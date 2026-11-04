@@ -128,24 +128,29 @@ def convert_tts_to_pcmu_and_pcm16(audio_bytes: bytes, tts_provider: str = "murf"
         in_ch = 1
         fmt = "UNKNOWN"
 
-        # 1. Primary: PyAV decoding with FFmpeg polyphase Sinc anti-aliased resampling
+        # 1. Primary: miniaudio decoding (auto-detects MP3, WAV, FLAC, OGG without external DLL dependencies)
         try:
-            import av
-            container = av.open(buf)
-            stream = container.streams.audio[0]
-            in_sr = stream.rate or 24000
-            in_ch = stream.channels or 1
-            fmt = container.format.name.upper()
-
-            resampler = av.AudioResampler(format="s16", layout="mono", rate=8000)
-            pcm_chunks = []
-            for frame in container.decode(audio=0):
-                for r_frame in resampler.resample(frame):
-                    pcm_chunks.append(r_frame.to_ndarray().tobytes())
-            for r_frame in resampler.resample(None):
-                pcm_chunks.append(r_frame.to_ndarray().tobytes())
-            raw_pcm16 = b"".join(pcm_chunks)
-        except Exception as av_err:
+            import miniaudio
+            decoded = miniaudio.decode(
+                audio_bytes,
+                nchannels=1,
+                sample_rate=8000,
+                output_format=miniaudio.SampleFormat.SIGNED16
+            )
+            raw_pcm16 = decoded.samples.tobytes()
+            in_sr = decoded.sample_rate
+            in_ch = decoded.nchannels
+            if audio_bytes.startswith(b"ID3") or (len(audio_bytes) > 2 and audio_bytes[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2")):
+                fmt = "MP3"
+            elif audio_bytes.startswith(b"RIFF"):
+                fmt = "WAV"
+            elif audio_bytes.startswith(b"OggS"):
+                fmt = "OGG"
+            elif audio_bytes.startswith(b"fLaC"):
+                fmt = "FLAC"
+            else:
+                fmt = "MINIAUDIO_AUTO"
+        except Exception as ma_err:
             # 2. Secondary fallback for raw WAV
             buf.seek(0)
             try:
@@ -164,9 +169,27 @@ def convert_tts_to_pcmu_and_pcm16(audio_bytes: bytes, tts_provider: str = "murf"
                         raw, _ = audioop.ratecv(raw, 2, 1, in_sr, 8000, None)
                     raw_pcm16 = raw
             except Exception as wav_err:
-                logger.error(f"[AUDIO_CONVERT] Audio decoding failed (PyAV: {av_err}, WAV: {wav_err})")
-                return b"", b""
+                # 3. Tertiary fallback: PyAV (e.g. on Linux VPS)
+                buf.seek(0)
+                try:
+                    import av
+                    container = av.open(buf)
+                    stream = container.streams.audio[0]
+                    in_sr = stream.rate or 24000
+                    in_ch = stream.channels or 1
+                    fmt = container.format.name.upper()
 
+                    resampler = av.AudioResampler(format="s16", layout="mono", rate=8000)
+                    pcm_chunks = []
+                    for frame in container.decode(audio=0):
+                        for r_frame in resampler.resample(frame):
+                            pcm_chunks.append(r_frame.to_ndarray().tobytes())
+                    for r_frame in resampler.resample(None):
+                        pcm_chunks.append(r_frame.to_ndarray().tobytes())
+                    raw_pcm16 = b"".join(pcm_chunks)
+                except Exception as av_err:
+                    logger.error(f"[AUDIO_CONVERT] All audio decoders failed (miniaudio: {ma_err}, WAV: {wav_err}, PyAV: {av_err})")
+                    return b"", b""
         if not raw_pcm16:
             logger.warning("[AUDIO_CONVERT] Decoded PCM is empty.")
             return b"", b""
@@ -889,7 +912,7 @@ class SipCallSession:
         in_playback = self._ai_speaking or (now < getattr(self, "_ai_speaking_until", 0.0))
         time_since_ai = now - getattr(self, "_last_ai_speak_end_time", 0.0)
 
-        if not in_playback and time_since_ai > 2.5:
+        if not in_playback and time_since_ai > 0.45:
             return False
 
         clean_t = "".join(c.lower() for c in text if c.isalnum() or c.isspace()).strip()
@@ -902,7 +925,9 @@ class SipCallSession:
         protected_customer_words = {
             "hello", "hi", "hey", "yes", "yeah", "yep", "no", "nah", "okay", "ok", "sure",
             "thanks", "thank", "today", "tomorrow", "morning", "afternoon", "evening",
-            "am", "pm", "correct", "right", "fine"
+            "am", "pm", "correct", "right", "fine", "appointment", "doctor", "service",
+            "services", "hospital", "clinic", "treatment", "book", "booking", "schedule",
+            "help", "need", "want", "information", "timing", "hours", "available"
         }
         if len(words_t) <= 3 and (
             any(w in protected_customer_words for w in words_t)
@@ -2336,7 +2361,7 @@ class SipCallSession:
                 metrics["tts_start"] = time.monotonic()
 
             t0          = time.monotonic()
-            audio_bytes = await tts_service.synthesize_speech_async(text, language=self.current_lang)
+            audio_bytes = await tts_service.synthesize_speech_async(text, language=self.current_lang, voice_id=getattr(self, 'selected_tts_voice', None))
             elapsed     = time.monotonic() - t0
             if metrics and "tts_first_audio" not in metrics:
                 metrics["tts_first_audio"] = time.monotonic()
@@ -2550,14 +2575,57 @@ class SipCallSession:
                             except Exception as _em_err:
                                 logger.warning(f"[LATENCY_EMIT] {_em_err}")
 
-                        logger.info(f"[RTP_TX] source=AI_TTS Sending {len(pcmu_bytes)} PCMU bytes ({audio_play_dur:.2f}s) to phone")
-                        logger.info(f"[RTP_AUDIO_TRANSMISSION] call_id={self.call_sid} utterance_id={utt_id} bytes={len(pcmu_bytes)} duration_s={audio_play_dur:.2f} status=SUCCESS")
+                        # Validate that RTP payload contains actual audio signal, not flatline silence
+                        pcm_rms = audioop.rms(pcm16_audio, 2) if pcm16_audio else 0
+                        pcm_peak = audioop.max(pcm16_audio, 2) if pcm16_audio else 0
+                        if pcm_rms < 100:
+                            logger.warning(f"[RTP_TX] Low energy audio warning: rms={pcm_rms} peak={pcm_peak}")
+
+                        # Extract negotiated RTP destination and sequence details
+                        pkt_count = len(pcmu_bytes) // 160
+                        rtp_dest_ip = "unknown"
+                        rtp_dest_port = 0
+                        seq_start = 0
+                        seq_end = 0
+                        pycall = getattr(self, "pyvoip_call", None)
+                        if pycall and hasattr(pycall, "RTPClients") and pycall.RTPClients:
+                            rtp_client = pycall.RTPClients[0]
+                            rtp_dest_ip = getattr(rtp_client, "outIP", "unknown")
+                            rtp_dest_port = getattr(rtp_client, "outPort", 0)
+                            seq_start = getattr(rtp_client, "outSequence", 0)
+                            seq_end = (seq_start + pkt_count) & 0xFFFF
+
+                        tx_result = "SUCCESS"
                         cb = self.audio_send_callback
                         if cb:
                             try:
                                 cb(pcmu_bytes)
                             except Exception as _cb_err:
+                                tx_result = f"FAILED: {_cb_err}"
                                 logger.warning(f"[RTP_TX] Callback write error: {_cb_err}")
+                        else:
+                            tx_result = "DROPPED: no audio_send_callback"
+
+                        logger.info(
+                            f"\n[RTP_VOICE_TRANSMISSION]"
+                            f"\n  call_id={self.call_sid}"
+                            f"\n  utterance_id={utt_id}"
+                            f"\n  audio_source=AI_TTS"
+                            f"\n  decoded_pcm_bytes={len(pcm16_audio)}"
+                            f"\n  sample_rate=8000"
+                            f"\n  channel_count=1"
+                            f"\n  pcmu_encoded_bytes={len(pcmu_bytes)}"
+                            f"\n  rtp_packet_count={pkt_count}"
+                            f"\n  rtp_payload_bytes=160"
+                            f"\n  rtp_destination={rtp_dest_ip}:{rtp_dest_port}"
+                            f"\n  seq_start={seq_start}"
+                            f"\n  seq_end={seq_end}"
+                            f"\n  duration_s={audio_play_dur:.2f}"
+                            f"\n  rms_energy={pcm_rms}"
+                            f"\n  peak_amplitude={pcm_peak}"
+                            f"\n  actual_transmission_result={tx_result}"
+                        )
+                        logger.info(f"[RTP_AUDIO_TRANSMISSION] call_id={self.call_sid} utterance_id={utt_id} bytes={len(pcmu_bytes)} duration_s={audio_play_dur:.2f} status={tx_result}")
 
                         # Feed AI speech to TwoWayCallRecorder for synchronized recording
                         if hasattr(self, "two_way_recorder") and pcm16_audio:
@@ -2914,6 +2982,12 @@ class SipCallSession:
                     call.duration = duration_str
                     call.call_type = self.call_type
                     call.messages = json.dumps(self._messages)
+                    user_msgs = [m.get("text", "") for m in self._messages if m.get("role") in ("user", "customer") and m.get("text")]
+                    ai_msgs = [m.get("text", "") for m in self._messages if m.get("role") in ("assistant", "ai") and m.get("text")]
+                    if user_msgs:
+                        call.caller_said = user_msgs[-1]
+                    if ai_msgs:
+                        call.ai_response = ai_msgs[-1]
                     call.receptionist_state = f"SIP {direction_label} COMPLETED"
                     call.recording_status = rec_status
                     call.recording_file_size = rec_file_size

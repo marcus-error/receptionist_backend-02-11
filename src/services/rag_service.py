@@ -782,6 +782,69 @@ class RagService:
 
         return ""
 
+    @staticmethod
+    def _get_time_aware_greeting_prefix(organization_id: Optional[int] = None) -> str:
+        """Returns 'Good morning', 'Good afternoon', or 'Good evening' based on
+        the organization's timezone or IST (UTC+5:30) as standard.
+        Strict time rules:
+        - Good morning:   5:00 AM to 11:59 AM (05:00 - 11:59)
+        - Good afternoon: 12:00 PM to 4:59 PM (12:00 - 16:59)
+        - Good evening:   5:00 PM to 4:59 AM (17:00 - 04:59)
+        """
+        try:
+            import datetime as _dt
+            from datetime import timezone as _tz
+            utc_now = _dt.datetime.now(_tz.utc)
+            # Default to IST (UTC+5:30)
+            ist_offset = _dt.timedelta(hours=5, minutes=30)
+            now_dt = utc_now + ist_offset
+            now_hour = now_dt.hour
+            if 5 <= now_hour < 12:
+                return "Good morning"
+            elif 12 <= now_hour < 17:
+                return "Good afternoon"
+            else:
+                return "Good evening"
+        except Exception:
+            return "Good morning"
+
+    @classmethod
+    def _apply_time_aware_prefix(cls, greeting: str, org_name: str = "", organization_id: Optional[int] = None) -> str:
+        """Dynamically shapes opening greeting according to standard structure:
+        "Good [morning/afternoon/evening]. Welcome to [Organization Name]. How may I assist you?"
+        - Strips any hardcoded time-of-day phrases from document content.
+        - Fixes truncated / dangling sentences from PDF text extractions.
+        - Never uses hardcoded organization names.
+        """
+        import re as _re
+        time_prefix = cls._get_time_aware_greeting_prefix(organization_id=organization_id)
+        
+        words = greeting.split()
+        dangling_words = {"our", "the", "a", "an", "to", "for", "with", "and", "or", "in", "of", "about"}
+        last_word = words[-1].lower().strip(".,!?\"'") if words else ""
+        is_incomplete = len(words) < 3 or (last_word in dangling_words) or not (greeting.rstrip() and greeting.rstrip()[-1] in (".", "!", "?"))
+        
+        if is_incomplete:
+            resolved_org = org_name or rag_service.get_organization_name(organization_id)
+            if resolved_org:
+                return f"{time_prefix}. Welcome to {resolved_org}. How may I assist you?"
+            return f"{time_prefix}. Welcome. How may I assist you?"
+
+        stripped = _re.sub(
+            r'^(?:Good\s+(?:morning|afternoon|evening|day|night)|Hello|Hi|Namaste|Vanakkam)[!,\.\s]*',
+            '',
+            greeting,
+            flags=_re.IGNORECASE,
+        ).strip()
+        if not stripped:
+            resolved_org = org_name or rag_service.get_organization_name(organization_id)
+            if resolved_org:
+                return f"{time_prefix}. Welcome to {resolved_org}. How may I assist you?"
+            return f"{time_prefix}. Welcome. How may I assist you?"
+            
+        remaining = stripped[0].upper() + stripped[1:] if len(stripped) > 1 else stripped.upper()
+        return f"{time_prefix}. {remaining}"
+
     def synthesize_greeting_from_doc(self, content: str, doc_title: str = "", scope: Optional[str] = None) -> str:
         """
         Constructs an appropriate opening greeting using the organization name, role,
@@ -818,9 +881,11 @@ class RagService:
 
         scope_str = str(scope or "").lower()
         if "outbound" in scope_str:
-            return f"Hello! This is {org_name} calling. How may I assist you today?"
+            time_prefix = self._get_time_aware_greeting_prefix()
+            return f"{time_prefix}. This is {org_name} calling. How may I assist you?"
         else:
-            return f"Thank you for calling {org_name}. How may I assist you today?"
+            time_prefix = self._get_time_aware_greeting_prefix()
+            return f"{time_prefix}. Welcome to {org_name}. How may I assist you?"
 
     def get_active_greeting(
         self,
@@ -892,6 +957,7 @@ class RagService:
 
                         greeting = self.extract_greeting_from_content(content, is_script_doc=True, doc_title=doc_explicit.title)
                         if greeting:
+                            greeting = self._apply_time_aware_prefix(greeting, organization_id=organization_id)
                             logger.info(
                                 f"\n[GREETING_EXTRACTION]"
                                 f"\n  source='{doc_explicit.title}'"
@@ -1033,6 +1099,7 @@ class RagService:
                     is_script = (doc.document_type in ["SCRIPT", "INBOUND_SCRIPT"]) or ("script" in (doc.title or "").lower())
                     greeting = self.extract_greeting_from_content(raw_content, is_script_doc=is_script, doc_title=doc.title)
                     if greeting:
+                        greeting = self._apply_time_aware_prefix(greeting, organization_id=organization_id)
                         logger.info(
                             f"\n[GREETING_EXTRACTION]"
                             f"\n  source='{doc.title}'"
