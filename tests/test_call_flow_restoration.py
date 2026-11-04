@@ -64,7 +64,7 @@ Voice Greeting: "Good morning! Welcome to Sarans Hospitals. How may I assist you
 
         greeting, doc_id, doc_title = rag_service.get_active_greeting(1)
         logger.info(f"Org 1 -> Greeting: '{greeting}', Doc ID: {doc_id}, Doc Title: {doc_title}")
-        assert greeting == "Good morning! Welcome to Sarans Hospitals. How may I assist you today?"
+        assert "Welcome to Sarans Hospitals" in greeting and "How may I assist you" in greeting
         assert not greeting.endswith(".pdf"), "Greeting must not end with .pdf"
         assert not greeting.endswith(".txt"), "Greeting must not end with .txt"
         assert greeting != doc_title, "Greeting must not be the raw document title or filename"
@@ -82,29 +82,39 @@ Voice Greeting: "Good morning! Welcome to Sarans Hospitals. How may I assist you
         rag_service.invalidate_caches(1)
 
 
-def test_multilingual_language_detection():
-    """Verify language detection accurately classifies English, Tamil, and Tanglish."""
-    # English
+def test_english_only_language_enforcement():
+    """Verify strict English-only enforcement across all phrases."""
+    # English phrase
     en_phrase = "I would like to schedule an appointment with a doctor tomorrow"
     assert language_service.detect_language(en_phrase) == "en"
+    assert language_service.is_non_english_input(en_phrase) is False
 
-    # Tamil
+    # Foreign phrases intercepted
     ta_phrase = "வணக்கம், நாளைக்கு டாக்டரை பார்க்க முடியுமா?"
-    assert language_service.detect_language(ta_phrase) == "ta"
+    assert language_service.detect_language(ta_phrase) == "en"
+    assert language_service.is_non_english_input(ta_phrase) is True
 
-    # Tanglish
-    tanglish_phrase = "Doctor appointment book panna mudiyuma?"
-    lang = language_service.determine_conversation_language(tanglish_phrase, current_lang="en")
-    assert lang in ("tanglish", "ta", "en")
+    # Spanish phrase intercepted
+    es_phrase = "Hola, ¿puedo hablar con un médico por favor?"
+    assert language_service.detect_language(es_phrase) == "en"
+    assert language_service.is_non_english_input(es_phrase) is True
+
+    # Hindi phrase intercepted
+    hi_phrase = "Mujhe doctor se milna hai kal subah"
+    assert language_service.detect_language(hi_phrase) == "en"
+    assert language_service.is_non_english_input(hi_phrase) is True
+
+    # Language switch request intercepted
+    switch_phrase = "Can you speak in Spanish?"
+    assert language_service.is_language_switch_request(switch_phrase) is True
+    redirect = language_service.get_language_switch_confirmation()
+    assert "English" in redirect
 
 
-def test_murf_voice_mapping_for_multilingual():
-    """Verify Murf TTS maps correct voices for English, Tamil, and Hindi."""
+def test_murf_voice_mapping_english_only():
+    """Verify Murf TTS strictly maps English voice."""
     from src.services.murf_tts import MURF_LANGUAGE_VOICES
-    assert MURF_LANGUAGE_VOICES.get("ta") == "ta-IN-iniya"
-    assert MURF_LANGUAGE_VOICES.get("hi") == "hi-IN-shweta"
     assert MURF_LANGUAGE_VOICES.get("en") == "en-IN-isha"
-    assert MURF_LANGUAGE_VOICES.get("tanglish") == "en-IN-isha"
 
 
 def test_greeting_extractor_validation():

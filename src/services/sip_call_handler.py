@@ -204,9 +204,9 @@ def convert_tts_to_pcmu_and_pcm16(audio_bytes: bytes, tts_provider: str = "murf"
             f"[AUDIO_CONVERT] input_rate={in_sr} output_rate=8000 input_format={fmt} output_format=PCM16_SINC"
         )
 
-        # 3. Trim excessive leading/trailing silence (>150ms)
+        # 3. Trim excessive leading silence (keep nominal 50ms padding, never truncate trailing speech)
         FRAME_10MS = 160  # 10ms @ 8kHz 16-bit mono = 80 samples * 2 bytes = 160 bytes
-        SILENCE_THRESH = 350
+        SILENCE_THRESH = 80
 
         start_idx = 0
         while start_idx + FRAME_10MS <= len(raw_pcm16):
@@ -215,12 +215,13 @@ def convert_tts_to_pcmu_and_pcm16(audio_bytes: bytes, tts_provider: str = "murf"
             start_idx += FRAME_10MS
         start_idx = max(0, start_idx - (4 * FRAME_10MS))  # 40ms safety padding
 
+        # Only trim trailing pure digital silence (>200ms) with large safety margin (150ms) to ensure no speech is truncated
         end_idx = len(raw_pcm16)
         while end_idx - FRAME_10MS >= start_idx:
             if audioop.rms(raw_pcm16[end_idx - FRAME_10MS:end_idx], 2) > SILENCE_THRESH:
                 break
             end_idx -= FRAME_10MS
-        end_idx = min(len(raw_pcm16), end_idx + (4 * FRAME_10MS))
+        end_idx = min(len(raw_pcm16), end_idx + (15 * FRAME_10MS))  # 150ms safety padding
 
         if end_idx > start_idx:
             raw_pcm16 = raw_pcm16[start_idx:end_idx]
@@ -231,7 +232,7 @@ def convert_tts_to_pcmu_and_pcm16(audio_bytes: bytes, tts_provider: str = "murf"
 
         if peak > 0:
             target_peak = 22000.0
-            factor = min(max(target_peak / float(peak), 0.7), 2.0)
+            factor = min(max(target_peak / float(peak), 0.75), 2.5)
             raw_pcm16 = audioop.mul(raw_pcm16, 2, factor)
             norm_rms = audioop.rms(raw_pcm16, 2)
             norm_peak = audioop.max(raw_pcm16, 2)
@@ -985,6 +986,13 @@ class SipCallSession:
             except Exception:
                 return
 
+        # Adaptive Telephony AGC for Customer Voice Clarity & High-Precision STT
+        cust_rms = audioop.rms(s16, 2)
+        if cust_rms > 100:  # Active customer voice above background noise floor
+            if cust_rms < 2400:
+                boost = min(2400.0 / float(cust_rms), 2.5)
+                s16 = audioop.mul(s16, 2, boost)
+
         # Two-Way Synchronized Call Recording (unclipped, natural customer audio)
         try:
             if hasattr(self, "two_way_recorder"):
@@ -1032,18 +1040,41 @@ class SipCallSession:
             logger.info(f"[AI_ECHO_FILTER] Partial echo discarded: '{text}' utt_id={utt_id}")
             return
 
+        # Handle duration_s as float or dict defensively
+        if isinstance(duration_s, dict):
+            dur_val = float(duration_s.get("duration", 0.0) or 0.0)
+        else:
+            try:
+                dur_val = float(duration_s or 0.0)
+            except (TypeError, ValueError):
+                dur_val = 0.0
+
         in_ai_speaking = self._ai_speaking or (now < getattr(self, "_ai_speaking_until", 0.0))
         if in_ai_speaking:
-            # Genuine customer speech started while AI was speaking - trigger barge-in interrupt!
-            logger.info(f"[BARGE_IN_PARTIAL] Customer interrupted AI speech with partial: '{text}' utt_id={utt_id}")
-            self._ai_speaking = False
-            self._ai_speaking_until = 0.0
-            self._barge_in_event.set()
-            if self.audio_clear_callback:
-                try:
-                    self.audio_clear_callback()
-                except Exception:
-                    pass
+            # Check for genuine customer interruption vs transient noise / isolated reflex greeting
+            words = text.split()
+            word_count = len(words)
+            clean_first = words[0].lower().strip(".,!?") if words else ""
+
+            # Isolated reflex words like "hello", "hi", "uh", "um", "yeah" during opening playback are not barge-in interruptions
+            is_reflex_word = word_count <= 2 and clean_first in ("hello", "hi", "hey", "uh", "um", "yeah", "yes", "okay", "ok")
+
+            # Interrupt AI playback only on substantive interruption (>=3 words OR duration >= 0.8s OR explicit interrupt phrase)
+            has_explicit_interrupt = any(kw in text.lower() for kw in ("stop", "wait", "hold on", "listen", "no no", "excuse me", "hang on"))
+            is_genuine_interruption = (not is_reflex_word) and (word_count >= 3 or dur_val >= 0.8 or has_explicit_interrupt)
+
+            if is_genuine_interruption:
+                logger.info(f"[BARGE_IN_PARTIAL] Genuine customer interruption during AI speech: '{text}' (words={word_count}, dur={dur_val:.2f}s) utt_id={utt_id}")
+                self._ai_speaking = False
+                self._ai_speaking_until = 0.0
+                self._barge_in_event.set()
+                if self.audio_clear_callback:
+                    try:
+                        self.audio_clear_callback()
+                    except Exception:
+                        pass
+            else:
+                logger.debug(f"[BARGE_IN_HELD] Non-interrupting partial held during AI playback: '{text}' utt_id={utt_id}")
 
         partial_lang = language_service.detect_language(text, stt_lang=detected_lang) or self.current_lang
         await self._emit_transcript_typed("CUSTOMER_PARTIAL", utt_id, text, {
@@ -1143,104 +1174,41 @@ class SipCallSession:
             f"\n  text='{text}'"
         )
 
-        # Multi-lingual detection & automatic language tracking (Task 2 & 3)
-        stt_detected_lang = metrics.get("detected_language", "")
+        # Enforce English-only recognition and conversation lock
         real_conf = float(metrics.get("confidence", 1.0))
         self.call_id = self.call_sid
         self.utterance_id = utt_id
         self.stt_language_confidence = real_conf
         self.original_transcript = text
 
-        old_preferred = getattr(self, "preferred_response_language", self.current_lang)
-
-        # Task 2: Separate speech-language detection from explicit preference switch
-        lang_res = language_service.resolve_call_language_turn(
-            text=text,
-            current_preferred_lang=old_preferred,
-            stt_lang=stt_detected_lang,
-            confidence=real_conf
-        )
-
-        self.detected_utterance_language = lang_res["detected_utterance_language"]
-        self.preferred_response_language = lang_res["preferred_response_language"]
-        self.language_switch_requested = lang_res["language_switch_requested"]
-        new_lang = self.preferred_response_language
-
-        _LANG_NAMES = {
-            "ta": "Tamil",
-            "tanglish": "Tanglish",
-            "hi": "Hindi",
-            "te": "Telugu",
-            "ml": "Malayalam",
-            "kn": "Kannada",
-            "en": "English",
-        }
-        readable_utterance = _LANG_NAMES.get(self.detected_utterance_language, self.detected_utterance_language.capitalize())
-        readable_preferred = _LANG_NAMES.get(new_lang, new_lang.capitalize())
-
-        # Task 4: Explicit, verified provider & voice routing
-        if new_lang in ("te", "telugu"):
-            self.selected_tts_provider = "gtts"
-            self.selected_tts_voice = "te-IN"
-        elif new_lang in ("ml", "malayalam"):
-            self.selected_tts_provider = "gtts"
-            self.selected_tts_voice = "ml-IN"  # NEVER ta-IN-iniya
-        elif new_lang in ("kn", "kannada"):
-            self.selected_tts_provider = "gtts"
-            self.selected_tts_voice = "kn-IN"  # NEVER Tamil
-        elif new_lang in ("ta", "tamil"):
-            self.selected_tts_provider = "murf"
-            self.selected_tts_voice = "ta-IN-iniya"
-        elif new_lang in ("hi", "hindi"):
-            self.selected_tts_provider = "murf"
-            self.selected_tts_voice = "hi-IN-shweta"
-        elif new_lang in ("tanglish", "ta_mix"):
-            self.selected_tts_provider = "murf"
-            self.selected_tts_voice = "en-IN-isha"
-        else:
-            self.selected_tts_provider = "murf"
-            self.selected_tts_voice = "en-IN-isha"
-
-        self.transcript_language = self.detected_utterance_language
-        self.language_code = new_lang
-        self.current_lang = new_lang
-        self.detected_language = readable_preferred
+        self.detected_utterance_language = "en"
+        self.preferred_response_language = "en"
+        self.language_switch_requested = False
+        self.selected_tts_provider = "murf"
+        self.selected_tts_voice = "en-IN-isha"
+        self.transcript_language = "en"
+        self.language_code = "en"
+        self.current_lang = "en"
+        self.detected_language = "English"
         self.language_confidence = real_conf
-        self.ai_response_language = new_lang
+        self.ai_response_language = "en"
+        if hasattr(self, "booking_session"):
+            self.booking_session.conversation_language = "en"
 
-        if new_lang != old_preferred:
-            self.language_change_timestamp = datetime.now(timezone.utc).isoformat()
-            trigger_type = "explicit_request" if self.language_switch_requested else "auto_detected"
-            logger.info(
-                f"\n[LANGUAGE_CHANGE]"
-                f"\n  call_id={self.call_sid}"
-                f"\n  previous_language={old_preferred}"
-                f"\n  current_language={new_lang} ({readable_preferred})"
-                f"\n  detected_utterance_language={self.detected_utterance_language} ({readable_utterance})"
-                f"\n  selected_tts_provider={self.selected_tts_provider}"
-                f"\n  selected_tts_voice={self.selected_tts_voice}"
-                f"\n  trigger='{trigger_type}'"
-            )
-            if hasattr(self, "booking_session"):
-                self.booking_session.conversation_language = new_lang
-            try:
-                from src.sockets.socket_manager import sio
-                await sio.emit("language_change", {
-                    "call_sid": self.call_sid,
-                    "previous_language": old_preferred,
-                    "current_language": new_lang,
-                    "language": readable_preferred,
-                    "language_code": new_lang,
-                    "detected_utterance_language": self.detected_utterance_language,
-                    "preferred_response_language": new_lang,
-                    "selected_tts_provider": self.selected_tts_provider,
-                    "selected_tts_voice": self.selected_tts_voice,
-                    "trigger": trigger_type,
-                    "timestamp": self.language_change_timestamp
-                })
-            except Exception:
-                pass
+        # Intercept foreign language input or language switch requests
+        if language_service.is_language_switch_request(text) or language_service.is_non_english_input(text):
+            logger.info(f"[ENGLISH_ONLY_REDIRECT] Foreign language / switch request intercepted: '{text[:60]}'")
+            redirect_msg = language_service.get_language_switch_confirmation()
+            self.session_history.append({"role": "user", "text": text})
+            self.session_history.append({"role": "model", "text": redirect_msg})
+            metrics["response_id"] = f"ai_en_redirect_{int(time.time()*1000)}"
+            metrics["source"] = "ENGLISH_ONLY_REDIRECT"
+            await self._speak(redirect_msg, "language_redirect", metrics)
+            return
 
+        readable_utterance = "English"
+        readable_preferred = "English"
+        stt_detected_lang = "en"
         logger.info(
             f"\n[LANGUAGE_DETECTED]"
             f"\n  call_id={self.call_sid}"
@@ -1252,7 +1220,7 @@ class SipCallSession:
             f"\n  language_switch_requested={self.language_switch_requested}"
             f"\n  tts_provider={self.selected_tts_provider}"
             f"\n  tts_voice={self.selected_tts_voice}"
-            f"\n  stt_detected_language={stt_detected_lang or 'none'}"
+            f"\n  stt_detected_language={stt_detected_lang}"
         )
         logger.info(
             f"[LANGUAGE_DETECTION] call_id={self.call_sid} utterance_id={utt_id} "
@@ -1820,12 +1788,7 @@ class SipCallSession:
             if not getattr(self, "_call_ending_scheduled", False):
                 self._call_ending_scheduled = True
                 org_title = rag_service.get_organization_name(self.organization_id) or "CallZenza"
-                if self.current_lang in ("ta", "tanglish", "ta_mix"):
-                    closing_msg = f"ரொம்ப நன்றி! {org_title}-ஐ தொடர்பு கொண்டதற்கு நன்றி. நல்ல நாளாக அமையட்டும், வணக்கம்!"
-                elif self.current_lang == "hi":
-                    closing_msg = f"Aapka bahut dhanyawad! {org_title} mein call karne ke liye shukriya. Aapka din shubh ho, alvida!"
-                else:
-                    closing_msg = f"You're very welcome! Thank you for calling {org_title}. Have a wonderful day, goodbye!"
+                closing_msg = f"You're very welcome! Thank you for calling {org_title}. Have a wonderful day, goodbye!"
 
                 self.session_history.append({"role": "user", "text": transcription})
                 self.session_history.append({"role": "model", "text": closing_msg})
@@ -2726,9 +2689,9 @@ class SipCallSession:
                 f"\n  response_text='{greeting}'"
             )
 
-            # Determine greeting language dynamically so TTS uses the right voice (e.g. Iniya for Tamil, Isha for English/Tanglish)
-            greeting_lang = language_service.detect_language(greeting) or self.current_lang
-            self.current_lang = greeting_lang
+            # Enforce English greeting
+            greeting_lang = "en"
+            self.current_lang = "en"
 
             logger.info(
                 f"\n[GREETING_TTS]"
@@ -3030,7 +2993,24 @@ class SipCallSession:
                     import json
                     call = db.query(CallLog).filter(CallLog.id == self.db_call_id).first()
                     if call:
+                        # Ensure message is tracked in session message history
+                        msg_entry = {"role": role, "text": text}
+                        if intent:
+                            msg_entry["intent"] = intent
+                        if not any(m.get("role") == role and m.get("text") == text for m in self._messages):
+                            self._messages.append(msg_entry)
                         call.messages = json.dumps(self._messages)
+
+                        # Immediately update caller_said and ai_response for real-time live monitoring
+                        if role in ("user", "customer"):
+                            call.caller_said = text
+                            if intent:
+                                call.intent = intent
+                        elif role in ("assistant", "ai"):
+                            call.ai_response = text
+
+                        if self.active_script_title:
+                            call.rag_source = self.active_script_title
                         if self.booking_session:
                             if self.booking_session.patient_name:
                                 call.caller_name = self.booking_session.patient_name

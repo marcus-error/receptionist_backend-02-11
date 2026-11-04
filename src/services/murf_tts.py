@@ -45,13 +45,7 @@ VOICE_ALIASES = {
 }
 
 MURF_LANGUAGE_VOICES = {
-    "ta": "ta-IN-iniya",
-    "tanglish": "en-IN-isha",
-    "hi": "hi-IN-shweta",
     "en": "en-IN-isha",
-    "te": "en-IN-isha",
-    "ml": "en-IN-isha",
-    "kn": "en-IN-isha",
 }
 
 MODEL_VERSION_MAP = {
@@ -149,20 +143,9 @@ class MurfTTSService:
         raw_target_model = model or env_model or "GEN2"
         target_voice, model_version = parse_voice_and_model(raw_target_voice, raw_target_model)
 
-        # Multilingual voice compatibility guard: ensure compatible voice matches text script
-        import re
-        has_tamil = bool(re.search(r'[\u0b80-\u0bff]', clean_text))
-        has_hindi = bool(re.search(r'[\u0900-\u097f]', clean_text))
-        clean_lang = str(language or "").lower().strip()
-
-        if has_tamil or clean_lang in ("ta", "tamil"):
-            target_voice = "ta-IN-iniya"
-            model_version = "GEN1"  # Murf Tamil voice is GEN1; FALCON streaming rejects it with HTTP 400
-        elif has_hindi or clean_lang in ("hi", "hindi"):
-            target_voice = "hi-IN-shweta"
-            model_version = "GEN1"  # Murf Hindi voice is GEN1; FALCON streaming rejects it with HTTP 400
-        elif clean_lang in ("tanglish", "ta_mix"):
-            target_voice = "en-IN-isha"
+        # Enforce English voice and GEN2 model for telephony
+        target_voice = target_voice or "en-IN-isha"
+        model_version = "GEN2"
 
         if not api_key:
             latency_ms = int((time.time() - t0) * 1000)

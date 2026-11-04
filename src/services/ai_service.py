@@ -238,10 +238,10 @@ class AIService:
             "   - Search the complete RAG knowledge base for relevant information across all uploaded sections, pages, headings, tables, product lists, and timings.\n"
             "   - RAG queries and API calls MUST NOT reset the conversation state.\n"
             "   - If information is unlisted in RAG, clearly state it is unavailable instead of inventing facts.\n\n"
-            "4. LANGUAGE DETECTION & INTENT TRANSLATION:\n"
-            "   - Automatically detect caller language (English, Tanglish, Tamil, Hindi, Hinglish, Malayalam, Telugu, Kannada, etc.).\n"
-            "   - Focus on core intent and meaning without translation glitches.\n"
-            "   - Preserve context and meaning seamlessly without word-for-word translation glitches.\n\n"
+            "4. STRICT ENGLISH-ONLY CONVERSATION ENFORCEMENT:\n"
+            "   - You MUST formulate all speech and responses strictly in English. NEVER respond in Spanish, Hindi, Tamil, Telugu, Malayalam, Kannada, or any language other than English.\n"
+            "   - If the caller speaks another language or asks to switch languages (e.g. Spanish, Hindi, Tamil, etc.), DO NOT translate and DO NOT switch languages. Politely respond in English: 'I can only assist you in English. Please could you continue in English?'\n"
+            "   - All speech recognition, entity extraction, appointment handling, and dialogue responses must remain 100% in English.\n\n"
             "5. ABSOLUTE DOMAIN ISOLATION & ZERO MEDICAL MENTIONS:\n"
             "   - Preserve exact spelling of product/staff names, departments, services, proper nouns, and terms from RAG.\n"
             "   - NEVER ASSUME THE BUSINESS TYPE IS A HOSPITAL OR CLINIC. NEVER MENTION OR SUGGEST DOCTORS, PATIENTS, OR MEDICAL DEPARTMENTS (such as Cardiology, Dentist, Ophthalmology, Pediatrics, General Medicine), EVEN WHEN DENYING AN UNLISTED QUESTION OR EXPLAINING MISSING INFORMATION.\n"
@@ -466,32 +466,13 @@ class AIService:
                 f"===========================================\n\n"
             ) + system_prompt
 
-        # Language guidance
-        lang_code = (conversation_language or "en").lower().strip()
-        if lang_code == "ta":
-            system_prompt += "\nLANGUAGE LOCK: The caller is speaking in Tamil. You MUST respond in natural, polite, grammatically correct Tamil using Tamil script (தமிழ்). Never respond in English or Latin script unless the customer explicitly requests English."
-        elif lang_code in ("tanglish", "ta_mix"):
-            system_prompt += "\nLANGUAGE LOCK: The caller is speaking in Tanglish (Tamil words in Latin alphabet). You MUST respond naturally in conversational Tanglish using Latin script."
-        elif lang_code == "hi":
-            system_prompt += "\nLANGUAGE LOCK: The caller is speaking in Hindi. You MUST respond in polite, natural Hindi using Devanagari script (हिंदी). Never respond in English unless the customer explicitly requests English."
-        elif lang_code == "hinglish":
-            system_prompt += "\nLANGUAGE LOCK: The caller is speaking in Hinglish (Hindi in Latin script). You MUST respond in natural, polite Hinglish using Latin script."
-        elif lang_code in ("te", "telugu"):
-            system_prompt += "\nLANGUAGE LOCK: The caller is speaking in Telugu. You MUST respond in polite, natural Telugu."
-        elif lang_code in ("ml", "malayalam"):
-            system_prompt += "\nLANGUAGE LOCK: The caller is speaking in Malayalam. You MUST respond in polite, natural Malayalam."
-        elif lang_code in ("kn", "kannada"):
-            system_prompt += "\nLANGUAGE LOCK: The caller is speaking in Kannada. You MUST respond in polite, natural Kannada."
-        else:
-            system_prompt += "\nLANGUAGE: The caller is speaking in English. Respond in clear, professional English."
-
+        # Strict English-Only Directive
         system_prompt += (
-            "\n=== MULTILINGUAL RAG & FACTUAL FIDELITY DIRECTIVE ===\n"
-            "The knowledge base [RAG CONTEXT] may be documented in English. When the caller speaks Tamil, Tanglish, or Hindi:\n"
-            "- Always formulate your spoken answer directly in the customer's active language.\n"
-            "- Extract facts, doctor names, working hours, services, and fees accurately from [RAG CONTEXT].\n"
-            "- Do NOT alter doctor/staff names or technical terms, but present the explanation fluently in the customer's language.\n"
-            "- If the information is not in [RAG CONTEXT], politely explain in the customer's language that the information is unavailable without inventing facts.\n"
+            "\n=== STRICT ENGLISH-ONLY CONVERSATION DIRECTIVE ===\n"
+            "You are an English-only AI receptionist. You MUST generate all responses strictly in English.\n"
+            "- NEVER respond in Spanish, Hindi, Tamil, Telugu, Malayalam, Kannada, or any language other than English.\n"
+            "- If the caller speaks or inquires in another language, or asks you to switch languages, DO NOT translate and DO NOT switch languages. Politely reply in English: 'I can only assist you in English. Please could you continue in English?'\n"
+            "- Maintain professional, fluent, and natural English at all times.\n"
         )
 
         # Structured Prompt Assembly

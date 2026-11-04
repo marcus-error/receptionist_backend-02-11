@@ -3696,8 +3696,7 @@ class BookingStateService:
             self._log_conversation_turn(session, text, resp, "presence_reassurance", state_before=state_before)
             return _ret(resp)
 
-        from src.services.language_service import language_service
-        session.conversation_language = language_service.determine_conversation_language(text, current_lang=session.conversation_language)
+        session.conversation_language = "en" 
 
         lang = session.conversation_language
 

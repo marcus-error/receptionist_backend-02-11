@@ -580,13 +580,32 @@ class RagService:
                 if len(clean_name) > 1 and not any(w in clean_name.lower() for w in ["unknown", "n/a", "none"]):
                     return clean_name
 
+            # Check for "Welcome to [Organization Name]" in master context
+            m_welcome = re.search(r'welcome to\s+([A-Za-z0-9\s&\'\-]+?)(?:\.|\?|\!|,|how may|thank you|\n|$)', master_ctx, re.IGNORECASE)
+            if m_welcome:
+                clean_w = re.sub(r'[*_#`]', '', m_welcome.group(1)).strip()
+                if clean_w.isupper():
+                    clean_w = clean_w.title()
+                if len(clean_w) > 2 and not any(w in clean_w.lower() for w in ["unknown", "n/a", "none", "our team", "the call", "doctor", "dr."]):
+                    return clean_w
+
             header_match = re.search(r'#+\s*([A-Za-z0-9\s\.\-&,\']+?)(?:[\-\n\r]|$)', master_ctx)
             if header_match:
                 candidate = re.sub(r'[*_#`]', '', header_match.group(1)).strip()
-                stop_phrases = ["test receptionist script", "receptionist script", "test script", "rag knowledge base", "section", "organization overview", "knowledge base", "master rag", "school information", "hospital information", "salon information", "company information"]
+                stop_phrases = [
+                    "test receptionist script", "receptionist script", "inbound script", "outbound script",
+                    "test script", "rag knowledge base", "section", "organization overview", "knowledge base",
+                    "master rag", "school information", "hospital information", "salon information",
+                    "company information", "doctor directory", "doctors directory", "staff directory",
+                    "directory", "departments", "department", "services", "treatments", "pricing",
+                    "hours", "timings", "contact", "faq", "faqs", "greeting & call opening", "greeting",
+                    "call opening"
+                ]
                 for sp in stop_phrases:
                     candidate = re.sub(re.escape(sp), '', candidate, flags=re.IGNORECASE).strip()
-                if candidate and len(candidate) > 2 and not any(w in candidate.lower() for w in ["script", "receptionist", "knowledge base"]):
+                candidate = re.sub(r'\s*(?:inbound|outbound)?\s*script\s*$', '', candidate, flags=re.IGNORECASE).strip()
+                if candidate.isupper(): candidate = candidate.title()
+                if candidate and len(candidate) > 2 and not any(w in candidate.lower() for w in ["script", "receptionist", "knowledge base", "directory"]):
                     return candidate
 
         # If active document exists, attempt to extract clean title from SQLite
@@ -702,9 +721,11 @@ class RagService:
         # 1. Look for explicit GREETING section header
         hdr_regex = re.compile(
             r'(?m)^[\s*\-•#]*(?:\d+[\.\)]\s*)?(?:\*\*|__)?'
-            r'(?:Voice Greeting|Inbound Greeting|Opening Greeting|Receptionist Greeting|'
+            r'(?:Voice Greeting|Inbound Greeting|Outbound Greeting|Opening Greeting|Receptionist Greeting|'
             r'Greeting\s*(?:&|and|/)\s*Call Opening|Call Opening\s*(?:&|and|/)\s*Greeting|'
-            r'Call Opening|Welcome Greeting|Opening Message|Approved Greeting|Initial Greeting|'
+            r'(?:Outbound|Inbound|Voice|Phone)?\s*Call Opening|'
+            r'(?:Outbound|Inbound|Voice|Phone)?\s*Greeting|'
+            r'Welcome Greeting|Opening Message|Approved Greeting|Initial Greeting|'
             r'Standard Greeting|Spoken Greeting|Approved Spoken Greeting|Welcome Message|'
             r'Phone Greeting|First Response|Opening|Introduction|Greeting|வரவேற்பு|வணக்கம்)'
             r'(?:\*\*|__)?\s*[:\-\]]?\s*([^\n\r]*)',
@@ -793,11 +814,18 @@ class RagService:
         """
         try:
             import datetime as _dt
-            from datetime import timezone as _tz
-            utc_now = _dt.datetime.now(_tz.utc)
-            # Default to IST (UTC+5:30)
-            ist_offset = _dt.timedelta(hours=5, minutes=30)
-            now_dt = utc_now + ist_offset
+            from zoneinfo import ZoneInfo
+            from src.config.env import settings
+
+            tz_name = getattr(settings, "BUSINESS_TIMEZONE", "Asia/Kolkata") or "Asia/Kolkata"
+            try:
+                tz = ZoneInfo(tz_name)
+                now_dt = _dt.datetime.now(tz)
+            except Exception:
+                utc_now = _dt.datetime.now(_dt.timezone.utc)
+                ist_offset = _dt.timedelta(hours=5, minutes=30)
+                now_dt = utc_now + ist_offset
+
             now_hour = now_dt.hour
             if 5 <= now_hour < 12:
                 return "Good morning"
@@ -809,41 +837,53 @@ class RagService:
             return "Good morning"
 
     @classmethod
-    def _apply_time_aware_prefix(cls, greeting: str, org_name: str = "", organization_id: Optional[int] = None) -> str:
+    def _apply_time_aware_prefix(cls, greeting: str, org_name: str = "", organization_id: Optional[int] = None, scope: Optional[str] = None) -> str:
         """Dynamically shapes opening greeting according to standard structure:
         "Good [morning/afternoon/evening]. Welcome to [Organization Name]. How may I assist you?"
-        - Strips any hardcoded time-of-day phrases from document content.
-        - Fixes truncated / dangling sentences from PDF text extractions.
+        - Organization name comes dynamically from authenticated organization / database.
+        - Strict time-of-day prefix based on actual call time in configured timezone:
+          * Good morning: 5:00 AM to 11:59 AM
+          * Good afternoon: 12:00 PM to 4:59 PM
+          * Good evening: 5:00 PM to 4:59 AM
         - Never uses hardcoded organization names.
         """
         import re as _re
         time_prefix = cls._get_time_aware_greeting_prefix(organization_id=organization_id)
-        
-        words = greeting.split()
-        dangling_words = {"our", "the", "a", "an", "to", "for", "with", "and", "or", "in", "of", "about"}
-        last_word = words[-1].lower().strip(".,!?\"'") if words else ""
-        is_incomplete = len(words) < 3 or (last_word in dangling_words) or not (greeting.rstrip() and greeting.rstrip()[-1] in (".", "!", "?"))
-        
-        if is_incomplete:
-            resolved_org = org_name or rag_service.get_organization_name(organization_id)
-            if resolved_org:
-                return f"{time_prefix}. Welcome to {resolved_org}. How may I assist you?"
-            return f"{time_prefix}. Welcome. How may I assist you?"
+        resolved_org = ""
+        m_org = _re.search(r'welcome to\s+([A-Za-z0-9\s&\'\-]+?)(?:\.|\?|\!|,|how may|thank you|\n|$)', greeting, _re.IGNORECASE)
+        if m_org:
+            extracted = m_org.group(1).strip()
+            if len(extracted) > 2 and extracted.lower() not in ("default organization", "unknown", "none", "our team", "the call"):
+                resolved_org = extracted
 
-        stripped = _re.sub(
-            r'^(?:Good\s+(?:morning|afternoon|evening|day|night)|Hello|Hi|Namaste|Vanakkam)[!,\.\s]*',
-            '',
-            greeting,
-            flags=_re.IGNORECASE,
-        ).strip()
-        if not stripped:
+        if not resolved_org:
             resolved_org = org_name or rag_service.get_organization_name(organization_id)
-            if resolved_org:
-                return f"{time_prefix}. Welcome to {resolved_org}. How may I assist you?"
-            return f"{time_prefix}. Welcome. How may I assist you?"
-            
-        remaining = stripped[0].upper() + stripped[1:] if len(stripped) > 1 else stripped.upper()
-        return f"{time_prefix}. {remaining}"
+
+        if resolved_org and resolved_org.isupper():
+            resolved_org = resolved_org.title()
+        if not resolved_org or resolved_org.strip().lower() in ("default organization", "unknown", "none"):
+            resolved_org = "our team"
+
+        g = (greeting or "").strip()
+        time_pattern = r'^(?:good\s+morning\s*/\s*afternoon|good\s+morning\s*/\s*evening|good\s+morning|good\s+afternoon|good\s+evening)[.,!?;:\s]*'
+        if _re.search(time_pattern, g, _re.IGNORECASE):
+            rest = _re.sub(time_pattern, '', g, count=1, flags=_re.IGNORECASE).strip()
+            if rest:
+                rest = rest[0].upper() + rest[1:]
+                return f"{time_prefix}. {rest}"
+            return time_prefix
+
+        if _re.search(r'^(?:welcome to|this is|thank you for calling)', g, _re.IGNORECASE):
+            return f"{time_prefix}. {g}"
+
+        if g and len(g) > 10:
+            return f"{time_prefix}. {g}"
+
+        scope_str = str(scope or "").lower()
+        if "outbound" in scope_str:
+            return f"{time_prefix}. This is {resolved_org} calling. How may I assist you?"
+        return f"{time_prefix}. Welcome to {resolved_org}. How may I assist you?"
+
 
     def synthesize_greeting_from_doc(self, content: str, doc_title: str = "", scope: Optional[str] = None) -> str:
         """
@@ -957,7 +997,7 @@ class RagService:
 
                         greeting = self.extract_greeting_from_content(content, is_script_doc=True, doc_title=doc_explicit.title)
                         if greeting:
-                            greeting = self._apply_time_aware_prefix(greeting, organization_id=organization_id)
+                            greeting = self._apply_time_aware_prefix(greeting, organization_id=organization_id, scope=scope)
                             logger.info(
                                 f"\n[GREETING_EXTRACTION]"
                                 f"\n  source='{doc_explicit.title}'"
@@ -1099,7 +1139,7 @@ class RagService:
                     is_script = (doc.document_type in ["SCRIPT", "INBOUND_SCRIPT"]) or ("script" in (doc.title or "").lower())
                     greeting = self.extract_greeting_from_content(raw_content, is_script_doc=is_script, doc_title=doc.title)
                     if greeting:
-                        greeting = self._apply_time_aware_prefix(greeting, organization_id=organization_id)
+                        greeting = self._apply_time_aware_prefix(greeting, organization_id=organization_id, scope=scope)
                         logger.info(
                             f"\n[GREETING_EXTRACTION]"
                             f"\n  source='{doc.title}'"

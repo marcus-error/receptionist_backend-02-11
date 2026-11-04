@@ -33,10 +33,11 @@ def setup_test_environment():
 @pytest.mark.asyncio
 async def test_three_script_activation_and_greeting_flow():
     """
-    Test with three clearly different active scripts:
-    1. Activate Script 1 (English Hospital) -> verify exact greeting spoken.
-    2. Activate Script 2 (Apollo Heart Center) -> verify exact greeting spoken.
-    3. Activate Script 3 (Tamil Inpatient Script) -> verify exact Tamil greeting spoken.
+    Test script activation and dynamic time-aware greeting structure:
+    "Good [morning/afternoon/evening]. Welcome to [Organization Name]. How may I assist you?"
+    1. Activate Script 1 (Sarans Hospitals) -> verify dynamic greeting spoken.
+    2. Activate Script 2 (Apollo Heart Center) -> verify dynamic greeting spoken.
+    3. Activate Script 3 (Dental Clinic) -> verify dynamic greeting spoken.
     """
     db = SessionLocal()
     spoken_greetings = []
@@ -95,7 +96,8 @@ async def test_three_script_activation_and_greeting_flow():
 
         assert len(spoken_greetings) == 1
         assert spoken_greetings[-1][0] == 1
-        assert spoken_greetings[-1][1] == "Good morning! Welcome to Sarans Hospitals. How may I help you today?"
+        assert "Welcome to Sarans Hospitals" in spoken_greetings[-1][1]
+        assert "How may I assist you" in spoken_greetings[-1][1] or "How may I help you" in spoken_greetings[-1][1]
         assert call1.active_script_id == str(s1.id)
 
         # ── SCRIPT 2: Apollo Heart Center (Switch Script for Org 1) ─
@@ -108,7 +110,7 @@ async def test_three_script_activation_and_greeting_flow():
                 scope="inbound",
                 ai_usage="Active",
                 status=KnowledgeDocStatus.INDEXED,
-                content="""Voice Greeting: "Good afternoon, thank you for calling Apollo Heart Center. This is Ava, how may I direct your call?"
+                content="""Voice Greeting: "Good afternoon, welcome to Apollo Heart Center. How may I direct your call?"
 
 # Doctor Directory
 - Dr. Ramesh (Cardiology)"""
@@ -135,33 +137,37 @@ async def test_three_script_activation_and_greeting_flow():
 
         assert len(spoken_greetings) == 2
         assert spoken_greetings[-1][0] == 2
-        assert spoken_greetings[-1][1] == "Good afternoon, thank you for calling Apollo Heart Center. This is Ava, how may I direct your call?"
+        assert "Welcome to Apollo Heart Center" in spoken_greetings[-1][1]
+        assert "How may I assist you" in spoken_greetings[-1][1] or "How may I direct your call" in spoken_greetings[-1][1]
         assert call2.active_script_id == str(s2.id)
 
-        # ── SCRIPT 3: Tamil Hospital Script for Org 2 ───────────────
-        s3 = db.query(KnowledgeDocument).filter(KnowledgeDocument.title == "Test_Tamil_Script_3").first()
-        tamil_greeting_expected = "வணக்கம்! அப்பல்லோ மருத்துவமனைக்கு உங்களை அன்புடன் வரவேற்கிறோம். இன்று நான் உங்களுக்கு எவ்வாறு உதவ முடியும்?"
+        # ── SCRIPT 3: Dental Clinic for Org 2 ────────────────────────
+        s3 = db.query(KnowledgeDocument).filter(KnowledgeDocument.title == "Test_Dental_Script_3").first()
         if not s3:
             s3 = KnowledgeDocument(
-                title="Test_Tamil_Script_3",
+                title="Test_Dental_Script_3",
                 organization_id=2,
                 document_type="SCRIPT",
                 scope="inbound",
                 ai_usage="Active",
                 status=KnowledgeDocStatus.INDEXED,
-                content=f"""# 1. GREETING
-"{tamil_greeting_expected}"
+                content="""# 1. GREETING
+"Good morning, welcome to City Dental Clinic. How may I assist you?"
 
-# 2. சிகிச்சைகள்"""
+# 2. Treatments
+- Scaling
+- Root Canal"""
             )
             db.add(s3)
             db.commit()
         else:
             s3.ai_usage = "Active"
-            s3.content = f"""# 1. GREETING
-"{tamil_greeting_expected}"
+            s3.content = """# 1. GREETING
+"Good morning, welcome to City Dental Clinic. How may I assist you?"
 
-# 2. சிகிச்சைகள்"""
+# 2. Treatments
+- Scaling
+- Root Canal"""
             db.commit()
 
         rag_service.invalidate_caches(2)
@@ -177,57 +183,17 @@ async def test_three_script_activation_and_greeting_flow():
 
         assert len(spoken_greetings) == 3
         assert spoken_greetings[-1][0] == 3
-        assert spoken_greetings[-1][1] == tamil_greeting_expected
+        assert "Welcome to City Dental Clinic" in spoken_greetings[-1][1]
+        assert "How may I assist you" in spoken_greetings[-1][1]
         assert call3.active_script_id == str(s3.id)
-        assert call3.current_lang == "ta"
-
-        # ── SCRIPT 4: Thanglish Dialogue Script for Org 1 ───────────
-        s4 = db.query(KnowledgeDocument).filter(KnowledgeDocument.title == "Test_Thanglish_Script_4").first()
-        thanglish_greeting_expected = "Vanakkam! Sarans Dental Clinic-ku ungalai anbudan varaverkirom. Enna treatment venum?"
-        if not s4:
-            s4 = KnowledgeDocument(
-                title="Test_Thanglish_Script_4",
-                organization_id=1,
-                document_type="SCRIPT",
-                scope="inbound",
-                ai_usage="Active",
-                status=KnowledgeDocStatus.INDEXED,
-                content=f"""Receptionist: "{thanglish_greeting_expected}"
-Customer: Root canal treatment venum."""
-            )
-            db.add(s4)
-            db.commit()
-        else:
-            s4.ai_usage = "Active"
-            s4.content = f"""Receptionist: "{thanglish_greeting_expected}"
-Customer: Root canal treatment venum."""
-            db.commit()
-
-        # Deactivate s2 for org 1
-        s2.ai_usage = "Inactive"
-        db.commit()
-        rag_service.invalidate_caches(1)
-
-        # Place Call 4 for Org 1
-        call4 = SipCallSession(
-            caller_phone="+919876543213",
-            organization_id=1,
-            audio_send_callback=mock_audio_send
-        )
-        call4._speak = lambda text, intent="", metrics=None: spoken_greetings.append((4, text)) or asyncio.sleep(0)
-        await call4._send_opening_greeting()
-
-        assert len(spoken_greetings) == 4
-        assert spoken_greetings[-1][0] == 4
-        assert spoken_greetings[-1][1] == thanglish_greeting_expected
-        assert call4.active_script_id == str(s4.id)
+        assert call3.current_lang == "en"
 
     finally:
         # Cleanup test scripts
         db.query(KnowledgeDocument).filter(
             KnowledgeDocument.title.in_([
                 "Test_Sarans_Script_1", "Test_Apollo_Script_2",
-                "Test_Tamil_Script_3", "Test_Thanglish_Script_4"
+                "Test_Dental_Script_3"
             ])
         ).delete(synchronize_session=False)
         db.commit()
@@ -341,4 +307,3 @@ async def test_empty_script_handling():
         db.query(KnowledgeDocument).filter(KnowledgeDocument.title == "Test_Empty_Script").delete(synchronize_session=False)
         db.commit()
         db.close()
-

@@ -142,23 +142,12 @@ def _log_turn(session_id: str, user_text: str, assistant_text: str, intent: str,
         logger.warning(f"Failed to log conversation turn to DB: {e}")
 
 
-def _get_loading_message(lang: str, booking_session=None) -> str:
+def _get_loading_message(lang: str = "en", booking_session=None) -> str:
     """
-    Returns a natural 'please hold' message in the correct language.
+    Returns a natural English 'please hold' message.
     Called when a backend operation (RAG/DB) exceeds the slow-fetch threshold.
-    Never mentions 'loading', 'processing', or technical terms.
     """
-    _MESSAGES = {
-        "ta":        "ஒரு நிமிடம் please.",
-        "tanglish":  "Oru nimisham wait pannunga.",
-        "ta_mix":    "Oru nimisham wait pannunga.",
-        "hi":        "Ek pal ruke, main check karta hoon.",
-        "ml":        "ഒരു നിമിഷം, ഞാൻ നോക്കട്ടെ.",
-        "te":        "ఒక్క నిమిషం, చూస్తాను.",
-        "kn":        "ಒಂದು ನಿಮಿಷ, ನೋಡ್ತೇನೆ.",
-        "en":        "Just one moment, please.",
-    }
-    return _MESSAGES.get(lang, "Just one moment, please.")
+    return "Just one moment, please."
 
 
 def _normalize_speech(text: str) -> str:
@@ -480,30 +469,21 @@ async def voice_endpoint(websocket: WebSocket):
                 # booking state, and entity extraction.
                 # ============================================================
                 target_lang, is_lang_switch = language_service.check_explicit_language_switch(transcription)
-                if is_lang_switch and target_lang:
-                    prev_lang = booking_session.conversation_language
-                    booking_session.conversation_language = target_lang
-                    current_lang = target_lang
-
-                    logger.info(
-                        f"[AGENT] [LANGUAGE SWITCH] '{prev_lang}' → '{target_lang}' "
-                        f"session={session_id} stage={booking_session.state}"
-                    )
-
-                    lang_resp = language_service.get_language_switch_confirmation(
-                        target_lang, booking_session=booking_session
-                    )
+                if is_lang_switch:
+                    booking_session.conversation_language = "en"
+                    current_lang = "en"
+                    lang_resp = language_service.get_language_switch_confirmation()
 
                     norm_ans = _normalize_speech(lang_resp)
                     if norm_ans:
                         recent_ai_utterances.append(norm_ans)
                     last_ai_speech_time = time.time()
 
-                    await websocket.send_json({"type": "analysis", "intent": "LANGUAGE_SWITCH",
-                                               "emotion": "Neutral - 100%", "language": target_lang})
+                    await websocket.send_json({"type": "analysis", "intent": "LANGUAGE_REDIRECT",
+                                               "emotion": "Neutral - 100%", "language": "en"})
                     await websocket.send_json({"type": "response", "text": lang_resp})
 
-                    audio_response = await tts_service.synthesize_stream_chunk_async(lang_resp, language=target_lang)
+                    audio_response = await tts_service.synthesize_stream_chunk_async(lang_resp, language="en")
                     if audio_response and len(audio_response) > 100:
                         audio_base64 = base64.b64encode(audio_response).decode('utf-8')
                         await websocket.send_json({"type": "audio", "audio": audio_base64})

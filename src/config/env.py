@@ -191,7 +191,8 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     STT_PROVIDER: str = "deepgram"  # "deepgram", "faster-whisper", "whisper", "local"
     DEEPGRAM_API_KEY: Optional[str] = None
-    DEEPGRAM_MODEL: str = "nova-2-phonecall"
+    DEEPGRAM_MODEL: str = "nova-3"
+    DEEPGRAM_LANGUAGE: str = "en"
     DEEPGRAM_ENDPOINTING_MS: int = 300
     DEEPGRAM_UTTERANCE_END_MS: int = 1000
     STT_MODEL_SIZE: str = "tiny"

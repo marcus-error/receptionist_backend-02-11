@@ -181,15 +181,8 @@ class TTSService:
         _, default_murf_voice, default_murf_model = murf_tts.get_credentials()
         murf_model = default_murf_model
 
-        # Language-aware voice selection for natural speech
-        if target_gtts_lang == "ta":
-            selected_murf_voice = "ta-IN-iniya"
-        elif target_gtts_lang == "hi":
-            selected_murf_voice = "hi-IN-shweta"
-        elif target_gtts_lang in ("tanglish", "ta_mix"):
-            selected_murf_voice = "en-IN-isha"
-        else:
-            selected_murf_voice = voice_id or default_murf_voice or "en-IN-isha"
+        # Enforce English voice (en-IN-isha) for all syntheses
+        selected_murf_voice = voice_id or default_murf_voice or "en-IN-isha"
 
         murf_voice = selected_murf_voice
         effective_voice = murf_voice if tts_provider == "murf" else (voice_id or getattr(settings, "ELEVENLABS_VOICE_ID", "default"))

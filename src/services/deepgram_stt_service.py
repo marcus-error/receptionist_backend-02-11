@@ -59,7 +59,7 @@ class DeepgramStreamingSession:
         self.organization_id = organization_id
         self.keywords = keywords or []
         self.model = model or getattr(settings, "DEEPGRAM_MODEL", "nova-3") or "nova-3"
-        self.language = getattr(settings, "DEEPGRAM_LANGUAGE", "multi") or "multi"
+        self.language = getattr(settings, "DEEPGRAM_LANGUAGE", "en") or "en"
         raw_endpointing = endpointing_ms or getattr(settings, "DEEPGRAM_ENDPOINTING_MS", 300) or 300
         self.endpointing_ms = max(250, int(raw_endpointing))
         raw_u_end = utterance_end_ms or getattr(settings, "DEEPGRAM_UTTERANCE_END_MS", 1500) or 1500
@@ -114,7 +114,7 @@ class DeepgramStreamingSession:
             f"&sample_rate={self.sample_rate}"
             f"&channels=1"
             f"&model={self.model}"
-            f"&language={getattr(self, 'language', 'multi')}"
+            f"&language={getattr(self, 'language', 'en')}"
             f"&interim_results=true"
             f"&endpointing={self.endpointing_ms}"
             f"&utterance_end_ms={max(1000, self.utterance_end_ms)}"
@@ -123,7 +123,7 @@ class DeepgramStreamingSession:
             f"&numerals=true"
         )
         # Deepgram Nova-3 and multilingual endpoints reject 'keywords' with HTTP 400
-        is_multilingual_or_nova3 = (getattr(self, 'language', 'multi') == 'multi') or ('nova-3' in str(self.model))
+        is_multilingual_or_nova3 = ('nova-3' in str(self.model))
         kw_list = list(self.keywords)
         if not is_multilingual_or_nova3 and self.organization_id and not kw_list:
             try:
@@ -388,10 +388,8 @@ class DeepgramStreamingSession:
         alt = alternatives[0]
         transcript = (alt.get("transcript") or "").strip()
         confidence = alt.get("confidence", 0.0)
-        alt_langs = alt.get("languages") or []
-        detected_lang = alt_langs[0] if alt_langs else (channel.get("detected_language") or alt.get("detected_language") or "")
-        if detected_lang:
-            self._last_detected_language = str(detected_lang).lower().strip()
+        # Enforce English-only STT recognition
+        self._last_detected_language = "en" 
         is_final = data.get("is_final", False)
         speech_final = data.get("speech_final", False)
 
@@ -660,7 +658,7 @@ class DeepgramStreamingSession:
                 if asyncio.iscoroutine(res):
                     await res
             except Exception as e:
-                logger.error(f"[DG_FINAL_CALLBACK_ERR] {e}")
+                logger.error(f"[DG_FINAL_CALLBACK_ERR] call_id={self.call_id} utt_id={utt_id} text='{text}': {e}", exc_info=True)
 
     async def _handle_utterance_end(self, data: Dict[str, Any]):
         """Deepgram indicates customer finished speaking turn."""

@@ -16,10 +16,10 @@ class CallLogCreate(BaseModel):
     duration: Optional[str] = "02:14"
     caller_said: Optional[str] = None
     ai_response: Optional[str] = None
-    intent: Optional[str] = "Appointment Booking"
-    emotion: Optional[str] = "Neutral — 91%"
+    intent: Optional[str] = "General Inquiry"
+    emotion: Optional[str] = "Neutral"
     language: Optional[str] = "English"
-    rag_source: Optional[str] = "legal-services.pdf"
+    rag_source: Optional[str] = "Active Knowledge Base"
     receptionist_state: Optional[str] = None
 
 

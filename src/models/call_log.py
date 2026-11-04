@@ -40,10 +40,10 @@ class CallLog(Base):
     recording_duration = Column(Integer, nullable=True)  # in seconds
     recording_error = Column(Text, nullable=True)
 
-    intent = Column(String(150), default="Appointment Booking")
-    emotion = Column(String(100), default="Neutral — 91%")
+    intent = Column(String(150), default="General Inquiry")
+    emotion = Column(String(100), default="Neutral")
     language = Column(String(50), default="English")
-    rag_source = Column(String(255), default="legal-services.pdf")
+    rag_source = Column(String(255), default="Active Knowledge Base")
     receptionist_state = Column(Text, nullable=True)  # JSON or comma-separated steps
     messages = Column(Text().with_variant(LONGTEXT, "mysql"), default="[]")  # Store conversation history as JSON string
 

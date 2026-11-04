@@ -76,7 +76,7 @@ class STTService:
                 }
                 params = {
                     "model": getattr(settings, "DEEPGRAM_MODEL", "nova-3") or "nova-3",
-                    "language": getattr(settings, "DEEPGRAM_LANGUAGE", "multi") or "multi",
+                    "language": getattr(settings, "DEEPGRAM_LANGUAGE", "en") or "en",
                     "smart_format": "true",
                     "punctuate": "true",
                 }

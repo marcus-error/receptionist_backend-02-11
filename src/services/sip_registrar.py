@@ -370,28 +370,24 @@ try:
 
         def _patched_rtp_clear_tx(self_rtp):
             if hasattr(self_rtp, "pmout") and self_rtp.pmout:
-                if hasattr(self_rtp.pmout, "clear"):
-                    self_rtp.pmout.clear()
-                else:
-                    import io
-                    with getattr(self_rtp.pmout, "bufferLock", None) or nullcontext():
-                        self_rtp.pmout.buffer = io.BytesIO()
-                        self_rtp.pmout.log = {}
+                import io
+                with getattr(self_rtp.pmout, "bufferLock", None) or nullcontext():
+                    self_rtp.pmout.buffer = io.BytesIO()
+                    self_rtp.pmout.log = {}
+                    self_rtp.pmout.offset = getattr(self_rtp, "outOffset", 0)
         pyVoIP.RTP.RTPClient.clear_tx_buffer = _patched_rtp_clear_tx
 
-        # 2. Patch encode_pcmu to pass through pre-encoded 160-byte G.711 PCMU packets directly
+        # 2. Patch encode_pcmu to pass through pre-encoded 160-byte G.711 PCMU packets directly without corrupting voice samples
         def _patched_encode_pcmu(self, packet: bytes) -> bytes:
-            if not packet or packet == b"\xff" * len(packet) or packet == b"\x80" * len(packet):
+            if not packet or packet == b"\xff" * len(packet):
                 return b"\xff" * 160
-            if b"\x80" in packet and packet.endswith(b"\x80"):
-                packet = packet.replace(b"\x80", b"\xff")
             if len(packet) < 160:
                 return packet + (b"\xff" * (160 - len(packet)))
             return packet[:160]
         pyVoIP.RTP.RTPClient.encode_pcmu = _patched_encode_pcmu
         pyVoIP.RTP.RTPClient.encodePCMU = _patched_encode_pcmu
 
-        # 3. Patch RTP trans thread to use exact 20ms drift-free pacing and send 160-byte PCMU packets
+        # 3. Patch RTP trans thread to use exact 20ms drift-free pacing and dynamic payload type
         def _patched_trans(self):
             import time
             import logging
@@ -400,9 +396,14 @@ try:
             frame_duration = 0.020  # 20ms pacing (160 samples @ 8000Hz)
             pkt_count = 0
             
+            try:
+                pt = int(self.preference)
+            except Exception:
+                pt = 0
+
             logger.info(
                 f"[RTP_TX] Initialized RTP transmitter | dest={self.outIP}:{self.outPort} | "
-                f"src={self.inIP}:{self.inPort} | payload_type=0 (PCMU) | ssrc={self.outSSRC}"
+                f"src={self.inIP}:{self.inPort} | payload_type={pt} | ssrc={self.outSSRC}"
             )
             
             if hasattr(self, "sout") and self.sout:
@@ -417,7 +418,7 @@ try:
                 payload = self.encode_packet(payload)  # outputs 160 bytes PCMU
                 
                 packet = bytearray([0x80])  # V=2, P=0, X=0, CC=0
-                packet.append(0)  # PT=0 for PCMU / G.711 u-law
+                packet.append(pt)  # Dynamic PT from SDP negotiation (0=PCMU, 8=PCMA)
                 try:
                     packet.extend(self.outSequence.to_bytes(2, byteorder="big"))
                 except OverflowError:

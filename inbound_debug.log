@@ -3047,3 +3047,108 @@ a=maxptime:140
 a=sendrecv
 
   EXTRACTED: phone='+918270678370' name='+918270678370'
+
+[2026-11-04 14:18:16.909852] Call-ID=a3f8e29d-4e2c-4757-bfb1-ff5b212888e2
+  REQ_HEADERS: {'Via': [{'type': 'SIP/2.0/UDP', 'address': ('49.249.142.147', '5060'), 'rport': None, 'branch': 'z9hG4bKPje1563b1a-92a5-463f-879d-983ed7178b40'}], 'From': {'raw': '<sip:09092649453@49.249.142.147>', 'tag': '13657ff7-ed1b-4fd4-a824-b6052edabd74', 'address': '09092649453@49.249.142.147', 'number': '09092649453', 'caller': '', 'host': '49.249.142.147'}, 'To': {'raw': '<sip:09410697548@152.57.87.156:5080>', 'tag': '', 'address': '09410697548@152.57.87.156:5080', 'number': '09410697548', 'caller': '', 'host': '152.57.87.156:5080'}, 'Contact': '<sip:asterisk@49.249.142.147:5060>', 'Call-ID': 'a3f8e29d-4e2c-4757-bfb1-ff5b212888e2', 'CSeq': {'check': '6272', 'method': 'INVITE'}, 'Allow': ['OPTIONS', 'REGISTER', 'SUBSCRIBE', 'NOTIFY', 'PUBLISH', 'INVITE', 'ACK', 'BYE', 'CANCEL', 'UPDATE', 'PRACK', 'MESSAGE', 'INFO', 'REFER'], 'Supported': ['100rel', 'timer', 'replaces', 'norefersub', 'histinfo'], 'Session-Expires': '1800', 'Min-SE': '90', 'Max-Forwards': '70', 'User-Agent': 'Asterisk PBX 22.7.0', 'Content-Type': 'application/sdp', 'Content-Length': 265}
+  RAW_SIP:
+INVITE sip:09410697548@152.57.87.156:5080 SIP/2.0
+Via: SIP/2.0/UDP 49.249.142.147:5060;rport;branch=z9hG4bKPje1563b1a-92a5-463f-879d-983ed7178b40
+From: <sip:09092649453@49.249.142.147>;tag=13657ff7-ed1b-4fd4-a824-b6052edabd74
+To: <sip:09410697548@152.57.87.156:5080>
+Contact: <sip:asterisk@49.249.142.147:5060>
+Call-ID: a3f8e29d-4e2c-4757-bfb1-ff5b212888e2
+CSeq: 6272 INVITE
+Allow: OPTIONS, REGISTER, SUBSCRIBE, NOTIFY, PUBLISH, INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, MESSAGE, INFO, REFER
+Supported: 100rel, timer, replaces, norefersub, histinfo
+Session-Expires: 1800
+Min-SE: 90
+Max-Forwards: 70
+User-Agent: Asterisk PBX 22.7.0
+Content-Type: application/sdp
+Content-Length:   265
+
+v=0
+o=- 1242204864 1242204864 IN IP4 49.249.142.147
+s=Asterisk
+c=IN IP4 49.249.142.147
+t=0 0
+m=audio 19984 RTP/AVP 8 0 101
+a=rtpmap:8 PCMA/8000
+a=rtpmap:0 PCMU/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-16
+a=ptime:20
+a=maxptime:140
+a=sendrecv
+
+  EXTRACTED: phone='9092649453' name='Sanjay Kumar'
+
+[2026-11-04 16:19:06.977664] Call-ID=9b6c4dc7-30e2-493b-bf7f-0fec9c865eb0
+  REQ_HEADERS: {'Via': [{'type': 'SIP/2.0/UDP', 'address': ('49.249.142.147', '5060'), 'rport': None, 'branch': 'z9hG4bKPj08c5b886-ff95-4bd7-a3cd-d7c519034eaf'}], 'From': {'raw': '<sip:08270678370@49.249.142.147>', 'tag': '5182353b-37e7-4a0e-a155-e6f66f0b59e3', 'address': '08270678370@49.249.142.147', 'number': '08270678370', 'caller': '', 'host': '49.249.142.147'}, 'To': {'raw': '<sip:09410697548@27.4.1.135:5080>', 'tag': '', 'address': '09410697548@27.4.1.135:5080', 'number': '09410697548', 'caller': '', 'host': '27.4.1.135:5080'}, 'Contact': '<sip:asterisk@49.249.142.147:5060>', 'Call-ID': '9b6c4dc7-30e2-493b-bf7f-0fec9c865eb0', 'CSeq': {'check': '14960', 'method': 'INVITE'}, 'Allow': ['OPTIONS', 'REGISTER', 'SUBSCRIBE', 'NOTIFY', 'PUBLISH', 'INVITE', 'ACK', 'BYE', 'CANCEL', 'UPDATE', 'PRACK', 'MESSAGE', 'INFO', 'REFER'], 'Supported': ['100rel', 'timer', 'replaces', 'norefersub', 'histinfo'], 'Session-Expires': '1800', 'Min-SE': '90', 'Max-Forwards': '70', 'User-Agent': 'Asterisk PBX 22.7.0', 'Content-Type': 'application/sdp', 'Content-Length': 263}
+  RAW_SIP:
+INVITE sip:09410697548@27.4.1.135:5080 SIP/2.0
+Via: SIP/2.0/UDP 49.249.142.147:5060;rport;branch=z9hG4bKPj08c5b886-ff95-4bd7-a3cd-d7c519034eaf
+From: <sip:08270678370@49.249.142.147>;tag=5182353b-37e7-4a0e-a155-e6f66f0b59e3
+To: <sip:09410697548@27.4.1.135:5080>
+Contact: <sip:asterisk@49.249.142.147:5060>
+Call-ID: 9b6c4dc7-30e2-493b-bf7f-0fec9c865eb0
+CSeq: 14960 INVITE
+Allow: OPTIONS, REGISTER, SUBSCRIBE, NOTIFY, PUBLISH, INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, MESSAGE, INFO, REFER
+Supported: 100rel, timer, replaces, norefersub, histinfo
+Session-Expires: 1800
+Min-SE: 90
+Max-Forwards: 70
+User-Agent: Asterisk PBX 22.7.0
+Content-Type: application/sdp
+Content-Length:   263
+
+v=0
+o=- 108988051 108988051 IN IP4 49.249.142.147
+s=Asterisk
+c=IN IP4 49.249.142.147
+t=0 0
+m=audio 15898 RTP/AVP 8 0 101
+a=rtpmap:8 PCMA/8000
+a=rtpmap:0 PCMU/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-16
+a=ptime:20
+a=maxptime:140
+a=sendrecv
+
+  EXTRACTED: phone='+918270678370' name='+918270678370'
+
+[2026-11-04 16:19:44.204714] Call-ID=0dae7fd7-9cdf-4d1c-b8c3-796dc750236c
+  REQ_HEADERS: {'Via': [{'type': 'SIP/2.0/UDP', 'address': ('49.249.142.147', '5060'), 'rport': None, 'branch': 'z9hG4bKPj88993905-e760-4f3e-834e-a3374323933a'}], 'From': {'raw': '<sip:08270678370@49.249.142.147>', 'tag': '6bdf496a-3178-477a-aabf-b2bd84d83cc7', 'address': '08270678370@49.249.142.147', 'number': '08270678370', 'caller': '', 'host': '49.249.142.147'}, 'To': {'raw': '<sip:09410697548@27.4.1.135:5080>', 'tag': '', 'address': '09410697548@27.4.1.135:5080', 'number': '09410697548', 'caller': '', 'host': '27.4.1.135:5080'}, 'Contact': '<sip:asterisk@49.249.142.147:5060>', 'Call-ID': '0dae7fd7-9cdf-4d1c-b8c3-796dc750236c', 'CSeq': {'check': '3951', 'method': 'INVITE'}, 'Allow': ['OPTIONS', 'REGISTER', 'SUBSCRIBE', 'NOTIFY', 'PUBLISH', 'INVITE', 'ACK', 'BYE', 'CANCEL', 'UPDATE', 'PRACK', 'MESSAGE', 'INFO', 'REFER'], 'Supported': ['100rel', 'timer', 'replaces', 'norefersub', 'histinfo'], 'Session-Expires': '1800', 'Min-SE': '90', 'Max-Forwards': '70', 'User-Agent': 'Asterisk PBX 22.7.0', 'Content-Type': 'application/sdp', 'Content-Length': 265}
+  RAW_SIP:
+INVITE sip:09410697548@27.4.1.135:5080 SIP/2.0
+Via: SIP/2.0/UDP 49.249.142.147:5060;rport;branch=z9hG4bKPj88993905-e760-4f3e-834e-a3374323933a
+From: <sip:08270678370@49.249.142.147>;tag=6bdf496a-3178-477a-aabf-b2bd84d83cc7
+To: <sip:09410697548@27.4.1.135:5080>
+Contact: <sip:asterisk@49.249.142.147:5060>
+Call-ID: 0dae7fd7-9cdf-4d1c-b8c3-796dc750236c
+CSeq: 3951 INVITE
+Allow: OPTIONS, REGISTER, SUBSCRIBE, NOTIFY, PUBLISH, INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, MESSAGE, INFO, REFER
+Supported: 100rel, timer, replaces, norefersub, histinfo
+Session-Expires: 1800
+Min-SE: 90
+Max-Forwards: 70
+User-Agent: Asterisk PBX 22.7.0
+Content-Type: application/sdp
+Content-Length:   265
+
+v=0
+o=- 1542659977 1542659977 IN IP4 49.249.142.147
+s=Asterisk
+c=IN IP4 49.249.142.147
+t=0 0
+m=audio 14204 RTP/AVP 8 0 101
+a=rtpmap:8 PCMA/8000
+a=rtpmap:0 PCMU/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-16
+a=ptime:20
+a=maxptime:140
+a=sendrecv
+
+  EXTRACTED: phone='+918270678370' name='+918270678370'

@@ -177,28 +177,20 @@ class AgentEngine:
             except Exception:
                 pass
 
-        # 1. LANGUAGE DETECTION & EXPLICIT SWITCH
-        target_lang, is_lang_switch = language_service.check_explicit_language_switch(user_text)
-        if is_lang_switch and target_lang:
-            prev_lang = booking_session.conversation_language
-            booking_session.conversation_language = target_lang
-            current_lang = target_lang
-
-            logger.info(
-                f"[AGENT] [LANGUAGE SWITCH] '{prev_lang}' -> '{target_lang}' "
-                f"session={session_id} channel={channel}"
-            )
-            lang_resp = language_service.get_language_switch_confirmation(
-                target_lang, booking_session=booking_session
-            )
-            self._log_turn(session_id, user_text, lang_resp, "LANGUAGE_SWITCH", booking_session, channel=channel, emotion="Neutral - 100%")
+        # 1. ENGLISH-ONLY ENFORCEMENT & REDIRECTION GUARD
+        booking_session.conversation_language = "en"
+        current_lang = "en"
+        if language_service.is_language_switch_request(user_text) or language_service.is_non_english_input(user_text):
+            logger.info(f"[AGENT] [ENGLISH_ONLY_REDIRECT] Intercepted non-English input: '{user_text[:60]}'")
+            lang_resp = language_service.get_language_switch_confirmation()
+            self._log_turn(session_id, user_text, lang_resp, "LANGUAGE_REDIRECT", booking_session, channel=channel, emotion="Neutral - 100%")
             post_eval = booking_state_service.evaluate_post_response(booking_session)
 
             return {
                 "response": lang_resp,
-                "intent": "LANGUAGE_SWITCH",
+                "intent": "LANGUAGE_REDIRECT",
                 "emotion": "Neutral - 100%",
-                "language": target_lang,
+                "language": "en",
                 "stage": booking_session.current_stage,
                 "next_action": post_eval.get("next_action", NextAction.USER_INPUT_REQUIRED),
                 "quick_actions": self.get_quick_actions(booking_session),
@@ -207,12 +199,6 @@ class AgentEngine:
                 "active_rag_title": active_doc_title,
                 "telemetry": tracker.log_summary()
             }
-
-        # Determine conversation language
-        current_lang = language_service.determine_conversation_language(
-            user_text, current_lang=booking_session.conversation_language
-        )
-        booking_session.conversation_language = current_lang
         tracker.mark("language_detected_at")
 
         # Always extract slots (name, contact, email, date, time) to keep conversation state current
@@ -278,10 +264,7 @@ class AgentEngine:
 
         if _is_explicit_handoff_request:
             handoff_msg = "I am connecting you to our human representative right away. Please wait a moment."
-            if current_lang in ("ta", "tanglish", "ta_mix"):
-                handoff_msg = "உங்களை எங்கள் human representative-க்கு transfer செய்கிறேன். ஒரு நிமிடம் காத்திருங்கள்."
-            elif current_lang == "hi":
-                handoff_msg = "Main aapko hamare human representative se connect kar raha hoon. Kripya ek pal intezar karein."
+
 
             handoff_data = {
                 "status": "initiated",
@@ -313,10 +296,7 @@ class AgentEngine:
         if intent_name == "callback":
             cb_phone = booking_session.phone_number or "your phone number"
             cb_msg = f"I have registered your callback request for {cb_phone}. Our team will contact you shortly."
-            if current_lang in ("ta", "tanglish", "ta_mix"):
-                cb_msg = f"உங்க callback request register பண்ணியாச்சு. எங்கள் team உங்களை விரைவில் தொடர்புகொள்வார்கள்."
-            elif current_lang == "hi":
-                cb_msg = f"Aapka callback request note kar liya gaya hai. Hamari team aapse jaldi sampark karegi."
+
 
             callback_data = {
                 "phone": booking_session.phone_number,
