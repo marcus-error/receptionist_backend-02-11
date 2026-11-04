@@ -1,0 +1,344 @@
+import asyncio
+import logging
+import pytest
+import os
+import sys
+
+from src.config.database import SessionLocal, init_db
+from src.models.knowledge_doc import KnowledgeDocument, KnowledgeDocStatus
+from src.models.organization import Organization
+from src.services.rag_service import rag_service
+from src.services.sip_call_handler import SipCallSession
+from src.services.knowledge_service import KnowledgeService
+
+logger = logging.getLogger("test_active_script_greeting_flow")
+logging.basicConfig(level=logging.INFO)
+
+
+@pytest.fixture(autouse=True)
+def setup_test_environment():
+    init_db()
+    db = SessionLocal()
+    # Ensure test organizations exist
+    org1 = db.query(Organization).filter(Organization.id == 1).first()
+    if not org1:
+        db.add(Organization(id=1, name="Sarans Healthcare"))
+    org2 = db.query(Organization).filter(Organization.id == 2).first()
+    if not org2:
+        db.add(Organization(id=2, name="Chennai Speciality Clinic"))
+    db.commit()
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_three_script_activation_and_greeting_flow():
+    """
+    Test with three clearly different active scripts:
+    1. Activate Script 1 (English Hospital) -> verify exact greeting spoken.
+    2. Activate Script 2 (Apollo Heart Center) -> verify exact greeting spoken.
+    3. Activate Script 3 (Tamil Inpatient Script) -> verify exact Tamil greeting spoken.
+    """
+    db = SessionLocal()
+    spoken_greetings = []
+
+    def mock_audio_send(data):
+        pass
+
+    try:
+        # ── SCRIPT 1: Sarans Hospitals ────────────────────────────
+        s1 = db.query(KnowledgeDocument).filter(KnowledgeDocument.title == "Test_Sarans_Script_1").first()
+        if not s1:
+            s1 = KnowledgeDocument(
+                title="Test_Sarans_Script_1",
+                organization_id=1,
+                document_type="SCRIPT",
+                scope="inbound",
+                ai_usage="Active",
+                status=KnowledgeDocStatus.INDEXED,
+                content="""# SARANS HOSPITALS INBOUND SCRIPT
+# 1. Greeting & Call Opening
+"Good morning! Welcome to Sarans Hospitals. How may I help you today?"
+
+# 2. Departments
+- Cardiology
+- Dental Care"""
+            )
+            db.add(s1)
+            db.commit()
+        else:
+            s1.ai_usage = "Active"
+            s1.content = """# SARANS HOSPITALS INBOUND SCRIPT
+# 1. Greeting & Call Opening
+"Good morning! Welcome to Sarans Hospitals. How may I help you today?"
+
+# 2. Departments
+- Cardiology
+- Dental Care"""
+            db.commit()
+
+        # Deactivate any other script for org 1
+        db.query(KnowledgeDocument).filter(
+            KnowledgeDocument.organization_id == 1,
+            KnowledgeDocument.id != s1.id
+        ).update({"ai_usage": "Inactive"})
+        db.commit()
+        rag_service.invalidate_caches(1)
+
+        # Place Call 1 for Org 1
+        call1 = SipCallSession(
+            caller_phone="+919876543210",
+            organization_id=1,
+            audio_send_callback=mock_audio_send
+        )
+        call1._speak = lambda text, intent="", metrics=None: spoken_greetings.append((1, text)) or asyncio.sleep(0)
+        await call1._send_opening_greeting()
+
+        assert len(spoken_greetings) == 1
+        assert spoken_greetings[-1][0] == 1
+        assert spoken_greetings[-1][1] == "Good morning! Welcome to Sarans Hospitals. How may I help you today?"
+        assert call1.active_script_id == str(s1.id)
+
+        # ── SCRIPT 2: Apollo Heart Center (Switch Script for Org 1) ─
+        s2 = db.query(KnowledgeDocument).filter(KnowledgeDocument.title == "Test_Apollo_Script_2").first()
+        if not s2:
+            s2 = KnowledgeDocument(
+                title="Test_Apollo_Script_2",
+                organization_id=1,
+                document_type="SCRIPT",
+                scope="inbound",
+                ai_usage="Active",
+                status=KnowledgeDocStatus.INDEXED,
+                content="""Voice Greeting: "Good afternoon, thank you for calling Apollo Heart Center. This is Ava, how may I direct your call?"
+
+# Doctor Directory
+- Dr. Ramesh (Cardiology)"""
+            )
+            db.add(s2)
+            db.commit()
+        else:
+            s2.ai_usage = "Active"
+            db.commit()
+
+        # Activate s2 and deactivate s1
+        s1.ai_usage = "Inactive"
+        db.commit()
+        rag_service.invalidate_caches(1)
+
+        # Place Call 2 for Org 1
+        call2 = SipCallSession(
+            caller_phone="+919876543211",
+            organization_id=1,
+            audio_send_callback=mock_audio_send
+        )
+        call2._speak = lambda text, intent="", metrics=None: spoken_greetings.append((2, text)) or asyncio.sleep(0)
+        await call2._send_opening_greeting()
+
+        assert len(spoken_greetings) == 2
+        assert spoken_greetings[-1][0] == 2
+        assert spoken_greetings[-1][1] == "Good afternoon, thank you for calling Apollo Heart Center. This is Ava, how may I direct your call?"
+        assert call2.active_script_id == str(s2.id)
+
+        # ── SCRIPT 3: Tamil Hospital Script for Org 2 ───────────────
+        s3 = db.query(KnowledgeDocument).filter(KnowledgeDocument.title == "Test_Tamil_Script_3").first()
+        tamil_greeting_expected = "வணக்கம்! அப்பல்லோ மருத்துவமனைக்கு உங்களை அன்புடன் வரவேற்கிறோம். இன்று நான் உங்களுக்கு எவ்வாறு உதவ முடியும்?"
+        if not s3:
+            s3 = KnowledgeDocument(
+                title="Test_Tamil_Script_3",
+                organization_id=2,
+                document_type="SCRIPT",
+                scope="inbound",
+                ai_usage="Active",
+                status=KnowledgeDocStatus.INDEXED,
+                content=f"""# 1. GREETING
+"{tamil_greeting_expected}"
+
+# 2. சிகிச்சைகள்"""
+            )
+            db.add(s3)
+            db.commit()
+        else:
+            s3.ai_usage = "Active"
+            s3.content = f"""# 1. GREETING
+"{tamil_greeting_expected}"
+
+# 2. சிகிச்சைகள்"""
+            db.commit()
+
+        rag_service.invalidate_caches(2)
+
+        # Place Call 3 for Org 2
+        call3 = SipCallSession(
+            caller_phone="+919876543212",
+            organization_id=2,
+            audio_send_callback=mock_audio_send
+        )
+        call3._speak = lambda text, intent="", metrics=None: spoken_greetings.append((3, text)) or asyncio.sleep(0)
+        await call3._send_opening_greeting()
+
+        assert len(spoken_greetings) == 3
+        assert spoken_greetings[-1][0] == 3
+        assert spoken_greetings[-1][1] == tamil_greeting_expected
+        assert call3.active_script_id == str(s3.id)
+        assert call3.current_lang == "ta"
+
+        # ── SCRIPT 4: Thanglish Dialogue Script for Org 1 ───────────
+        s4 = db.query(KnowledgeDocument).filter(KnowledgeDocument.title == "Test_Thanglish_Script_4").first()
+        thanglish_greeting_expected = "Vanakkam! Sarans Dental Clinic-ku ungalai anbudan varaverkirom. Enna treatment venum?"
+        if not s4:
+            s4 = KnowledgeDocument(
+                title="Test_Thanglish_Script_4",
+                organization_id=1,
+                document_type="SCRIPT",
+                scope="inbound",
+                ai_usage="Active",
+                status=KnowledgeDocStatus.INDEXED,
+                content=f"""Receptionist: "{thanglish_greeting_expected}"
+Customer: Root canal treatment venum."""
+            )
+            db.add(s4)
+            db.commit()
+        else:
+            s4.ai_usage = "Active"
+            s4.content = f"""Receptionist: "{thanglish_greeting_expected}"
+Customer: Root canal treatment venum."""
+            db.commit()
+
+        # Deactivate s2 for org 1
+        s2.ai_usage = "Inactive"
+        db.commit()
+        rag_service.invalidate_caches(1)
+
+        # Place Call 4 for Org 1
+        call4 = SipCallSession(
+            caller_phone="+919876543213",
+            organization_id=1,
+            audio_send_callback=mock_audio_send
+        )
+        call4._speak = lambda text, intent="", metrics=None: spoken_greetings.append((4, text)) or asyncio.sleep(0)
+        await call4._send_opening_greeting()
+
+        assert len(spoken_greetings) == 4
+        assert spoken_greetings[-1][0] == 4
+        assert spoken_greetings[-1][1] == thanglish_greeting_expected
+        assert call4.active_script_id == str(s4.id)
+
+    finally:
+        # Cleanup test scripts
+        db.query(KnowledgeDocument).filter(
+            KnowledgeDocument.title.in_([
+                "Test_Sarans_Script_1", "Test_Apollo_Script_2",
+                "Test_Tamil_Script_3", "Test_Thanglish_Script_4"
+            ])
+        ).delete(synchronize_session=False)
+        db.commit()
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_greeting_section_in_active_script():
+    """
+    Verify that if an active script has NO greeting section (only doctors/info),
+    the system does NOT silently speak a generic greeting or filename.
+    """
+    db = SessionLocal()
+    spoken_greetings = []
+
+    def mock_audio_send(data):
+        pass
+
+    try:
+        s_no_greeting = KnowledgeDocument(
+            title="Test_No_Greeting_Script",
+            organization_id=1,
+            document_type="SCRIPT",
+            scope="inbound",
+            ai_usage="Active",
+            status=KnowledgeDocStatus.INDEXED,
+            content="""# HOSPITAL INFORMATION
+Hospital Name: ABC General Hospital
+# DEPARTMENTS
+- Cardiology
+# DOCTOR DIRECTORY
+Dr Priya"""
+        )
+        db.add(s_no_greeting)
+        db.commit()
+
+        # Deactivate all others for org 1
+        db.query(KnowledgeDocument).filter(
+            KnowledgeDocument.organization_id == 1,
+            KnowledgeDocument.id != s_no_greeting.id
+        ).update({"ai_usage": "Inactive"})
+        db.commit()
+        rag_service.invalidate_caches(1)
+
+        # Extract greeting check directly
+        greeting, doc_id, doc_title = rag_service.get_active_greeting(1)
+        assert greeting is None or greeting == "", "Greeting must be None or empty when no greeting section is present"
+
+        # Call session check
+        call = SipCallSession(
+            caller_phone="+919876543220",
+            organization_id=1,
+            audio_send_callback=mock_audio_send
+        )
+        call._speak = lambda text, intent="", metrics=None: spoken_greetings.append(text) or asyncio.sleep(0)
+        await call._send_opening_greeting()
+
+        # MUST NOT speak any generic greeting!
+        assert len(spoken_greetings) == 0, "No spoken greeting must be delivered when script lacks greeting section"
+
+    finally:
+        db.query(KnowledgeDocument).filter(KnowledgeDocument.title == "Test_No_Greeting_Script").delete(synchronize_session=False)
+        db.commit()
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_empty_script_handling():
+    """Verify that an empty script logs configuration error and does not speak a fallback greeting."""
+    db = SessionLocal()
+    spoken_greetings = []
+
+    def mock_audio_send(data):
+        pass
+
+    try:
+        s_empty = KnowledgeDocument(
+            title="Test_Empty_Script",
+            organization_id=1,
+            document_type="SCRIPT",
+            scope="inbound",
+            ai_usage="Active",
+            status=KnowledgeDocStatus.INDEXED,
+            content=""
+        )
+        db.add(s_empty)
+        db.commit()
+
+        # Deactivate all others for org 1
+        db.query(KnowledgeDocument).filter(
+            KnowledgeDocument.organization_id == 1,
+            KnowledgeDocument.id != s_empty.id
+        ).update({"ai_usage": "Inactive"})
+        db.commit()
+        rag_service.invalidate_caches(1)
+
+        greeting, doc_id, doc_title = rag_service.get_active_greeting(1)
+        assert greeting is None or greeting == "", "Greeting must be None or empty for empty script"
+
+        call = SipCallSession(
+            caller_phone="+919876543221",
+            organization_id=1,
+            audio_send_callback=mock_audio_send
+        )
+        call._speak = lambda text, intent="", metrics=None: spoken_greetings.append(text) or asyncio.sleep(0)
+        await call._send_opening_greeting()
+
+        assert len(spoken_greetings) == 0, "No spoken greeting must be delivered for empty script"
+
+    finally:
+        db.query(KnowledgeDocument).filter(KnowledgeDocument.title == "Test_Empty_Script").delete(synchronize_session=False)
+        db.commit()
+        db.close()
+
