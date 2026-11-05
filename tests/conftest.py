@@ -57,9 +57,14 @@ from src.models import (
     appointment, call_log, knowledge_doc, staff, user,
     organization, permission, subscription, department,
     twilio_config, sip_config, email_config, whatsapp_config,
-    calendar_config, gemini_account, workflow, lead, webhook
+    calendar_config, gemini_account, workflow, lead, webhook,
+    audit_log, crm
 )
 from src.models import settings as settings_model
+try:
+    from src.services.reminder_service import Reminder
+except Exception:
+    pass
 
 # Create tables in test database
 db_mod.Base.metadata.create_all(bind=test_engine)
@@ -91,9 +96,12 @@ def isolate_test_environment():
         from src.models.settings import AppSettings
 
         if not session.query(Organization).filter(Organization.id == 1).first():
-            session.add(Organization(id=1, name="Synthetic Test Enterprise", organization_type="General", status="active"))
+            session.add(Organization(id=1, name="Synthetic Test Enterprise", organization_type="General", status="active", is_protected=True))
+        else:
+            org1 = session.query(Organization).filter(Organization.id == 1).first()
+            org1.is_protected = True
         if not session.query(Organization).filter(Organization.id == 2).first():
-            session.add(Organization(id=2, name="Synthetic Second Tenant", organization_type="General", status="active"))
+            session.add(Organization(id=2, name="Synthetic Second Tenant", organization_type="General", status="active", is_protected=False))
         if not session.query(AppSettings).first():
             session.add(AppSettings())
         session.commit()

@@ -202,15 +202,14 @@ async def sip_inbound_call(
 
         # Create an AI session for this call (webhook-based audio bridging).
         # Pass call_sid explicitly so the registry key matches the DB record.
-        from src.services.sip_call_handler import register_call, unregister_call
+        from src.services.sip_call_handler import register_call, unregister_call, CallType
         session = SipCallSession(
             caller_phone=payload.caller_phone,
             caller_name=payload.caller_name,
+            call_type=CallType.INBOUND,
+            call_sid=call_sid,
             organization_id=inbound_org_id,
         )
-        # Re-register with the correct call_sid (overrides the auto-generated one)
-        unregister_call(session.call_sid)
-        session.call_sid = call_sid
         session.session_id = f"sip_session_{call_sid}"
         session.db_call_id = call.id
         register_call(session)

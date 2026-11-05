@@ -16,6 +16,9 @@ from typing import Tuple, Optional, Dict, Any
 logger = logging.getLogger(__name__)
 
 LANG_ENGLISH = "en"
+LANG_TAMIL = "ta"
+LANG_HINDI = "hi"
+LANG_SPANISH = "es"
 ENGLISH_ONLY_REDIRECT_MESSAGE = "I can only assist you in English. Please could you continue in English?"
 
 # Non-English detection patterns (Spanish, Hindi, Tamil, Telugu, Malayalam, Kannada, French, German, etc.)

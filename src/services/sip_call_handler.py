@@ -621,12 +621,14 @@ class SipCallSession:
         # Determine Inbound vs Outbound call direction
         if call_type is not None:
             self.call_type = call_type
-        elif self.call_sid.startswith("sip_out") or "Outbound" in str(caller_name):
+        elif self.call_sid.startswith("sip_out") or self.call_sid.startswith("out_"):
             self.call_type = CallType.OUTBOUND
         else:
             self.call_type = CallType.INBOUND
 
         self.agent_id           = agent_id or "default_receptionist"
+        self.active_script_title: Optional[str] = None
+        self.active_script_greeting: Optional[str] = None
         from src.services.rag_service import rag_service
         dir_scope = "outbound" if self.call_type == CallType.OUTBOUND else "inbound"
         self.active_script_id   = active_script_id or rag_service._resolve_active_document_id(self.organization_id, document_type="SCRIPT", scope=dir_scope)
@@ -694,6 +696,8 @@ class SipCallSession:
         self.booking_session.active_rag_id = self.active_knowledge_id
         self.booking_session.caller_phone = self.caller_phone
         self.booking_session.caller_name = self.caller_name
+        self.booking_session.call_type = self.call_type
+        self.booking_session.call_direction = "OUTBOUND" if self.call_type == CallType.OUTBOUND else "INBOUND" 
         # Keep caller_phone on session, but do not auto-assign contact_number without customer confirmation
         # Task 3: Per-call isolated language state
         self.call_id = self.call_sid
@@ -2046,6 +2050,7 @@ class SipCallSession:
                 organization_id=self.organization_id,
                 conversation_state=self.booking_session.get_state_dict(),
                 outbound_script=getattr(self, "outbound_script", None),
+                call_direction="OUTBOUND" if self.call_type == CallType.OUTBOUND else "INBOUND",
             )
 
             sentence_queue = asyncio.Queue()
@@ -2332,7 +2337,7 @@ class SipCallSession:
 
             active_id = getattr(self, "_current_active_utt_id", None) or (metrics.get("utt_id") if metrics else None)
             if active_id:
-                ai_utt_id = f"ai_{active_id}" if not str(active_id).startswith("ai_") else str(active_id)
+                ai_utt_id = str(active_id) if (str(active_id).startswith("ai_") or str(active_id).startswith("utt_")) else f"ai_{active_id}"
             else:
                 ai_utt_id = f"ai_{uuid.uuid4().hex[:8]}"
             utt_id = ai_utt_id
@@ -2373,9 +2378,8 @@ class SipCallSession:
                         f"\n  call_id={self.call_sid}"
                         f"\n  source=AI"
                         f"\n  audio_source=AI_TTS_MONITOR"
-                        f"\n  bytes={len(audio_bytes)}"
-                        f"\n  sample_rate=8000"
-                        f"\n  duration_ms={round(len(audio_bytes)/16)}"
+                        f"\n  compressed_bytes={len(audio_bytes)}"
+                        f"\n  mime_type={mime}"
                     )
 
                 is_chunk = bool(metrics and metrics.get("is_chunk"))
@@ -2649,22 +2653,45 @@ class SipCallSession:
 
     async def _send_opening_greeting(self):
         try:
+            if getattr(self.booking_session, "greeting_sent", False):
+                logger.info(f"[GREETING_ALREADY_SENT] Greeting already sent for call {self.call_sid}; skipping duplicate.")
+                return
+
+            call_direction = "OUTBOUND" if self.call_type == CallType.OUTBOUND else "INBOUND"
             dir_scope = "outbound" if self.call_type == CallType.OUTBOUND else "inbound"
             doc_to_use = self.active_script_id or self.active_knowledge_id
-            greeting, script_id, script_title = rag_service.get_active_greeting(
+
+            details = rag_service.get_active_greeting_details(
                 organization_id=self.organization_id,
                 document_id=doc_to_use,
                 scope=dir_scope
             )
+            greeting = details.get("greeting")
+            script_id = details.get("script_id")
+            script_title = details.get("script_title")
+            extracted_greeting = details.get("extracted_greeting", "")
+            selected_source = details.get("source", "ACTIVE_SCRIPT")
+            cache_hit = details.get("cache_hit", False)
+            cache_version = details.get("cache_version", "v1")
+
             if script_id:
                 self.active_script_id = str(script_id)
                 self.active_script_title = script_title
                 self.active_script_greeting = greeting
 
+            # If no active script exists at all (script_id is None), apply dynamic DB greeting fallback
+            if (not greeting or not greeting.strip()) and script_id is None:
+                greeting = rag_service.extract_short_greeting("", organization_id=self.organization_id, scope=dir_scope)
+                selected_source = "DYNAMIC_DB_FALLBACK"
+                extracted_greeting = ""
+                cache_version = "db_v1"
+                cache_hit = False
+
             if not greeting or not greeting.strip():
                 logger.error(
                     f"\n[GREETING_CONFIG_ERROR]"
                     f"\n  call_id={self.call_sid}"
+                    f"\n  call_direction={call_direction}"
                     f"\n  organization_id={self.organization_id}"
                     f"\n  active_script_id={script_id or 'none'}"
                     f"\n  active_script_title='{script_title or 'none'}'"
@@ -2672,52 +2699,86 @@ class SipCallSession:
                 )
                 return
 
+            final_script_id = self.active_script_id or (str(script_id) if script_id else 'none')
+            final_script_title = getattr(self, 'active_script_title', None) or script_title or 'none'
+            final_greeting_text = greeting
+            tts_input_text = greeting
+            utt_id = "utt_greeting"
+
+            # Mandatory diagnostic log matching user specification exactly
             logger.info(
-                f"\n[GREETING_SCRIPT_RESOLUTION]"
+                f"\n[GREETING_SELECTION_DIAGNOSTIC]"
                 f"\n  call_id={self.call_sid}"
-                f"\n  organization_id={self.organization_id}"
-                f"\n  active_script_id={self.active_script_id or 'none'}"
-                f"\n  active_script_title='{self.active_script_title or 'none'}'"
-                f"\n  script_status={'ACTIVE' if self.active_script_id else 'MISSING'}"
+                f"\n  call_direction={call_direction}"
+                f"\n  organisation_id={self.organization_id}"
+                f"\n  active_script_id={final_script_id}"
+                f"\n  active_script_title='{final_script_title}'"
+                f"\n  selected_greeting_source={selected_source}"
+                f"\n  extracted_greeting='{extracted_greeting}'"
+                f"\n  final_greeting_text='{final_greeting_text}'"
+                f"\n  greeting_cache_hit={cache_hit}"
+                f"\n  cache_version={cache_version}"
+                f"\n  TTS_input_text='{tts_input_text}'"
+                f"\n  RTP_utterance_id={utt_id}"
             )
+
+            # Verification: Ensure final_greeting_text and TTS_input_text match exactly
+            assert final_greeting_text == tts_input_text, "final_greeting_text and TTS_input_text must match exactly"
 
             logger.info(
                 f"\n[GREETING_RESPONSE]"
-                f"\n  source=ACTIVE_SCRIPT_GREETING"
+                f"\n  call_id={self.call_sid}"
+                f"\n  call_direction={call_direction}"
+                f"\n  source={selected_source}"
                 f"\n  organization_id={self.organization_id}"
-                f"\n  active_script_id={script_id}"
-                f"\n  response_text='{greeting}'"
+                f"\n  active_script_id={final_script_id}"
+                f"\n  response_text='{final_greeting_text}'"
             )
 
-            # Enforce English greeting
             greeting_lang = "en"
             self.current_lang = "en"
 
             logger.info(
                 f"\n[GREETING_TTS]"
-                f"\n  source=ACTIVE_SCRIPT"
+                f"\n  call_id={self.call_sid}"
+                f"\n  call_direction={call_direction}"
+                f"\n  source={selected_source}"
                 f"\n  status=SYNTHESIZING"
                 f"\n  language={greeting_lang}"
-                f"\n  text='{greeting}'"
+                f"\n  text='{tts_input_text}'"
             )
 
             self.booking_session.greeting_sent = True
             self.booking_session.conversation_started = True
-            self.session_history.append({"role": "model", "text": greeting})
-            if not (self.booking_session.history and self.booking_session.history[-1].get("text") == greeting):
-                self.booking_session.history.append({"role": "model", "text": greeting})
-            asyncio.create_task(asyncio.to_thread(self._log_to_db, "assistant", greeting, "greeting"))
-            if not str(self.caller_name).startswith("Outbound"):
-                logger.info(f"[INBOUND AI STARTED] Playing AI greeting for call_sid={self.call_sid}: '{greeting[:60]}...'")
-            await self._speak(greeting, "greeting", {"utt_id": "utt_greeting", "is_greeting": True, "source": "ACTIVE_SCRIPT_GREETING"})
+            self.session_history.append({"role": "model", "text": final_greeting_text})
+            if not (self.booking_session.history and self.booking_session.history[-1].get("text") == final_greeting_text):
+                self.booking_session.history.append({"role": "model", "text": final_greeting_text})
+            asyncio.create_task(asyncio.to_thread(self._log_to_db, "assistant", final_greeting_text, "greeting"))
+            if call_direction == "INBOUND":
+                logger.info(f"[INBOUND AI STARTED] Playing AI greeting for call_sid={self.call_sid}: '{final_greeting_text[:60]}...'")
+            else:
+                logger.info(f"[OUTBOUND AI STARTED] Playing AI greeting for call_sid={self.call_sid}: '{final_greeting_text[:60]}...'")
+
+            await self._speak(
+                tts_input_text,
+                "greeting",
+                {
+                    "utt_id": utt_id,
+                    "is_greeting": True,
+                    "source": selected_source,
+                    "call_direction": call_direction
+                }
+            )
 
             logger.info(
                 f"\n[GREETING_TTS]"
-                f"\n  source=ACTIVE_SCRIPT"
+                f"\n  call_id={self.call_sid}"
+                f"\n  call_direction={call_direction}"
+                f"\n  source={selected_source}"
                 f"\n  status=SUCCESS"
             )
         except Exception as exc:
-            logger.error(f"[GREETING ERROR] {exc}")
+            logger.error(f"[GREETING ERROR] {exc}", exc_info=True)
         finally:
             self._ai_speaking = False
             self._last_ai_speak_end_time = time.monotonic()

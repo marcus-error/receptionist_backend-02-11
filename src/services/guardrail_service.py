@@ -77,7 +77,7 @@ class GuardrailService:
         return {"is_safe": True, "refusal_needed": False}
 
     @staticmethod
-    def validate_and_sanitize_response(raw_response: str) -> str:
+    def validate_and_sanitize_response(raw_response: str, call_direction: str = "INBOUND", org_name: str = "") -> str:
         """
         Validates LLM response for internal label leakage and cleans output for voice TTS.
         """
@@ -137,6 +137,24 @@ class GuardrailService:
                     response_text = cleaned_str + '.'
         elif response_text and response_text[-1] not in ('.', '!', '?', ')', '"', '”', '|', '।'):
             response_text += '.'
+
+        # Step 6: Ensure Inbound calls NEVER say "I'm calling from..." or "This is ... calling"
+        if (call_direction or "").upper() == "INBOUND":
+            inbound_bad_phrases = re.compile(
+                r'\b(?:this\s+is\s+([A-Za-z0-9\s&\'\-]+?)\s+calling|'
+                r'i(?:\'m|\s+am)\s+calling\s+from\s+([A-Za-z0-9\s&\'\-]+?)|'
+                r'i\s+am\s+calling\s+on\s+behalf\s+of\s+([A-Za-z0-9\s&\'\-]+?))'
+                r'(?:\.|\?|\!|,|\s+how\s+may|\s+how\s+can|\s*\n|$)',
+                re.IGNORECASE
+            )
+            m_bad = inbound_bad_phrases.search(response_text)
+            if m_bad:
+                extracted_org = m_bad.group(1) or m_bad.group(2) or m_bad.group(3) or org_name or "our office"
+                clean_org = extracted_org.strip()
+                if clean_org.isupper():
+                    clean_org = clean_org.title()
+                logger.warning(f"[GUARDRAIL INBOUND DIRECTION SANITIZED] Corrected outbound phrase to inbound in: '{response_text}'")
+                response_text = inbound_bad_phrases.sub(f"You've reached {clean_org}. How may I help you?", response_text)
 
         if leak_detected and not response_text:
             return "I am glad to assist you with any questions regarding our organization or appointments."

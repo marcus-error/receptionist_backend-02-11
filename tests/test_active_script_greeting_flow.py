@@ -96,7 +96,7 @@ async def test_three_script_activation_and_greeting_flow():
 
         assert len(spoken_greetings) == 1
         assert spoken_greetings[-1][0] == 1
-        assert "Welcome to Sarans Hospitals" in spoken_greetings[-1][1]
+        assert "Sarans Hospitals" in spoken_greetings[-1][1] and ("Thank you for calling" in spoken_greetings[-1][1] or "Welcome to" in spoken_greetings[-1][1])
         assert "How may I assist you" in spoken_greetings[-1][1] or "How may I help you" in spoken_greetings[-1][1]
         assert call1.active_script_id == str(s1.id)
 
@@ -137,7 +137,7 @@ async def test_three_script_activation_and_greeting_flow():
 
         assert len(spoken_greetings) == 2
         assert spoken_greetings[-1][0] == 2
-        assert "Welcome to Apollo Heart Center" in spoken_greetings[-1][1]
+        assert "Apollo Heart Center" in spoken_greetings[-1][1] and ("Thank you for calling" in spoken_greetings[-1][1] or "Welcome to" in spoken_greetings[-1][1])
         assert "How may I assist you" in spoken_greetings[-1][1] or "How may I direct your call" in spoken_greetings[-1][1]
         assert call2.active_script_id == str(s2.id)
 
@@ -183,7 +183,7 @@ async def test_three_script_activation_and_greeting_flow():
 
         assert len(spoken_greetings) == 3
         assert spoken_greetings[-1][0] == 3
-        assert "Welcome to City Dental Clinic" in spoken_greetings[-1][1]
+        assert "City Dental Clinic" in spoken_greetings[-1][1] and ("Thank you for calling" in spoken_greetings[-1][1] or "Welcome to" in spoken_greetings[-1][1])
         assert "How may I assist you" in spoken_greetings[-1][1]
         assert call3.active_script_id == str(s3.id)
         assert call3.current_lang == "en"

@@ -64,7 +64,7 @@ Voice Greeting: "Good morning! Welcome to Sarans Hospitals. How may I assist you
 
         greeting, doc_id, doc_title = rag_service.get_active_greeting(1)
         logger.info(f"Org 1 -> Greeting: '{greeting}', Doc ID: {doc_id}, Doc Title: {doc_title}")
-        assert "Welcome to Sarans Hospitals" in greeting and "How may I assist you" in greeting
+        assert ("Thank you for calling Sarans Hospitals" in greeting or "Welcome to Sarans Hospitals" in greeting) and "How may I assist you" in greeting
         assert not greeting.endswith(".pdf"), "Greeting must not end with .pdf"
         assert not greeting.endswith(".txt"), "Greeting must not end with .txt"
         assert greeting != doc_title, "Greeting must not be the raw document title or filename"

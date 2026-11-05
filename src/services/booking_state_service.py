@@ -86,6 +86,8 @@ class BookingSession:
 
         self.caller_name: Optional[str] = None
         self.caller_phone: Optional[str] = None
+        self.call_direction: str = "INBOUND"
+        self.call_type: str = "INBOUND"
         self.patient_relationship: Optional[str] = None
         self.is_booking_for_other: bool = False
 
@@ -641,6 +643,8 @@ class BookingSession:
             "agent_id": self.agent_id,
             "organization_id": self.organization_id,
             "active_rag_id": self.active_rag_id or self.active_doc_id,
+            "call_direction": getattr(self, "call_direction", "INBOUND"),
+            "call_type": str(getattr(self, "call_type", "INBOUND")),
             "conversation_started": self.conversation_started,
             "greeting_sent": self.greeting_sent,
             "turn_id": self.turn_id,

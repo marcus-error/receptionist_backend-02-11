@@ -104,6 +104,7 @@ class RagService:
         self.collection = chroma_vector_store
         self.bm25_scorer = BM25Scorer()
         self._org_context_cache: Dict[str, str] = {}
+        self._greeting_cache: Dict[str, Dict[str, Any]] = {}
         self._verified_indexed_docs: set = set()
         logger.info("[RAG SERVICE] ChromaDB Vector Store initialized successfully as primary.")
 
@@ -243,6 +244,10 @@ class RagService:
                 keys_to_del = [k for k in self._rag_query_cache if prefix_query in str(k) or str(k).startswith(prefix2)]
                 for k in keys_to_del:
                     del self._rag_query_cache[k]
+            if hasattr(self, "_greeting_cache"):
+                keys_to_del = [k for k in self._greeting_cache if str(k).startswith(prefix1) or str(k).startswith(prefix2)]
+                for k in keys_to_del:
+                    del self._greeting_cache[k]
             if hasattr(self, "_doc_version_cache"):
                 self._doc_version_cache.clear()
 
@@ -565,9 +570,26 @@ class RagService:
 
     def get_organization_name(self, organization_id: Optional[int] = None, document_id: Optional[str] = None, scope: Optional[str] = None) -> str:
         """
-        Dynamically extracts the Organization / Business Name from the active Knowledge Base.
+        Dynamically extracts the Organization / Business Name from the database or active Knowledge Base.
         Returns empty string if no custom brand is specified.
         """
+        # Strict Rule 3: Fetch the organisation name dynamically from the database first
+        if organization_id:
+            try:
+                from src.config.database import SessionLocal
+                from src.models.organization import Organization
+                db = SessionLocal()
+                try:
+                    org = db.query(Organization).filter(Organization.id == int(organization_id)).first()
+                    if org and org.name and org.name.strip().lower() not in {"default organization", "organization", "company", "business", "unknown", "none"}:
+                        res_name = org.name.strip()
+                        res_name = re.sub(r'\bAi\b', 'AI', res_name)
+                        return res_name
+                finally:
+                    db.close()
+            except Exception:
+                pass
+
         master_ctx = self.get_organization_master_context(organization_id, document_id=document_id, scope=scope)
         if master_ctx:
             match = re.search(
@@ -577,6 +599,11 @@ class RagService:
             )
             if match:
                 clean_name = re.sub(r'[*_#`]', '', match.group(1)).strip()
+                if clean_name.isupper():
+                    clean_name = clean_name.title()
+                clean_name = re.sub(r'\bAi\b', 'AI', clean_name)
+                clean_name = re.sub(r'\bUsa\b', 'USA', clean_name)
+                clean_name = re.sub(r'\bLlc\b', 'LLC', clean_name)
                 if len(clean_name) > 1 and not any(w in clean_name.lower() for w in ["unknown", "n/a", "none"]):
                     return clean_name
 
@@ -586,6 +613,9 @@ class RagService:
                 clean_w = re.sub(r'[*_#`]', '', m_welcome.group(1)).strip()
                 if clean_w.isupper():
                     clean_w = clean_w.title()
+                clean_w = re.sub(r'\bAi\b', 'AI', clean_w)
+                clean_w = re.sub(r'\bUsa\b', 'USA', clean_w)
+                clean_w = re.sub(r'\bLlc\b', 'LLC', clean_w)
                 if len(clean_w) > 2 and not any(w in clean_w.lower() for w in ["unknown", "n/a", "none", "our team", "the call", "doctor", "dr."]):
                     return clean_w
 
@@ -604,7 +634,11 @@ class RagService:
                 for sp in stop_phrases:
                     candidate = re.sub(re.escape(sp), '', candidate, flags=re.IGNORECASE).strip()
                 candidate = re.sub(r'\s*(?:inbound|outbound)?\s*script\s*$', '', candidate, flags=re.IGNORECASE).strip()
-                if candidate.isupper(): candidate = candidate.title()
+                if candidate.isupper():
+                    candidate = candidate.title()
+                candidate = re.sub(r'\bAi\b', 'AI', candidate)
+                candidate = re.sub(r'\bUsa\b', 'USA', candidate)
+                candidate = re.sub(r'\bLlc\b', 'LLC', candidate)
                 if candidate and len(candidate) > 2 and not any(w in candidate.lower() for w in ["script", "receptionist", "knowledge base", "directory"]):
                     return candidate
 
@@ -628,23 +662,10 @@ class RagService:
                         title_clean = re.sub(r'^(master_rag_knowledge_base_|rag_knowledge_base_|knowledge_base_)', '', title_clean, flags=re.IGNORECASE)
                         title_clean = re.sub(r'(_rag)?(_inbound|_outbound)?(_script)?(_fine_tuned)?$', '', title_clean, flags=re.IGNORECASE)
                         title_clean = title_clean.replace('_', ' ').strip().title()
+                        title_clean = re.sub(r'\bAi\b', 'AI', title_clean)
                         bad_generic_keywords = ["simple english", "knowledge base", "master rag", "script", "document", "receptionist", "test"]
                         if title_clean and not any(kw in title_clean.lower() for kw in bad_generic_keywords) and len(title_clean) > 2:
                             return title_clean
-                finally:
-                    db.close()
-            except Exception:
-                pass
-
-        if organization_id:
-            try:
-                from src.config.database import SessionLocal
-                from src.models.organization import Organization
-                db = SessionLocal()
-                try:
-                    org = db.query(Organization).filter(Organization.id == int(organization_id)).first()
-                    if org and org.name and org.name.strip().lower() not in {"default organization", "organization", "company", "business", "unknown", "none"}:
-                        return org.name
                 finally:
                     db.close()
             except Exception:
@@ -716,11 +737,11 @@ class RagService:
         if not text or not text.strip():
             return ""
         clean_src = text.strip()
-        quote_chars = '"\'“”‘’«»„‟'
+        quote_chars = '"\'“”‘’«»„‟\x91\x92\x93\x94\u201c\u201d\u2018\u2019'
 
-        # 1. Look for explicit GREETING section header
+        # 1. Look for explicit GREETING section header on its own line (using horizontal whitespace so it never crosses newlines)
         hdr_regex = re.compile(
-            r'(?m)^[\s*\-•#]*(?:\d+[\.\)]\s*)?(?:\*\*|__)?'
+            r'(?m)^[ \t*\-•#]*(?:\d+[\.\)][ \t]*)?(?:\*\*|__)?'
             r'(?:Voice Greeting|Inbound Greeting|Outbound Greeting|Opening Greeting|Receptionist Greeting|'
             r'Greeting\s*(?:&|and|/)\s*Call Opening|Call Opening\s*(?:&|and|/)\s*Greeting|'
             r'(?:Outbound|Inbound|Voice|Phone)?\s*Call Opening|'
@@ -728,27 +749,31 @@ class RagService:
             r'Welcome Greeting|Opening Message|Approved Greeting|Initial Greeting|'
             r'Standard Greeting|Spoken Greeting|Approved Spoken Greeting|Welcome Message|'
             r'Phone Greeting|First Response|Opening|Introduction|Greeting|வரவேற்பு|வணக்கம்)'
-            r'(?:\*\*|__)?\s*[:\-\]]?\s*([^\n\r]*)',
+            r'(?:\*\*|__)?[ \t]*(?:[:\-\]][ \t]*)?([^\r\n]*)',
             re.IGNORECASE
         )
 
         for m in hdr_regex.finditer(clean_src):
             same_line = m.group(1).strip()
-            # Case A: Same line contains quotes
-            q_match = re.search(r'[' + quote_chars + r']\s*(.+?)\s*[' + quote_chars + r']', same_line, re.DOTALL)
+            post_text = clean_src[m.end():]
+
+            # A. Check for quoted text in block (handles both single-line and multiline quoted greetings)
+            block_text = (same_line + "\n" + post_text).strip() if same_line else post_text.strip()
+            q_match = re.search(r'[' + quote_chars + r']\s*(.+?)\s*[' + quote_chars + r']', block_text, re.DOTALL)
             if q_match:
                 candidate = self._clean_spoken_text(q_match.group(1))
                 if self._is_valid_spoken_greeting(candidate, doc_title):
-                    return candidate
+                    # Ensure candidate doesn't cross into subsequent section headers
+                    if not re.search(r'\n\s*#+\s+|\n\s*(?:Page\s+\d+|[A-Z0-9\s]{4,}:)', candidate):
+                        return candidate
 
-            # Case B: Same line has spoken text after colon/dash
-            if same_line:
+            # B. If same_line has complete spoken text after colon/dash
+            if same_line and not any(same_line.startswith(q) for q in quote_chars):
                 candidate = self._clean_spoken_text(same_line)
-                if self._is_valid_spoken_greeting(candidate, doc_title):
+                if self._is_valid_spoken_greeting(candidate, doc_title) and any(candidate.endswith(p) for p in [".", "!", "?"]):
                     return candidate
 
-            # Case C: Check lines immediately following the heading
-            post_text = clean_src[m.end():]
+            # C. Collect lines immediately following the heading until section break or complete paragraph
             lines = post_text.splitlines()
             collected = []
             for line in lines[:10]:
@@ -758,15 +783,16 @@ class RagService:
                         break
                     continue
                 # Stop if hitting another section header
-                if re.match(r'^[\s*\-•#]*(?:[A-Z0-9\.\s]{3,}:|#|\d+\.)', l_str) and not any(l_str.lower().startswith(p) for p in ["receptionist", "ai", "agent", "say"]):
+                if re.match(r'^[ \t*\-•#]*(?:[A-Z0-9\.\s]{4,}:|#+\s+|\d+\.)', l_str) and not any(l_str.lower().startswith(p) for p in ["receptionist", "ai", "agent", "say"]):
                     break
-                # Check for quote in this line
-                q_line = re.search(r'[' + quote_chars + r']\s*(.+?)\s*[' + quote_chars + r']', l_str, re.DOTALL)
-                if q_line:
-                    candidate = self._clean_spoken_text(q_line.group(1))
-                    if self._is_valid_spoken_greeting(candidate, doc_title):
-                        return candidate
+                if l_str.lower().startswith("page "):
+                    break
                 collected.append(l_str)
+                # Check if we have formed a complete greeting ending with sentence punctuation
+                cand = self._clean_spoken_text(" ".join(collected))
+                if any(cand.endswith(p) for p in [".", "!", "?"]) and len(cand.split()) >= 8:
+                    if self._is_valid_spoken_greeting(cand, doc_title):
+                        return cand
 
             if collected:
                 full_candidate = self._clean_spoken_text(" ".join(collected))
@@ -837,55 +863,116 @@ class RagService:
             return "Good morning"
 
     @classmethod
-    def _apply_time_aware_prefix(cls, greeting: str, org_name: str = "", organization_id: Optional[int] = None, scope: Optional[str] = None) -> str:
+    def _condense_to_short_greeting(cls, greeting: str, resolved_org: str = "", time_prefix: str = "Good morning", scope: Optional[str] = None) -> str:
+        """
+        Distills and shapes a crisp, natural, professional 1-sentence opening.
+        Strict Rules:
+        - Inbound calls ALWAYS use: "Good [time of day]! Thank you for calling [Organisation Name]. How may I assist you?"
+        - Never generate phrases like "This is [Org] calling", "I'm calling from...", "I am calling on behalf of...".
+        - Outbound calls preserve customer confirmation ("Good [time]. Am I speaking with...").
+        """
+        import re as _re
+        g = cls._clean_spoken_text(greeting or "").strip()
+        scope_str = str(scope or "").lower()
+        is_outbound = "outbound" in scope_str
+
+        if not resolved_org or resolved_org.strip().lower() in ("default organization", "unknown", "none", "us"):
+            resolved_org = "our team"
+        elif resolved_org.isupper():
+            resolved_org = resolved_org.title()
+
+        if resolved_org:
+            resolved_org = _re.sub(r'\bAi\b', 'AI', resolved_org)
+
+        if is_outbound:
+            m_cust = _re.search(r'(am i speaking with\s+[^?]+(?:\?|$))', g, _re.IGNORECASE)
+            if m_cust:
+                cust_q = m_cust.group(1).strip()
+                if not cust_q.endswith("?"):
+                    cust_q += "?"
+                cust_q = cust_q[0].upper() + cust_q[1:]
+                return f"{time_prefix}. {cust_q}"
+            if resolved_org != "our team":
+                return f"{time_prefix}. This is {resolved_org} calling. How may I assist you?"
+            return f"{time_prefix}. This is our team calling. How may I assist you?"
+
+        # Inbound call: Always use "Thank you for calling [Organisation Name]"
+        return f"{time_prefix}! Thank you for calling {resolved_org}. How may I assist you?"
+
+    @classmethod
+    def _apply_time_aware_prefix(cls, greeting: str, org_name: str = "", organization_id: Optional[int] = None, scope: Optional[str] = None, short: bool = True) -> str:
         """Dynamically shapes opening greeting according to standard structure:
-        "Good [morning/afternoon/evening]. Welcome to [Organization Name]. How may I assist you?"
+        "Good [morning/afternoon/evening]! Thank you for calling [Organization Name]. How may I assist you?"
         - Organization name comes dynamically from authenticated organization / database.
         - Strict time-of-day prefix based on actual call time in configured timezone:
           * Good morning: 5:00 AM to 11:59 AM
           * Good afternoon: 12:00 PM to 4:59 PM
           * Good evening: 5:00 PM to 4:59 AM
+        - Inbound calls ALWAYS use:
+          "Good [time of day]! Thank you for calling [Organisation Name]. How may I assist you?"
         - Never uses hardcoded organization names.
         """
         import re as _re
         time_prefix = cls._get_time_aware_greeting_prefix(organization_id=organization_id)
         resolved_org = ""
-        m_org = _re.search(r'welcome to\s+([A-Za-z0-9\s&\'\-]+?)(?:\.|\?|\!|,|how may|thank you|\n|$)', greeting, _re.IGNORECASE)
-        if m_org:
-            extracted = m_org.group(1).strip()
-            if len(extracted) > 2 and extracted.lower() not in ("default organization", "unknown", "none", "our team", "the call"):
-                resolved_org = extracted
 
-        if not resolved_org:
-            resolved_org = org_name or rag_service.get_organization_name(organization_id)
+        # 1. Check if the greeting itself contains an explicit organization brand (from active script)
+        if greeting:
+            m_org = _re.search(r'(?:welcome to|thank you for calling|thanks for calling|this is)\s+([A-Za-z0-9\s&\'\-]+?)(?:\.|\?|\!|,|\s+how may|\s+how can|\s+thank you|\n|$)', greeting, _re.IGNORECASE)
+            if m_org:
+                extracted = m_org.group(1).strip()
+                if len(extracted) > 2 and extracted.lower() not in ("default organization", "organization", "company", "business", "unknown", "none", "our team", "the call", "us"):
+                    resolved_org = extracted
+
+        # 2. Check if explicit org_name passed
+        if not resolved_org and org_name and org_name.strip().lower() not in ("default organization", "organization", "company", "business", "unknown", "none"):
+            resolved_org = org_name.strip()
+
+        # 3. Fetch organisation name dynamically from the database
+        if not resolved_org and organization_id is not None:
+            resolved_org = rag_service.get_organization_name(organization_id)
 
         if resolved_org and resolved_org.isupper():
             resolved_org = resolved_org.title()
+        if resolved_org:
+            resolved_org = _re.sub(r'\bAi\b', 'AI', resolved_org)
         if not resolved_org or resolved_org.strip().lower() in ("default organization", "unknown", "none"):
             resolved_org = "our team"
 
         g = (greeting or "").strip()
-        time_pattern = r'^(?:good\s+morning\s*/\s*afternoon|good\s+morning\s*/\s*evening|good\s+morning|good\s+afternoon|good\s+evening)[.,!?;:\s]*'
-        if _re.search(time_pattern, g, _re.IGNORECASE):
-            rest = _re.sub(time_pattern, '', g, count=1, flags=_re.IGNORECASE).strip()
-            if rest:
-                rest = rest[0].upper() + rest[1:]
-                return f"{time_prefix}. {rest}"
-            return time_prefix
-
-        if _re.search(r'^(?:welcome to|this is|thank you for calling)', g, _re.IGNORECASE):
-            return f"{time_prefix}. {g}"
-
-        if g and len(g) > 10:
-            return f"{time_prefix}. {g}"
-
         scope_str = str(scope or "").lower()
-        if "outbound" in scope_str:
+        is_outbound = "outbound" in scope_str
+
+        if short:
+            return cls._condense_to_short_greeting(g, resolved_org=resolved_org, time_prefix=time_prefix, scope=scope)
+
+        # Non-condensed raw preservation (for testing raw extraction only when short=False explicitly passed)
+        if is_outbound:
             return f"{time_prefix}. This is {resolved_org} calling. How may I assist you?"
-        return f"{time_prefix}. Welcome to {resolved_org}. How may I assist you?"
+        return f"{time_prefix}! Thank you for calling {resolved_org}. How may I assist you?"
 
+    def extract_short_greeting(
+        self,
+        raw_greeting: str = "",
+        org_name: str = "",
+        organization_id: Optional[int] = None,
+        scope: Optional[str] = None,
+        doc_title: Optional[str] = None,
+    ) -> str:
+        """
+        Dynamically extracts and condenses the short greeting from script content or generates
+        a short dynamic fallback using the organization name from the database.
+        Always returns a short, natural, professional opening (ideally one sentence).
+        """
+        return self._apply_time_aware_prefix(
+            greeting=raw_greeting,
+            org_name=org_name,
+            organization_id=organization_id,
+            scope=scope,
+            short=True
+        )
 
-    def synthesize_greeting_from_doc(self, content: str, doc_title: str = "", scope: Optional[str] = None) -> str:
+    def synthesize_greeting_from_doc(self, content: str, doc_title: str = "", scope: Optional[str] = None, organization_id: Optional[int] = None) -> str:
         """
         Constructs an appropriate opening greeting using the organization name, role,
         and style defined in an active knowledge document when no explicit greeting section exists.
@@ -920,30 +1007,44 @@ class RagService:
             org_name = "our team"
 
         scope_str = str(scope or "").lower()
+        time_prefix = self._get_time_aware_greeting_prefix(organization_id=organization_id)
         if "outbound" in scope_str:
-            time_prefix = self._get_time_aware_greeting_prefix()
             return f"{time_prefix}. This is {org_name} calling. How may I assist you?"
         else:
-            time_prefix = self._get_time_aware_greeting_prefix()
-            return f"{time_prefix}. Welcome to {org_name}. How may I assist you?"
+            return f"{time_prefix}! Thank you for calling {org_name}. How may I assist you?"
 
-    def get_active_greeting(
+    def get_active_greeting_details(
         self,
         organization_id: Optional[int] = None,
         document_id: Optional[str] = None,
         scope: Optional[str] = None,
-    ) -> Tuple[Optional[str], Optional[int], Optional[str]]:
+        short: bool = True,
+        allow_db_fallback: bool = False,
+    ) -> Dict[str, Any]:
         """
-        Dynamically retrieves the greeting strictly from the currently ACTIVE script or knowledge document for the organization.
-        Returns: (greeting_text, active_script_doc_id, active_script_title)
+        Dynamically retrieves the greeting strictly from the currently ACTIVE script or knowledge document for the organization,
+        returning full diagnostic details:
+        {
+            "greeting": str or None,
+            "script_id": int or None,
+            "script_title": str or None,
+            "extracted_greeting": str,
+            "source": str,  # ACTIVE_SCRIPT, ACTIVE_KNOWLEDGE_DOC, DYNAMIC_DB_FALLBACK, NONE
+            "cache_hit": bool,
+            "cache_version": str
+        }
+        """
+        if not hasattr(self, "_greeting_cache"):
+            self._greeting_cache = {}
 
-        Rules:
-        - The active script is the ONLY source for the greeting.
-        - If the document is a general knowledge document with organization info but no explicit greeting section,
-          synthesizes an appropriate greeting using the organization name and style defined in the document.
-        - Under NO circumstance falls back to a hardcoded generic greeting like 'Hello! How can I help you today?'.
-        - If no active document exists at all, returns (None, None, None) and logs CONFIGURATION_ERROR.
-        """
+        time_prefix = self._get_time_aware_greeting_prefix(organization_id=organization_id)
+        cache_key = f"org_{organization_id}_doc_{document_id}_scope_{scope}_short_{short}_time_{time_prefix}"
+
+        if cache_key in self._greeting_cache:
+            res = dict(self._greeting_cache[cache_key])
+            res["cache_hit"] = True
+            return res
+
         try:
             from src.config.database import SessionLocal
             from src.models.knowledge_doc import KnowledgeDocument, KnowledgeDocStatus
@@ -995,9 +1096,10 @@ class RagService:
                             f"\n  script_status=ACTIVE"
                         )
 
-                        greeting = self.extract_greeting_from_content(content, is_script_doc=True, doc_title=doc_explicit.title)
-                        if greeting:
-                            greeting = self._apply_time_aware_prefix(greeting, organization_id=organization_id, scope=scope)
+                        raw_greeting = self.extract_greeting_from_content(content, is_script_doc=True, doc_title=doc_explicit.title)
+                        cache_ver = self._get_document_version(doc_explicit.id)
+                        if raw_greeting:
+                            greeting = self._apply_time_aware_prefix(raw_greeting, organization_id=organization_id, scope=scope, short=short)
                             logger.info(
                                 f"\n[GREETING_EXTRACTION]"
                                 f"\n  source='{doc_explicit.title}'"
@@ -1005,10 +1107,20 @@ class RagService:
                                 f"\n  extracted_text='{greeting}'"
                                 f"\n  extraction_status=SUCCESS"
                             )
-                            return (greeting, doc_explicit.id, doc_explicit.title)
+                            details = {
+                                "greeting": greeting,
+                                "script_id": doc_explicit.id,
+                                "script_title": doc_explicit.title,
+                                "extracted_greeting": raw_greeting,
+                                "source": "ACTIVE_SCRIPT",
+                                "cache_hit": False,
+                                "cache_version": cache_ver or "v1",
+                            }
+                            self._greeting_cache[cache_key] = details
+                            return details
                         elif doc_explicit.document_type not in ["SCRIPT", "INBOUND_SCRIPT", "OUTBOUND_SCRIPT"] and content and content.strip():
                             # Priority 2: General knowledge document with organization info but no explicit greeting section
-                            synth_greeting = self.synthesize_greeting_from_doc(content, doc_explicit.title, scope=scope)
+                            synth_greeting = self.synthesize_greeting_from_doc(content, doc_explicit.title, scope=scope, organization_id=organization_id)
                             logger.info(
                                 f"\n[GREETING_EXTRACTION]"
                                 f"\n  source='{doc_explicit.title}'"
@@ -1016,7 +1128,17 @@ class RagService:
                                 f"\n  extracted_text='{synth_greeting}'"
                                 f"\n  extraction_status=SUCCESS"
                             )
-                            return (synth_greeting, doc_explicit.id, doc_explicit.title)
+                            details = {
+                                "greeting": synth_greeting,
+                                "script_id": doc_explicit.id,
+                                "script_title": doc_explicit.title,
+                                "extracted_greeting": "synthesized_from_document_identity",
+                                "source": "ACTIVE_KNOWLEDGE_DOC",
+                                "cache_hit": False,
+                                "cache_version": cache_ver or "v1",
+                            }
+                            self._greeting_cache[cache_key] = details
+                            return details
                         else:
                             logger.warning(
                                 f"\n[GREETING_EXTRACTION]"
@@ -1028,7 +1150,28 @@ class RagService:
                             logger.error(
                                 f"[GREETING_CONFIG_ERROR] Active script id={doc_explicit.id} ('{doc_explicit.title}') does not contain a greeting section."
                             )
-                            return (None, doc_explicit.id, doc_explicit.title)
+                            if allow_db_fallback:
+                                db_fallback = self.extract_short_greeting("", organization_id=organization_id, scope=scope, doc_title=doc_explicit.title)
+                                details = {
+                                    "greeting": db_fallback,
+                                    "script_id": doc_explicit.id,
+                                    "script_title": doc_explicit.title,
+                                    "extracted_greeting": "",
+                                    "source": "DYNAMIC_DB_FALLBACK",
+                                    "cache_hit": False,
+                                    "cache_version": "db_v1",
+                                }
+                                self._greeting_cache[cache_key] = details
+                                return details
+                            return {
+                                "greeting": None,
+                                "script_id": doc_explicit.id,
+                                "script_title": doc_explicit.title,
+                                "extracted_greeting": "",
+                                "source": "NONE",
+                                "cache_hit": False,
+                                "cache_version": "none",
+                            }
 
                 # 2. Dynamic active script lookup directly from SQLite
                 base_q = db.query(KnowledgeDocument).filter(
@@ -1060,7 +1203,6 @@ class RagService:
 
                 scope_str = str(scope or "inbound").lower()
                 if "outbound" in scope_str:
-                    # Outbound: try dedicated outbound script first, then general scripts
                     outbound_cand = base_q.filter(
                         (KnowledgeDocument.document_type.in_(["OUTBOUND_SCRIPT", "CAMPAIGN_SCRIPT"])) |
                         KnowledgeDocument.title.ilike("%outbound%") |
@@ -1109,10 +1251,32 @@ class RagService:
                         f"\n  extracted_text=none"
                         f"\n  extraction_status=NO_ACTIVE_SCRIPT"
                     )
+                    if allow_db_fallback and organization_id is not None:
+                        db_fallback = self.extract_short_greeting("", organization_id=organization_id, scope=scope)
+                        logger.info(f"[GREETING_DB_FALLBACK] Using dynamic DB greeting fallback for org {organization_id}: '{db_fallback}'")
+                        details = {
+                            "greeting": db_fallback,
+                            "script_id": None,
+                            "script_title": None,
+                            "extracted_greeting": "",
+                            "source": "DYNAMIC_DB_FALLBACK",
+                            "cache_hit": False,
+                            "cache_version": "db_v1",
+                        }
+                        self._greeting_cache[cache_key] = details
+                        return details
                     logger.error(
                         f"[GREETING_CONFIG_ERROR] No active script configured for organization_id={organization_id}."
                     )
-                    return (None, None, None)
+                    return {
+                        "greeting": None,
+                        "script_id": None,
+                        "script_title": None,
+                        "extracted_greeting": "",
+                        "source": "NONE",
+                        "cache_hit": False,
+                        "cache_version": "none",
+                    }
 
                 for doc in candidate_docs:
                     logger.info(
@@ -1137,9 +1301,10 @@ class RagService:
                         continue
 
                     is_script = (doc.document_type in ["SCRIPT", "INBOUND_SCRIPT"]) or ("script" in (doc.title or "").lower())
-                    greeting = self.extract_greeting_from_content(raw_content, is_script_doc=is_script, doc_title=doc.title)
-                    if greeting:
-                        greeting = self._apply_time_aware_prefix(greeting, organization_id=organization_id, scope=scope)
+                    raw_greeting = self.extract_greeting_from_content(raw_content, is_script_doc=is_script, doc_title=doc.title)
+                    cache_ver = self._get_document_version(doc.id)
+                    if raw_greeting:
+                        greeting = self._apply_time_aware_prefix(raw_greeting, organization_id=organization_id, scope=scope, short=short)
                         logger.info(
                             f"\n[GREETING_EXTRACTION]"
                             f"\n  source='{doc.title}'"
@@ -1147,9 +1312,19 @@ class RagService:
                             f"\n  extracted_text='{greeting}'"
                             f"\n  extraction_status=SUCCESS"
                         )
-                        return (greeting, doc.id, doc.title)
+                        details = {
+                            "greeting": greeting,
+                            "script_id": doc.id,
+                            "script_title": doc.title,
+                            "extracted_greeting": raw_greeting,
+                            "source": "ACTIVE_SCRIPT",
+                            "cache_hit": False,
+                            "cache_version": cache_ver or "v1",
+                        }
+                        self._greeting_cache[cache_key] = details
+                        return details
                     elif doc.document_type not in ["SCRIPT", "INBOUND_SCRIPT", "OUTBOUND_SCRIPT"] and raw_content and raw_content.strip():
-                        synth_greeting = self.synthesize_greeting_from_doc(raw_content, doc.title, scope=scope)
+                        synth_greeting = self.synthesize_greeting_from_doc(raw_content, doc.title, scope=scope, organization_id=organization_id)
                         logger.info(
                             f"\n[GREETING_EXTRACTION]"
                             f"\n  source='{doc.title}'"
@@ -1157,7 +1332,17 @@ class RagService:
                             f"\n  extracted_text='{synth_greeting}'"
                             f"\n  extraction_status=SUCCESS"
                         )
-                        return (synth_greeting, doc.id, doc.title)
+                        details = {
+                            "greeting": synth_greeting,
+                            "script_id": doc.id,
+                            "script_title": doc.title,
+                            "extracted_greeting": "synthesized_from_document_identity",
+                            "source": "ACTIVE_KNOWLEDGE_DOC",
+                            "cache_hit": False,
+                            "cache_version": cache_ver or "v1",
+                        }
+                        self._greeting_cache[cache_key] = details
+                        return details
                     else:
                         logger.warning(
                             f"\n[GREETING_EXTRACTION]"
@@ -1169,14 +1354,96 @@ class RagService:
                         logger.error(
                             f"[GREETING_CONFIG_ERROR] Active script id={doc.id} ('{doc.title}') does not contain a greeting section."
                         )
+                        if allow_db_fallback:
+                            db_fallback = self.extract_short_greeting("", organization_id=organization_id, scope=scope, doc_title=doc.title)
+                            details = {
+                                "greeting": db_fallback,
+                                "script_id": doc.id,
+                                "script_title": doc.title,
+                                "extracted_greeting": "",
+                                "source": "DYNAMIC_DB_FALLBACK",
+                                "cache_hit": False,
+                                "cache_version": "db_v1",
+                            }
+                            self._greeting_cache[cache_key] = details
+                            return details
 
                 top_doc = candidate_docs[0]
-                return (None, top_doc.id, top_doc.title)
+                if allow_db_fallback and organization_id is not None:
+                    db_fallback = self.extract_short_greeting("", organization_id=organization_id, scope=scope, doc_title=top_doc.title)
+                    details = {
+                        "greeting": db_fallback,
+                        "script_id": top_doc.id,
+                        "script_title": top_doc.title,
+                        "extracted_greeting": "",
+                        "source": "DYNAMIC_DB_FALLBACK",
+                        "cache_hit": False,
+                        "cache_version": "db_v1",
+                    }
+                    self._greeting_cache[cache_key] = details
+                    return details
+                return {
+                    "greeting": None,
+                    "script_id": top_doc.id,
+                    "script_title": top_doc.title,
+                    "extracted_greeting": "",
+                    "source": "NONE",
+                    "cache_hit": False,
+                    "cache_version": "none",
+                }
             finally:
                 db.close()
         except Exception as exc:
-            logger.error(f"[GREETING_ERROR] Error resolving active greeting: {exc}")
-            return (None, None, None)
+            logger.error(f"[GREETING_ERROR] Error resolving active greeting details: {exc}")
+            return {
+                "greeting": None,
+                "script_id": None,
+                "script_title": None,
+                "extracted_greeting": "",
+                "source": "ERROR",
+                "cache_hit": False,
+                "cache_version": "none",
+            }
+
+    def get_active_greeting(
+        self,
+        organization_id: Optional[int] = None,
+        document_id: Optional[str] = None,
+        scope: Optional[str] = None,
+        short: bool = True,
+        allow_db_fallback: bool = False,
+    ) -> Tuple[Optional[str], Optional[int], Optional[str]]:
+        """
+        Dynamically retrieves the greeting strictly from the currently ACTIVE script or knowledge document for the organization.
+        Returns: (greeting_text, active_script_doc_id, active_script_title)
+        """
+        details = self.get_active_greeting_details(
+            organization_id=organization_id,
+            document_id=document_id,
+            scope=scope,
+            short=short,
+            allow_db_fallback=allow_db_fallback,
+        )
+        return (details.get("greeting"), details.get("script_id"), details.get("script_title"))
+
+    def get_active_short_greeting(
+        self,
+        organization_id: Optional[int] = None,
+        document_id: Optional[str] = None,
+        scope: Optional[str] = None,
+        allow_db_fallback: bool = True,
+    ) -> Tuple[Optional[str], Optional[int], Optional[str]]:
+        """
+        Convenience method to retrieve the dynamic short greeting.
+        Returns: (greeting_text, active_script_doc_id, active_script_title)
+        """
+        return self.get_active_greeting(
+            organization_id=organization_id,
+            document_id=document_id,
+            scope=scope,
+            short=True,
+            allow_db_fallback=allow_db_fallback
+        )
 
     def invalidate_caches(self, organization_id: Optional[int] = None):
         """Clears all in-memory caches for the organization or globally."""
@@ -1186,10 +1453,10 @@ class RagService:
     def get_organization_greeting(self, organization_id: Optional[int] = None, document_id: Optional[str] = None, scope: Optional[str] = None) -> str:
         """
         Dynamically extracts the approved opening Receptionist Greeting directly from the active script,
-        or constructs a natural, time-aware greeting using the extracted organization name.
+        distilled into a crisp, short, professional 1-sentence greeting.
         """
-        greeting, _, _ = self.get_active_greeting(organization_id=organization_id, document_id=document_id, scope=scope)
-        return greeting
+        greeting, _, _ = self.get_active_greeting(organization_id=organization_id, document_id=document_id, scope=scope, short=True, allow_db_fallback=True)
+        return greeting or ""
     def get_organization_hours(self, organization_id: Optional[int] = None, document_id: Optional[str] = None) -> Optional[str]:
         master_ctx = self.get_organization_master_context(organization_id, document_id=document_id)
         if master_ctx:

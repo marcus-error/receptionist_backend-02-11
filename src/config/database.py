@@ -53,8 +53,7 @@ def init_db() -> None:
     from src.models import workflow  # noqa: F401
     from src.models import lead  # noqa: F401
     from src.models import webhook  # noqa: F401
-
-
+    from src.models import audit_log  # noqa: F401
 
     if settings.DB_AUTO_CREATE:
         Base.metadata.create_all(bind=engine)

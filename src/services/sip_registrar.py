@@ -9,6 +9,10 @@ try:
     if hasattr(pyVoIP, "REGISTER_FAILURE_THRESHOLD"):
         pyVoIP.REGISTER_FAILURE_THRESHOLD = 999999
 
+    # Enforce strictly G.711 PCMU (Payload Type 0) and DTMF telephone-event (101) to prevent PCMA/PCMU mismatch
+    if hasattr(pyVoIP, "RTPCompatibleCodecs"):
+        pyVoIP.RTPCompatibleCodecs = [pyVoIP.RTP.PayloadType.PCMU, pyVoIP.RTP.PayloadType.EVENT]
+
     for method in ["OPTIONS", "REGISTER", "INFO", "NOTIFY", "SUBSCRIBE", "UPDATE", "MESSAGE", "PRACK"]:
         if hasattr(pyVoIP, "SIPCompatibleMethods") and method not in pyVoIP.SIPCompatibleMethods:
             pyVoIP.SIPCompatibleMethods.append(method)
@@ -377,7 +381,7 @@ try:
                     self_rtp.pmout.offset = getattr(self_rtp, "outOffset", 0)
         pyVoIP.RTP.RTPClient.clear_tx_buffer = _patched_rtp_clear_tx
 
-        # 2. Patch encode_pcmu to pass through pre-encoded 160-byte G.711 PCMU packets directly without corrupting voice samples
+        # 2. Patch encode_pcmu and encode_pcma to pass through pre-encoded 160-byte G.711 PCMU packets directly without corrupting voice samples
         def _patched_encode_pcmu(self, packet: bytes) -> bytes:
             if not packet or packet == b"\xff" * len(packet):
                 return b"\xff" * 160
@@ -386,6 +390,8 @@ try:
             return packet[:160]
         pyVoIP.RTP.RTPClient.encode_pcmu = _patched_encode_pcmu
         pyVoIP.RTP.RTPClient.encodePCMU = _patched_encode_pcmu
+        pyVoIP.RTP.RTPClient.encode_pcma = _patched_encode_pcmu
+        pyVoIP.RTP.RTPClient.encodePCMA = _patched_encode_pcmu
 
         # 3. Patch RTP trans thread to use exact 20ms drift-free pacing and dynamic payload type
         def _patched_trans(self):
@@ -845,12 +851,14 @@ class SipRegistrar:
         # 3. Fallback: Active AI Call Session Bridge & Socket broadcast
         logger.info(f"[SIP REG] Initializing AI Call Session fallback for outbound call to {to_number}")
         try:
-            from src.services.sip_call_handler import SipCallSession, register_call
+            from src.services.sip_call_handler import SipCallSession, register_call, CallType
             import uuid
             call_sid = f"out_sip_{uuid.uuid4().hex[:10]}"
             session = SipCallSession(
                 caller_phone=to_number,
                 caller_name=f"Outbound → {to_number}",
+                call_type=CallType.OUTBOUND,
+                call_sid=call_sid,
                 organization_id=1,
             )
             session.call_sid = call_sid

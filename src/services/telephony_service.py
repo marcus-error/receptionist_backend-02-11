@@ -842,10 +842,12 @@ class TelephonyService:
             else:
                 logger.error(f"[TelephonyService] No SIP registrar active for Org {_org_id} — fallback AI call handler used.")
                 try:
-                    from src.services.sip_call_handler import SipCallSession, register_call
+                    from src.services.sip_call_handler import SipCallSession, register_call, CallType
                     session = SipCallSession(
                         caller_phone=_fmt,
                         caller_name=f"Outbound → {_fmt}",
+                        call_type=CallType.OUTBOUND,
+                        call_sid=csid,
                         organization_id=_org_id,
                     )
                     session.call_sid = csid

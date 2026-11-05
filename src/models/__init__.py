@@ -9,6 +9,7 @@ from src.models.notification_log import NotificationLog
 from src.models.department import Department
 from src.models.lead import Lead, LeadActivity
 from src.models.webhook import Webhook, WebhookDelivery, WebhookType, WebhookDeliveryStatus
+from src.models.audit_log import PlatformAuditLog
 
 __all__ = [
     "Organization",
@@ -28,6 +29,5 @@ __all__ = [
     "WebhookDelivery",
     "WebhookType",
     "WebhookDeliveryStatus",
+    "PlatformAuditLog",
 ]
-
-

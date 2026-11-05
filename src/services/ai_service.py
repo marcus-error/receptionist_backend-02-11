@@ -182,7 +182,7 @@ class AIService:
             return "mistral"
         return "grounded_rag"
 
-    def _get_system_instruction(self, organization_name: Optional[str] = None, is_ongoing: bool = False, is_rag_active: bool = False, emotion: str = "neutral") -> str:
+    def _get_system_instruction(self, organization_name: Optional[str] = None, is_ongoing: bool = False, is_rag_active: bool = False, emotion: str = "neutral", call_direction: str = "INBOUND") -> str:
         org_title = organization_name or "the organization"
 
         emotion_lower = (emotion or "neutral").lower()
@@ -202,7 +202,10 @@ class AIService:
             "An ACTIVE RAG Knowledge Base document is currently loaded for this conversation.\n"
             "1. BUSINESS INQUIRIES & FACTUAL RECORDS: When answering questions about the organization, services, staff, timings, fees, policies, or locations, rely strictly on [RAG CONTEXT]. If a specific business detail is not found in [RAG CONTEXT], politely state: 'I apologize, but that specific information is not available in our active records. How else may I assist you?'\n"
             "   - CALLER INTRODUCTIONS & CONTACT DETAILS: When the caller introduces themselves (e.g. 'My name is...', 'I am...', 'This is...'), or shares their email, phone number, or purpose, acknowledge their name warmly (e.g. 'Nice to meet you, [Name]!'). NEVER treat a caller's personal name, email, or phone number as missing business information in RAG records.\n"
-            "   - CALLER IDENTITY & ORGANIZATION QUESTIONS: When the caller asks 'Who is this?', 'Who are you?', 'Which organization?', 'What do you do?', or 'What services do you provide?', introduce yourself clearly as the AI receptionist for " + org_title + " and state the specific services or role from [RAG CONTEXT]. NEVER say 'I am the virtual assistant handling scheduling for our team here' or generic unbranded text.\n"
+            "   - CALLER IDENTITY & CALL DIRECTION QUESTIONS:\n"
+            "     * INBOUND CALLS: You are answering an incoming call from a customer. If the caller asks 'You\'re calling from?', 'Where are you calling from?', 'Who is calling?', 'You\'ve reached where?', or 'Which hospital is this?', reply naturally: 'You\'ve reached " + org_title + ". How may I help you?'. NEVER say 'I\'m calling from " + org_title + "' or 'This is " + org_title + " calling' during an inbound call.\n"
+            "     * OUTBOUND CALLS: You placed an outbound call to the customer. Maintain outbound introduction behavior.\n"
+            "     * When the caller asks 'Who is this?', 'Who are you?', 'Which organization?', 'What do you do?', or 'What services do you provide?', introduce yourself clearly as the AI receptionist for " + org_title + " and state the specific services or role from [RAG CONTEXT]. NEVER say 'I am the virtual assistant handling scheduling for our team here' or generic unbranded text.\n"
             "2. GENERAL KNOWLEDGE & TRIVIA: For general knowledge, science, physics, history, geography, or trivia questions unrelated to the business (such as 'speed of light', 'capital of France'), answer directly and concisely using general knowledge.\n"
             "3. CASUAL CONVERSATION & GREETINGS: For greetings, status updates, or casual conversational remarks (e.g. 'how are you', 'sounds good', 'thanks'), respond naturally, warmly, and helpfully as an AI receptionist.\n"
             "4. ZERO MEDICAL MENTIONS: NEVER mention 'doctors', 'medical departments', 'hospitals', or 'patients' unless the active RAG specifically lists them.\n\n"
@@ -280,7 +283,8 @@ class AIService:
         organization_id: Optional[int] = None,
         is_ongoing: bool = False,
         booking_session=None,
-        has_context: bool = False
+        has_context: bool = False,
+        call_direction: str = "INBOUND"
     ) -> str | None:
         """
         Sub-50ms rule-based responses for common conversational pleasantries and basic identity questions.
@@ -310,6 +314,55 @@ class AIService:
         # ------------------------------------------------------------------ #
         # Pure conversational checks: must respond even if background RAG context exists
         # ------------------------------------------------------------------ #
+        effective_direction = (call_direction or "").upper()
+        if not effective_direction and booking_session:
+            if isinstance(booking_session, dict):
+                effective_direction = str(booking_session.get("call_direction") or booking_session.get("call_type") or "").upper()
+            else:
+                effective_direction = str(getattr(booking_session, "call_direction", getattr(booking_session, "call_type", "INBOUND"))).upper()
+        if "OUTBOUND" not in effective_direction:
+            effective_direction = "INBOUND"
+
+        already_greeted = is_ongoing or bool(
+            (booking_session and getattr(booking_session, "greeting_sent", False))
+            or (isinstance(booking_session, dict) and booking_session.get("greeting_sent"))
+        )
+
+        greetings = {
+            "hi", "hello", "hey", "good morning", "good afternoon", "good evening",
+            "greetings", "hello there", "hi there", "hey there", "vanakkam", "namaste"
+        }
+
+        # Pure greeting: caller ONLY said a greeting word without asking a question or mentioning services
+        question_or_entity_words = {
+            "what", "who", "where", "how", "when", "which", "is", "are", "do", "does",
+            "can", "could", "service", "services", "book", "booking", "appointment",
+            "doctor", "doctors", "department", "hospital", "clinic", "timing", "hours"
+        }
+        is_pure_greeting = (txt_clean in greetings or intent == "greeting") and not any(w in txt_clean.split() for w in question_or_entity_words)
+
+        if is_pure_greeting and already_greeted:
+            return "Yes, how may I assist you?"
+
+        # Identity and call origin questions (must fire even if background RAG context exists)
+        origin_identity_patterns = [
+            "youre calling from", "you are calling from", "calling from",
+            "where are you calling from", "where are you calling", "where you calling",
+            "who is calling", "whos calling", "who is this calling",
+            "youve reached where", "you reached where", "you have reached where", "where have i reached", "where did i call",
+            "which hospital is this", "which clinic is this", "which organization is this", "which business is this", "which company is this",
+            "who is this", "who am i speaking with", "who am i talking to"
+        ]
+        if any(phrase in txt_clean for phrase in origin_identity_patterns):
+            target_org = org_name or rag_service.get_organization_name(organization_id)
+            if not target_org or target_org.strip().lower() in ("default organization", "unknown", "none"):
+                target_org = "our office"
+
+            if effective_direction == "INBOUND":
+                return f"You've reached {target_org}. How may I help you?"
+            else:
+                return f"I'm calling from {target_org}. How may I assist you?"
+
         if any(phrase in txt_clean for phrase in ["can you hear me", "are you there", "am i audible", "can you hear", "hear me", "is anyone there"]):
             if booking_session and hasattr(booking_session, "is_active") and booking_session.is_active():
                 from src.services.booking_state_service import booking_state_service
@@ -416,7 +469,8 @@ class AIService:
         conversation_language: str = "en",
         organization_id: int = 1,
         conversation_state: Optional[Dict[str, Any]] = None,
-        outbound_script: Optional[str] = None
+        outbound_script: Optional[str] = None,
+        call_direction: str = "INBOUND"
     ) -> str:
         """
         Generates a natural, RAG-grounded receptionist response.
@@ -447,15 +501,16 @@ class AIService:
         # Step 3: Fast-Path Rule Response
         fast_resp = self._fast_rule_response(
             text, intent, organization_id=organization_id, is_ongoing=is_ongoing,
-            booking_session=conversation_state, has_context=bool(clean_context)
+            booking_session=conversation_state, has_context=bool(clean_context),
+            call_direction=call_direction
         )
         if fast_resp:
-            return guardrail_service.validate_and_sanitize_response(fast_resp)
+            return guardrail_service.validate_and_sanitize_response(fast_resp, call_direction=call_direction, org_name=org_name if 'org_name' in locals() else "")
 
         active_doc_id = rag_service._resolve_active_document_id(organization_id)
         is_rag_active = bool(active_doc_id)
         org_name = rag_service.get_organization_name(organization_id, document_id=active_doc_id)
-        system_prompt = self._get_system_instruction(organization_name=org_name, is_ongoing=is_ongoing, is_rag_active=is_rag_active, emotion=emotion)
+        system_prompt = self._get_system_instruction(organization_name=org_name, is_ongoing=is_ongoing, is_rag_active=is_rag_active, emotion=emotion, call_direction=call_direction)
 
         if outbound_script:
             system_prompt = (
@@ -884,7 +939,8 @@ class AIService:
         conversation_language: str = "en",
         organization_id: Optional[int] = None,
         conversation_state: Optional[Dict[str, Any]] = None,
-        outbound_script: Optional[str] = None
+        outbound_script: Optional[str] = None,
+        call_direction: str = "INBOUND"
     ) -> Generator[str, None, None]:
         """
         Streaming response generator for real-time voice playback with minimal first-token latency.
@@ -912,7 +968,8 @@ class AIService:
 
         fast_resp = self._fast_rule_response(
             text, intent, organization_id=organization_id, is_ongoing=is_ongoing,
-            booking_session=conversation_state, has_context=bool(clean_context)
+            booking_session=conversation_state, has_context=bool(clean_context),
+            call_direction=call_direction
         )
         if fast_resp:
             yield fast_resp
@@ -921,7 +978,7 @@ class AIService:
         active_doc_id = rag_service._resolve_active_document_id(organization_id)
         is_rag_active = bool(active_doc_id)
         org_name = rag_service.get_organization_name(organization_id, document_id=active_doc_id)
-        system_prompt = self._get_system_instruction(organization_name=org_name, is_ongoing=is_ongoing, is_rag_active=is_rag_active, emotion=emotion)
+        system_prompt = self._get_system_instruction(organization_name=org_name, is_ongoing=is_ongoing, is_rag_active=is_rag_active, emotion=emotion, call_direction=call_direction)
 
         if outbound_script:
             system_prompt = (

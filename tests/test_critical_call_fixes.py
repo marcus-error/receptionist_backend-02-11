@@ -114,3 +114,91 @@ def test_silence_trimming_preserves_audio_length():
     # Duration should be close to 4.0s (>= 3.8s)
     output_duration = len(pcm16) / 16000.0
     assert output_duration >= 3.8, f"Audio was excessively truncated: {output_duration}s < 3.8s"
+
+
+def test_doc1_complete_greeting_no_truncation():
+    """Verify that Doc 1 (Sarans Hospitals PDF) extracts the complete multi-line greeting without cutting off at 'our',
+    and generates a concise dynamic short greeting for calls."""
+    db = SessionLocal()
+    try:
+        doc = db.query(KnowledgeDocument).filter(KnowledgeDocument.id == 1).first()
+        if doc:
+            doc.ai_usage = "Active"
+            db.commit()
+            rag_service.invalidate_caches(doc.organization_id)
+
+            # 1. Verify raw extraction is complete without truncating at 'our'
+            raw_greeting = rag_service.extract_greeting_from_content(doc.content, is_script_doc=True, doc_title=doc.title)
+            assert raw_greeting is not None
+            assert not raw_greeting.endswith("our")
+            assert "treatments, doctors, consultations, services" in raw_greeting
+            assert "How may I help you today?" in raw_greeting
+
+            # 2. Verify dynamic short greeting is crisp, professional, and within 15 words
+            greeting, doc_id, doc_title = rag_service.get_active_greeting(
+                organization_id=doc.organization_id,
+                document_id=str(doc.id),
+                scope="inbound"
+            )
+            assert greeting is not None
+            assert "Sarans Hospitals" in greeting
+            assert "How may I assist you" in greeting
+            assert len(greeting.split()) <= 15
+            assert doc_id == 1
+    finally:
+        db.close()
+
+
+def test_rtp_codec_enforcement_pcmu():
+    """Verify pyVoIP only negotiates G.711 PCMU (Payload Type 0) and prioritizes PCMU when offered 8, 0, 101."""
+    import pyVoIP
+    import pyVoIP.RTP as rtp
+    import src.services.sip_registrar  # Ensures patches loaded
+
+    assert pyVoIP.RTP.PayloadType.PCMU in pyVoIP.RTPCompatibleCodecs
+    # Verify PCMA (8) is not in compatible codecs to prevent codec mismatch
+    assert pyVoIP.RTP.PayloadType.PCMA not in pyVoIP.RTPCompatibleCodecs
+
+    # Verify RTPClient preference when given SDP with 8, 0
+    codecs = {}
+    for m in [8, 0]:
+        pt = pyVoIP.RTP.PayloadType(m)
+        if pt in pyVoIP.RTPCompatibleCodecs:
+            codecs[m] = pt
+    client = rtp.RTPClient(codecs, "127.0.0.1", 1000, "127.0.0.1", 2000, rtp.TransmitType.SENDRECV)
+    assert client.preference == rtp.PayloadType.PCMU
+    assert int(client.preference) == 0
+
+
+def test_pcmu_correlation_and_zero_clipping():
+    """Verify telephony PCMU encoding preserves >= 0.999 correlation with source and has 0 clipping."""
+    import audioop
+    import numpy as np
+
+    # Generate synthetic speech audio (440Hz + 880Hz harmonics)
+    sample_rate = 8000
+    duration = 2.0
+    t = np.linspace(0, duration, int(sample_rate * duration), False)
+    signal = (np.sin(2 * np.pi * 440 * t) * 12000 + np.sin(2 * np.pi * 880 * t) * 6000).astype(np.int16)
+    pcm_bytes = signal.tobytes()
+
+    wav_buf = io.BytesIO()
+    with wave.open(wav_buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_bytes)
+
+    pcmu, pcm16 = convert_tts_to_pcmu_and_pcm16(wav_buf.getvalue(), "murf")
+
+    # Check zero clipping
+    samples_s16 = np.frombuffer(pcm16, dtype=np.int16)
+    clipped = np.sum(np.abs(samples_s16) >= 32700)
+    assert clipped == 0, f"Found {clipped} clipped samples in normalized audio"
+
+    # Decode PCMU back to linear PCM and test correlation
+    pcmu_decoded = audioop.ulaw2lin(pcmu, 2)
+    samples_pcmu_dec = np.frombuffer(pcmu_decoded, dtype=np.int16)
+
+    corr = np.corrcoef(samples_s16, samples_pcmu_dec)[0, 1]
+    assert corr >= 0.999, f"PCMU correlation {corr} < 0.999"

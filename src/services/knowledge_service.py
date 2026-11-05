@@ -63,6 +63,9 @@ class KnowledgeService:
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Knowledge document with ID {doc_id} not found or access denied",
             )
+        if doc.ai_usage == "Active":
+            self._sync_organization_greeting(doc, doc.content)
+
         return doc
 
     def _deactivate_conflicting(
@@ -114,6 +117,118 @@ class KnowledgeService:
                 cache_service.clear_all()
         except Exception:
             pass
+
+    def _sync_organization_greeting(self, doc: KnowledgeDocument, text_content: Optional[str] = None):
+        """
+        Synchronizes the dynamic short greeting into AppSettings for the document's organization.
+        - Extracts the greeting section from the active script.
+        - Condenses long introductions or catalogues to a crisp, professional 1-sentence greeting.
+        - If no greeting is found, uses a short dynamic fallback using the DB organization name.
+        - Saves the greeting to AppSettings.default_greeting.
+        """
+        try:
+            from src.services.rag_service import rag_service
+            from src.models.organization import Organization
+            from src.repositories.settings_repository import SettingsRepository
+
+            org_id = doc.organization_id or 1
+            org = self.db.query(Organization).filter(Organization.id == org_id).first()
+            org_name = org.name if org and org.name else ""
+
+            content = text_content or doc.content or ""
+            raw_greeting = ""
+            if content:
+                raw_greeting = rag_service.extract_greeting_from_content(
+                    content,
+                    is_script_doc=True,
+                    doc_title=doc.title
+                )
+
+            short_greeting = rag_service.extract_short_greeting(
+                raw_greeting=raw_greeting,
+                org_name=org_name,
+                organization_id=org_id,
+                scope=doc.scope,
+                doc_title=doc.title
+            )
+
+            settings_repo = SettingsRepository(self.db)
+            settings = settings_repo.get_or_create(org_id)
+            settings.default_greeting = short_greeting
+            self.db.commit()
+            self.db.refresh(settings)
+
+            rag_service.clear_organization_cache(org_id)
+            from src.services.cache_service import cache_service
+            cache_service.invalidate_organization(org_id)
+
+            logger.info(f"[GREETING_SYNC_SUCCESS] Saved dynamic short greeting for org={org_id} (doc_id={doc.id}): '{short_greeting}'")
+        except Exception as exc:
+            logger.error(f"[GREETING_SYNC_ERROR] Could not sync greeting for doc {doc.id}: {exc}")
+
+    def _sync_on_deactivation(self, organization_id: Optional[int]):
+        """
+        When an active document is deactivated or deleted, re-syncs the next active document's
+        greeting or applies a short dynamic fallback using the DB organization name.
+        """
+        if organization_id is None:
+            return
+        try:
+            from src.services.rag_service import rag_service
+            from src.models.organization import Organization
+            from src.repositories.settings_repository import SettingsRepository
+
+            next_active = self.db.query(KnowledgeDocument).filter(
+                KnowledgeDocument.organization_id == organization_id,
+                KnowledgeDocument.ai_usage == "Active",
+                KnowledgeDocument.status.in_([KnowledgeDocStatus.INDEXED, "Indexed", "INDEXED", "indexed"])
+            ).order_by(KnowledgeDocument.updated_at.desc(), KnowledgeDocument.id.desc()).first()
+
+            if next_active:
+                self._sync_organization_greeting(next_active)
+            else:
+                org = self.db.query(Organization).filter(Organization.id == organization_id).first()
+                org_name = org.name if org and org.name else ""
+                fallback = rag_service.extract_short_greeting("", org_name=org_name, organization_id=organization_id)
+                settings = SettingsRepository(self.db).get_or_create(organization_id)
+                settings.default_greeting = fallback
+                self.db.commit()
+                rag_service.clear_organization_cache(organization_id)
+                logger.info(f"[GREETING_SYNC_DEACTIVATION] Fallback short greeting set for org={organization_id}: '{fallback}'")
+        except Exception as exc:
+            logger.error(f"[GREETING_SYNC_DEACTIVATION_ERROR] Org {organization_id}: {exc}")
+
+    def sync_all_active_greetings(self) -> int:
+        """
+        Utility method to ensure all organizations have their
+        AppSettings.default_greeting synchronized with the exact dynamic short greeting format:
+        "Good [time of day]! Thank you for calling [Organisation Name]. How may I assist you?"
+        """
+        from src.models.organization import Organization
+        from src.repositories.settings_repository import SettingsRepository
+        from src.services.rag_service import rag_service
+
+        active_docs = self.db.query(KnowledgeDocument).filter(
+            KnowledgeDocument.ai_usage == "Active",
+            KnowledgeDocument.status.in_([KnowledgeDocStatus.INDEXED, "Indexed", "INDEXED", "indexed"])
+        ).all()
+        count = 0
+        active_org_ids = set()
+        for doc in active_docs:
+            self._sync_organization_greeting(doc)
+            count += 1
+            if doc.organization_id is not None:
+                active_org_ids.add(doc.organization_id)
+
+        all_orgs = self.db.query(Organization).all()
+        for org in all_orgs:
+            if org.id not in active_org_ids:
+                fallback = rag_service.extract_short_greeting("", org_name=org.name, organization_id=org.id, scope="inbound")
+                settings = SettingsRepository(self.db).get_or_create(org.id)
+                settings.default_greeting = fallback
+                count += 1
+        self.db.commit()
+        return count
 
     def create_doc(
         self,
@@ -181,6 +296,9 @@ class KnowledgeService:
                     cache_service.clear_all()
             except Exception:
                 pass
+
+        if doc.ai_usage == "Active":
+            self._sync_organization_greeting(doc, doc.content)
 
         return doc
 
@@ -651,6 +769,9 @@ class KnowledgeService:
             self.db.commit()
             self.db.refresh(doc)
 
+            if doc.ai_usage == "Active":
+                self._sync_organization_greeting(doc, text_content)
+
         except Exception as exc:
             self.db.rollback()
             doc = self.get_doc(doc.id, organization_id=organization_id, super_admin_view=super_admin_mode)
@@ -762,6 +883,11 @@ class KnowledgeService:
         else:
             cache_service.clear_all()
 
+        if doc.ai_usage == "Active":
+            self._sync_organization_greeting(doc, doc.content)
+        elif "ai_usage" in changes and changes["ai_usage"] != "Active":
+            self._sync_on_deactivation(doc.organization_id)
+
         if "content" in changes:
             return self.reindex_doc(doc_id, organization_id=organization_id)
 
@@ -788,7 +914,11 @@ class KnowledgeService:
         except Exception:
             pass
 
+        was_active = doc.ai_usage == "Active"
+        target_org_id = doc.organization_id
         self.repo.delete(doc)
+        if was_active:
+            self._sync_on_deactivation(target_org_id)
 
     def get_doc_file(self, doc_id: int, organization_id: Optional[int] = None, super_admin_view: bool = False):
         from fastapi.responses import FileResponse, Response

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, DateTime, Integer, String
+from sqlalchemy import Boolean, Column, DateTime, Integer, String
 from sqlalchemy.sql import func
 
 from src.config.database import Base
@@ -11,6 +11,7 @@ class Organization(Base):
     name = Column(String(150), nullable=False)
     organization_type = Column(String(100), default="General", nullable=False)
     status = Column(String(50), default="active", nullable=False)  # active, suspended
+    is_protected = Column(Boolean, default=False, server_default="0", nullable=False)  # System/Platform protected organization
 
     # KYC Verification Fields
     official_email = Column(String(150), nullable=True)  # Official Mail ID

@@ -11,6 +11,7 @@ from src.models.subscription import Subscription
 from src.models.user import User
 from src.models.permission import UserPermission
 from src.services.auth_service import AuthService
+from src.services.organization_deletion_service import organization_deletion_service
 from src.validators.auth_validator import RegisterRequest
 
 router = APIRouter(prefix="/organizations", tags=["Organizations"])
@@ -44,6 +45,7 @@ class OrganizationOut(BaseModel):
     name: str
     organization_type: str
     status: str
+    is_protected: Optional[bool] = False
     official_email: Optional[str] = None
     contact_person: Optional[str] = None
     gst_number: Optional[str] = None
@@ -77,6 +79,7 @@ def company_signup(payload: CompanySignupRequest, db: Session = Depends(get_db))
         name=payload.name,
         organization_type=payload.organization_type or "Other",
         status="active",
+        is_protected=False,
         official_email=payload.official_email or payload.admin_email,
         contact_person=payload.contact_person or payload.admin_name,
         gst_number=payload.gst_number or payload.tax_id,
@@ -137,7 +140,8 @@ def company_signup(payload: CompanySignupRequest, db: Session = Depends(get_db))
             "id": org.id,
             "name": org.name,
             "organization_type": org.organization_type,
-            "kyc_status": org.kyc_status
+            "kyc_status": org.kyc_status,
+            "is_protected": org.is_protected
         },
         "access_token": token_resp.access_token
     }
@@ -184,3 +188,13 @@ def update_organization_kyc_status(
     org.kyc_status = kyc_status
     db.commit()
     return {"status": "success", "message": f"Organization KYC status updated to {kyc_status}"}
+
+
+@router.delete("/{org_id}", response_model=dict)
+def delete_organization(
+    org_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role(["super_admin"]))
+):
+    """Permanently delete an organization and all its tenant assets (Super Admin only)."""
+    return organization_deletion_service.delete_organization(db, org_id, current_user)
