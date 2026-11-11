@@ -9,19 +9,28 @@ to switch databases.
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import declarative_base, sessionmaker
 
+from pathlib import Path
 from src.config.env import settings
 
+db_url = settings.DATABASE_URL
+if db_url.startswith("sqlite:///."):
+    backend_root = Path(__file__).resolve().parent.parent.parent
+    rel_path = db_url.replace("sqlite:///./", "").replace("sqlite:///.", "")
+    abs_db_file = (backend_root / rel_path).resolve()
+    db_url = f"sqlite:///{abs_db_file}".replace("\\", "/")
+
 connect_args = {}
-if "sqlite" in settings.DATABASE_URL:
-    connect_args = {"check_same_thread": False, "timeout": 60}
-    engine = create_engine(settings.DATABASE_URL, connect_args=connect_args, echo=False)
+if "sqlite" in db_url:
+    # 15s driver timeout + 5000ms PRAGMA busy_timeout for fast fail and backoff retry
+    connect_args = {"check_same_thread": False, "timeout": 15}
+    engine = create_engine(db_url, connect_args=connect_args, echo=False)
 
     @event.listens_for(engine, "connect")
     def set_sqlite_pragma(dbapi_connection, connection_record):
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA journal_mode=WAL")
         cursor.execute("PRAGMA synchronous=NORMAL")
-        cursor.execute("PRAGMA busy_timeout=60000")
+        cursor.execute("PRAGMA busy_timeout=5000")
         cursor.execute("PRAGMA cache_size=-64000")
         cursor.execute("PRAGMA temp_store=MEMORY")
         cursor.close()
@@ -31,6 +40,36 @@ else:
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
+
+
+def execute_with_retry(fn, max_retries: int = 5, base_delay: float = 0.05, max_delay: float = 0.5):
+    """
+    Executes a database write transaction with bounded exponential backoff and jitter
+    to handle transient SQLite write lock contention (OperationalError: database is locked).
+    """
+    import random
+    import time
+    from sqlalchemy.exc import OperationalError
+
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except OperationalError as err:
+            err_msg = str(err).lower()
+            if "database is locked" in err_msg or "busy" in err_msg or "locked" in err_msg:
+                last_err = err
+                if attempt == max_retries - 1:
+                    raise
+                jitter = random.uniform(0.8, 1.2)
+                sleep_time = min(max_delay, base_delay * (2 ** attempt) * jitter)
+                time.sleep(sleep_time)
+            else:
+                raise
+        except Exception:
+            raise
+    if last_err:
+        raise last_err
 
 
 def get_db():

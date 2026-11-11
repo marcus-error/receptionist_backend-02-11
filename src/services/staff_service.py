@@ -84,9 +84,29 @@ class StaffService:
         import json
         dept_clean = department.strip().lower()
         all_staff = self.list_staff(organization_id=organization_id)
+
+        # Check DepartmentStaff mappings
+        mapped_staff_ids = set()
+        try:
+            from src.models.department import Department, DepartmentStaff
+            dept_matches = (
+                self.db.query(DepartmentStaff.staff_id)
+                .join(Department, Department.id == DepartmentStaff.department_id)
+                .filter(
+                    DepartmentStaff.organization_id == organization_id,
+                    (Department.name.ilike(dept_clean) | Department.name.ilike(f"%{dept_clean}%"))
+                )
+                .all()
+            )
+            mapped_staff_ids = {row[0] for row in dept_matches}
+        except Exception:
+            mapped_staff_ids = set()
+
         matched = []
         for s in all_staff:
-            if s.department and (dept_clean in s.department.lower() or s.department.lower() in dept_clean):
+            if s.id in mapped_staff_ids:
+                matched.append(s)
+            elif s.department and (dept_clean in s.department.lower() or s.department.lower() in dept_clean):
                 matched.append(s)
             elif s.services:
                 try:

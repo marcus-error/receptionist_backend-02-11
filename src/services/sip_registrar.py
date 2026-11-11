@@ -9,6 +9,17 @@ try:
     if hasattr(pyVoIP, "REGISTER_FAILURE_THRESHOLD"):
         pyVoIP.REGISTER_FAILURE_THRESHOLD = 999999
 
+    # Set transmit delay reduction to 0.25 for low-latency RTP pacing
+    if hasattr(pyVoIP, "TRANSMIT_DELAY_REDUCTION"):
+        pyVoIP.TRANSMIT_DELAY_REDUCTION = 0.25
+
+    # Boost Windows multimedia timer resolution to 1ms for sub-millisecond RTP pacing
+    import ctypes
+    try:
+        ctypes.windll.winmm.timeBeginPeriod(1)
+    except Exception:
+        pass
+
     # Enforce strictly G.711 PCMU (Payload Type 0) and DTMF telephone-event (101) to prevent PCMA/PCMU mismatch
     if hasattr(pyVoIP, "RTPCompatibleCodecs"):
         pyVoIP.RTPCompatibleCodecs = [pyVoIP.RTP.PayloadType.PCMU, pyVoIP.RTP.PayloadType.EVENT]
@@ -346,42 +357,52 @@ try:
             
         pyVoIP.RTP.RTPClient.start = _patched_rtp_start
 
-        # 1. Patch RTPPacketManager to pad with standard G.711 PCMU silence bytes (0xFF)
-        _orig_read = pyVoIP.RTP.RTPPacketManager.read
-        def _patched_pm_read(self_pm, length=160):
-            import time
-            while self_pm.rebuilding:
-                time.sleep(0.01)
-            self_pm.bufferLock.acquire()
-            packet = self_pm.buffer.read(length)
-            if len(packet) < length:
-                pad_byte = b"\xff"  # Standard G.711 PCMU (mu-law) silence byte (0xFF = 0 amplitude)
-                packet = packet + (pad_byte * (length - len(packet)))
-            self_pm.bufferLock.release()
-            return packet
-        pyVoIP.RTP.RTPPacketManager.read = _patched_pm_read
+        # 1. Authoritative Outbound RTP Transmit Queue (FIFO, zero-drift, zero memory growth)
+        class RTPTransmitQueue:
+            """Thread-safe FIFO byte buffer for authoritative outbound RTP transmission."""
+            def __init__(self):
+                import threading
+                self._lock = threading.Lock()
+                self._buffer = bytearray()
+                self.rebuilding = False
 
-        def _patched_pm_clear(self_pm):
-            import io
-            try:
-                self_pm.bufferLock.acquire()
-                self_pm.buffer = io.BytesIO()
-                self_pm.log = {}
-                self_pm.offset = 4294967296
-            finally:
-                self_pm.bufferLock.release()
-        pyVoIP.RTP.RTPPacketManager.clear = _patched_pm_clear
+            def write(self, offset: int = 0, data: bytes = b"") -> None:
+                if not data:
+                    return
+                with self._lock:
+                    self._buffer.extend(data)
 
-        def _patched_rtp_clear_tx(self_rtp):
-            if hasattr(self_rtp, "pmout") and self_rtp.pmout:
-                import io
-                with getattr(self_rtp.pmout, "bufferLock", None) or nullcontext():
-                    self_rtp.pmout.buffer = io.BytesIO()
-                    self_rtp.pmout.log = {}
-                    self_rtp.pmout.offset = getattr(self_rtp, "outOffset", 0)
-        pyVoIP.RTP.RTPClient.clear_tx_buffer = _patched_rtp_clear_tx
+            def read(self, length: int = 160) -> bytes:
+                with self._lock:
+                    buf_len = len(self._buffer)
+                    if buf_len >= length:
+                        packet = bytes(self._buffer[:length])
+                        del self._buffer[:length]
+                        return packet
+                    elif buf_len > 0:
+                        packet = bytes(self._buffer) + (b"\xff" * (length - buf_len))
+                        self._buffer.clear()
+                        return packet
+                    else:
+                        return b"\xff" * length
 
-        # 2. Patch encode_pcmu and encode_pcma to pass through pre-encoded 160-byte G.711 PCMU packets directly without corrupting voice samples
+            def clear(self) -> None:
+                with self._lock:
+                    self._buffer.clear()
+
+            @property
+            def queue_depth_packets(self) -> int:
+                with self._lock:
+                    return len(self._buffer) // 160
+
+        # Patch RTPClient.__init__ to equip each call with the authoritative FIFO transmit queue
+        _orig_rtp_init = pyVoIP.RTP.RTPClient.__init__
+        def _patched_rtp_init(self_rtp, *args, **kwargs):
+            _orig_rtp_init(self_rtp, *args, **kwargs)
+            self_rtp.pmout = RTPTransmitQueue()
+        pyVoIP.RTP.RTPClient.__init__ = _patched_rtp_init
+
+        # 2. Patch encode_pcmu and encode_pcma to pass through pre-encoded 160-byte G.711 PCMU packets directly
         def _patched_encode_pcmu(self, packet: bytes) -> bytes:
             if not packet or packet == b"\xff" * len(packet):
                 return b"\xff" * 160
@@ -393,7 +414,7 @@ try:
         pyVoIP.RTP.RTPClient.encode_pcma = _patched_encode_pcmu
         pyVoIP.RTP.RTPClient.encodePCMA = _patched_encode_pcmu
 
-        # 3. Patch RTP trans thread to use exact 20ms drift-free pacing and dynamic payload type
+        # 3. Patch RTP trans thread: single authoritative sender with 20ms drift-free pacing and monotonic timestamps
         def _patched_trans(self):
             import time
             import logging
@@ -408,7 +429,7 @@ try:
                 pt = 0
 
             logger.info(
-                f"[RTP_TX] Initialized RTP transmitter | dest={self.outIP}:{self.outPort} | "
+                f"[RTP_TX] Initialized authoritative RTP transmitter | dest={self.outIP}:{self.outPort} | "
                 f"src={self.inIP}:{self.inPort} | payload_type={pt} | ssrc={self.outSSRC}"
             )
             
@@ -443,10 +464,11 @@ try:
                     self.sout.sendto(bytes(packet), (self.outIP, self.outPort))
                     pkt_count += 1
                     if pkt_count % 100 == 1:
+                        q_depth = getattr(self.pmout, "queue_depth_packets", 0)
                         logger.info(
-                            f"[RTP_TX] dest={self.outIP}:{self.outPort} | payload_type=0 | "
+                            f"[RTP_TX] dest={self.outIP}:{self.outPort} | payload_type={pt} | "
                             f"sequence={self.outSequence} | timestamp={self.outTimestamp} | "
-                            f"ssrc={self.outSSRC} | payload_bytes={len(payload)}"
+                            f"ssrc={self.outSSRC} | queue_depth={q_depth} pkts"
                         )
                 except (BlockingIOError, OSError) as err:
                     if getattr(err, "winerror", None) == 10035 or getattr(err, "errno", None) in (10035, 11, 35):
@@ -468,7 +490,8 @@ try:
                 sleep_time = next_time - time.perf_counter()
                 if sleep_time > 0:
                     time.sleep(sleep_time)
-                else:
+                elif sleep_time < -0.100:
+                    # Reset clock only if lag exceeds 100ms (5 frames) to avoid cumulative clock drift
                     next_time = time.perf_counter()
         
         pyVoIP.RTP.RTPClient.trans = _patched_trans
@@ -973,11 +996,13 @@ class SipRegistrar:
                         for client in call.RTPClients:
                             if hasattr(client, "pmout") and client.pmout:
                                 try:
-                                    with client.pmout.bufferLock:
-                                        import io
-                                        client.pmout.buffer = io.BytesIO()
-                                        client.pmout.log = {}
-                                        client.pmout.offset = getattr(client, "outOffset", 0)
+                                    if hasattr(client.pmout, "clear"):
+                                        client.pmout.clear()
+                                    else:
+                                        with getattr(client.pmout, "bufferLock", None):
+                                            import io
+                                            client.pmout.buffer = io.BytesIO()
+                                            client.pmout.log = {}
                                 except Exception:
                                     pass
                     if hasattr(call, "rtp") and call.rtp:
@@ -1683,11 +1708,13 @@ class SipRegistrar:
                         for client in call.RTPClients:
                             if hasattr(client, "pmout") and client.pmout:
                                 try:
-                                    with client.pmout.bufferLock:
-                                        import io
-                                        client.pmout.buffer = io.BytesIO()
-                                        client.pmout.log = {}
-                                        client.pmout.offset = getattr(client, "outOffset", 0)
+                                    if hasattr(client.pmout, "clear"):
+                                        client.pmout.clear()
+                                    else:
+                                        with getattr(client.pmout, "bufferLock", None):
+                                            import io
+                                            client.pmout.buffer = io.BytesIO()
+                                            client.pmout.log = {}
                                 except Exception:
                                     pass
                     if hasattr(call, "rtp") and call.rtp:

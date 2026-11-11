@@ -177,12 +177,11 @@ class TTSService:
         from src.services.murf_tts import murf_tts
         tts_provider = getattr(settings, "TTS_PROVIDER", "murf").lower().strip()
 
-        # Resolve credentials & normalized voice/model
-        _, default_murf_voice, default_murf_model = murf_tts.get_credentials()
-        murf_model = default_murf_model
-
-        # Enforce English voice (en-IN-isha) for all syntheses
-        selected_murf_voice = voice_id or default_murf_voice or "en-IN-isha"
+        # Resolve credentials & normalized voice/model based on target language
+        from src.services.language_service import language_service
+        lang_voice_id, lang_model, _ = language_service.get_tts_voice_and_model(target_gtts_lang)
+        selected_murf_voice = voice_id or lang_voice_id or "en-IN-isha"
+        murf_model = lang_model or "GEN2"
 
         murf_voice = selected_murf_voice
         effective_voice = murf_voice if tts_provider == "murf" else (voice_id or getattr(settings, "ELEVENLABS_VOICE_ID", "default"))

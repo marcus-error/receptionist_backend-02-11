@@ -438,33 +438,64 @@ def schedule_reminders_for_appointment(appointment, db: Session | None = None):
 
 def _appointment_insert_hook(mapper, connection, target):
     """
-    SQLAlchemy after_insert hook.
-
-    It creates reminders automatically for newly inserted appointments. A
-    separate DB session is intentionally used because the mapper connection is
-    not safe for arbitrary ORM writes during the flush.
+    SQLAlchemy after_insert hook (safeguard).
+    Delegates asynchronously to schedule_reminders_for_appointment_async
+    to prevent SQLite transaction write-lock deadlocks during the flush.
     """
     try:
-        if not target.id:
-            return
+        appt_id = getattr(target, "id", None)
+        if appt_id:
+            schedule_reminders_for_appointment_async(appt_id)
+    except Exception as err:
+        logger.debug(f"Async reminder delegation notice for appointment {getattr(target, 'id', None)}: {err}")
+
+
+def schedule_reminders_for_appointment_async(appointment_id: int):
+    """
+    Asynchronously create reminders for an appointment in a background daemon thread.
+    Uses its own isolated database session and never competes with the primary booking transaction.
+    """
+    def _bg_worker():
+        t0 = time_module.time()
         db = SessionLocal()
         try:
-            ReminderService(db).create_for_appointment(target)
+            from src.models.appointment import Appointment
+            appt = db.query(Appointment).filter(Appointment.id == appointment_id).first()
+            if appt:
+                reminders = ReminderService(db).create_for_appointment(appt)
+                dur_ms = max(1, int((time_module.time() - t0) * 1000))
+                logger.info(
+                    f"[REMINDER SCHEDULING] appointment_id={appointment_id} count={len(reminders or [])} "
+                    f"reminder_scheduling_ms={dur_ms} status=SUCCESS"
+                )
+        except Exception as e:
+            dur_ms = max(1, int((time_module.time() - t0) * 1000))
+            logger.warning(
+                f"[REMINDER SCHEDULING] appointment_id={appointment_id} reminder_scheduling_ms={dur_ms} "
+                f"status=FAILED error={e}"
+            )
         finally:
             db.close()
-    except Exception:
-        # Booking itself must not fail because reminder scheduling failed.
-        logger.exception(
-            "Could not create reminders for appointment %s", getattr(target, "id", None)
-        )
+
+    threading.Thread(target=_bg_worker, name=f"reminder-create-{appointment_id}", daemon=True).start()
 
 
 def register_appointment_hook():
+    """
+    DEPRECATED AND DISABLED:
+    Synchronous ORM after_insert hooks that open a secondary SessionLocal()
+    cause immediate SQLite write-lock deadlocks (OperationalError: database is locked)
+    while the outer transaction has an uncommitted write lock.
+    Reminders are dispatched asynchronously post-commit via schedule_reminders_for_appointment_async.
+    """
     from sqlalchemy import event
     from src.models.appointment import Appointment
 
-    if not event.contains(Appointment, "after_insert", _appointment_insert_hook):
-        event.listen(Appointment, "after_insert", _appointment_insert_hook)
+    if event.contains(Appointment, "after_insert", _appointment_insert_hook):
+        try:
+            event.remove(Appointment, "after_insert", _appointment_insert_hook)
+        except Exception:
+            pass
 
 
 def ensure_reminder_table():

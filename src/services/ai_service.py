@@ -182,7 +182,7 @@ class AIService:
             return "mistral"
         return "grounded_rag"
 
-    def _get_system_instruction(self, organization_name: Optional[str] = None, is_ongoing: bool = False, is_rag_active: bool = False, emotion: str = "neutral", call_direction: str = "INBOUND") -> str:
+    def _get_system_instruction(self, organization_name: Optional[str] = None, is_ongoing: bool = False, is_rag_active: bool = False, emotion: str = "neutral", call_direction: str = "INBOUND", conversation_language: str = "en") -> str:
         org_title = organization_name or "the organization"
 
         emotion_lower = (emotion or "neutral").lower()
@@ -241,10 +241,11 @@ class AIService:
             "   - Search the complete RAG knowledge base for relevant information across all uploaded sections, pages, headings, tables, product lists, and timings.\n"
             "   - RAG queries and API calls MUST NOT reset the conversation state.\n"
             "   - If information is unlisted in RAG, clearly state it is unavailable instead of inventing facts.\n\n"
-            "4. STRICT ENGLISH-ONLY CONVERSATION ENFORCEMENT:\n"
-            "   - You MUST formulate all speech and responses strictly in English. NEVER respond in Spanish, Hindi, Tamil, Telugu, Malayalam, Kannada, or any language other than English.\n"
-            "   - If the caller speaks another language or asks to switch languages (e.g. Spanish, Hindi, Tamil, etc.), DO NOT translate and DO NOT switch languages. Politely respond in English: 'I can only assist you in English. Please could you continue in English?'\n"
-            "   - All speech recognition, entity extraction, appointment handling, and dialogue responses must remain 100% in English.\n\n"
+            "4. DYNAMIC CONVERSATION LANGUAGE — MULTILINGUAL RECEPTIONIST:\n"
+            "   - You MUST formulate all speech and responses strictly in the requested conversation language.\n"
+            "   - Supported languages are strictly: Tamil (ta), English (en), Hindi (hi), Kannada (kn), Telugu (te).\n"
+            "   - If the caller requests another supported language, switch immediately and naturally.\n"
+            "   - Preserve exact spelling of proper nouns, patient names, email addresses, phone numbers, and appointment dates/times without translating or corrupting them.\n\n"
             "5. ABSOLUTE DOMAIN ISOLATION & ZERO MEDICAL MENTIONS:\n"
             "   - Preserve exact spelling of product/staff names, departments, services, proper nouns, and terms from RAG.\n"
             "   - NEVER ASSUME THE BUSINESS TYPE IS A HOSPITAL OR CLINIC. NEVER MENTION OR SUGGEST DOCTORS, PATIENTS, OR MEDICAL DEPARTMENTS (such as Cardiology, Dentist, Ophthalmology, Pediatrics, General Medicine), EVEN WHEN DENYING AN UNLISTED QUESTION OR EXPLAINING MISSING INFORMATION.\n"
@@ -284,7 +285,8 @@ class AIService:
         is_ongoing: bool = False,
         booking_session=None,
         has_context: bool = False,
-        call_direction: str = "INBOUND"
+        call_direction: str = "INBOUND",
+        conversation_language: str = "en"
     ) -> str | None:
         """
         Sub-50ms rule-based responses for common conversational pleasantries and basic identity questions.
@@ -299,17 +301,40 @@ class AIService:
         from src.services.rag_service import rag_service
         from src.services.language_service import language_service
 
+        active_doc_id = rag_service._resolve_active_document_id(organization_id)
+        org_name = rag_service.get_organization_name(organization_id, document_id=active_doc_id)
+        welcome_greeting = rag_service.get_organization_greeting(organization_id, document_id=active_doc_id)
+
         # ------------------------------------------------------------------ #
         # PRIORITY 0 — Language Switch (must fire before any RAG/LLM call)    #
         # ------------------------------------------------------------------ #
         target_lang, is_switch = language_service.check_explicit_language_switch(text)
-        if is_switch and target_lang:
+        if is_switch:
             return language_service.get_language_switch_confirmation(
-                target_lang, booking_session=booking_session
+                target_lang, booking_session=booking_session, org_name=org_name
             )
-        active_doc_id = rag_service._resolve_active_document_id(organization_id)
-        org_name = rag_service.get_organization_name(organization_id, document_id=active_doc_id)
-        welcome_greeting = rag_service.get_organization_greeting(organization_id, document_id=active_doc_id)
+
+        # Multilingual Protection: When active conversation language is not English,
+        # bypass hardcoded English pleasantries so Gemini or localized handlers respond in target language.
+        curr_lang = conversation_language if conversation_language in ("ta", "hi", "kn", "te") else "en"
+        if curr_lang != "en":
+            greetings_native = {
+                "ta": ["வணக்கம்", "வணக்கமுங்க", "வணக்கம்ங்க", "vanakkam", "vanakam", "hello", "hi"],
+                "hi": ["नमस्ते", "नमस्कार", "namaste", "namaskar", "hello", "hi"],
+                "kn": ["ನಮಸ್ಕಾರ", "namaskara", "namaste", "hello", "hi"],
+                "te": ["నమస్కారం", "నమస్తే", "namaskaram", "namaste", "hello", "hi"],
+            }
+            if any(g in txt for g in greetings_native.get(curr_lang, [])):
+                if curr_lang == "ta":
+                    return f"வணக்கம்! நான் {org_name or 'மருத்துவமனை'} AI வரவேற்பாளர். உங்களுக்கு இன்று எவ்வாறு உதவலாம்?"
+                elif curr_lang == "hi":
+                    return f"नमस्ते! मैं {org_name or 'अस्पताल'} का AI स्वागतकर्ता हूँ। आज मैं आपकी क्या सहायता कर सकता हूँ?"
+                elif curr_lang == "kn":
+                    return f"ನಮಸ್ಕಾರ! ನಾನು {org_name or 'ಆಸ್ಪತ್ರೆ'} AI ಸ್ವಾಗತಕಾರ. ಇಂದು ನಾನು ನಿಮಗೆ ಹೇಗೆ ಸಹಾಯ ಮಾಡಲಿ?"
+                elif curr_lang == "te":
+                    return f"నమస్కారం! నేను {org_name or 'ఆసుపత్రి'} AI రిసెప్షనిస్ట్‌ని. ఈరోజు నేను మీకు ఎలా సహాయపడగలను?"
+            # For all other statements in non-English, pass to LLM to generate fluent in-language response
+            return None
 
         # ------------------------------------------------------------------ #
         # Pure conversational checks: must respond even if background RAG context exists
@@ -502,7 +527,7 @@ class AIService:
         fast_resp = self._fast_rule_response(
             text, intent, organization_id=organization_id, is_ongoing=is_ongoing,
             booking_session=conversation_state, has_context=bool(clean_context),
-            call_direction=call_direction
+            call_direction=call_direction, conversation_language=conversation_language
         )
         if fast_resp:
             return guardrail_service.validate_and_sanitize_response(fast_resp, call_direction=call_direction, org_name=org_name if 'org_name' in locals() else "")
@@ -510,7 +535,7 @@ class AIService:
         active_doc_id = rag_service._resolve_active_document_id(organization_id)
         is_rag_active = bool(active_doc_id)
         org_name = rag_service.get_organization_name(organization_id, document_id=active_doc_id)
-        system_prompt = self._get_system_instruction(organization_name=org_name, is_ongoing=is_ongoing, is_rag_active=is_rag_active, emotion=emotion, call_direction=call_direction)
+        system_prompt = self._get_system_instruction(organization_name=org_name, is_ongoing=is_ongoing, is_rag_active=is_rag_active, emotion=emotion, call_direction=call_direction, conversation_language=conversation_language)
 
         if outbound_script:
             system_prompt = (
@@ -521,13 +546,16 @@ class AIService:
                 f"===========================================\n\n"
             ) + system_prompt
 
-        # Strict English-Only Directive
+        # Dynamic Language Directive
+        from src.services.language_service import language_service, SUPPORTED_LANGUAGES
+        req_lang = conversation_language if conversation_language in SUPPORTED_LANGUAGES else "en"
+        lang_name = language_service.get_language_name(req_lang)
         system_prompt += (
-            "\n=== STRICT ENGLISH-ONLY CONVERSATION DIRECTIVE ===\n"
-            "You are an English-only AI receptionist. You MUST generate all responses strictly in English.\n"
-            "- NEVER respond in Spanish, Hindi, Tamil, Telugu, Malayalam, Kannada, or any language other than English.\n"
-            "- If the caller speaks or inquires in another language, or asks you to switch languages, DO NOT translate and DO NOT switch languages. Politely reply in English: 'I can only assist you in English. Please could you continue in English?'\n"
-            "- Maintain professional, fluent, and natural English at all times.\n"
+            f"\n=== CONVERSATION LANGUAGE DIRECTIVE: {lang_name.upper()} ({req_lang}) ===\n"
+            f"You are speaking with the caller in {lang_name} ({req_lang}).\n"
+            f"- You MUST formulate your response strictly, entirely, and fluently in {lang_name} ({req_lang}).\n"
+            f"- Do NOT translate or corrupt caller names, doctor names, email addresses, phone numbers, or appointment dates.\n"
+            f"- Maintain professional, fluent, and natural {lang_name} dialogue at all times.\n"
         )
 
         # Structured Prompt Assembly
@@ -969,7 +997,7 @@ class AIService:
         fast_resp = self._fast_rule_response(
             text, intent, organization_id=organization_id, is_ongoing=is_ongoing,
             booking_session=conversation_state, has_context=bool(clean_context),
-            call_direction=call_direction
+            call_direction=call_direction, conversation_language=conversation_language
         )
         if fast_resp:
             yield fast_resp
@@ -978,7 +1006,7 @@ class AIService:
         active_doc_id = rag_service._resolve_active_document_id(organization_id)
         is_rag_active = bool(active_doc_id)
         org_name = rag_service.get_organization_name(organization_id, document_id=active_doc_id)
-        system_prompt = self._get_system_instruction(organization_name=org_name, is_ongoing=is_ongoing, is_rag_active=is_rag_active, emotion=emotion, call_direction=call_direction)
+        system_prompt = self._get_system_instruction(organization_name=org_name, is_ongoing=is_ongoing, is_rag_active=is_rag_active, emotion=emotion, call_direction=call_direction, conversation_language=conversation_language)
 
         if outbound_script:
             system_prompt = (

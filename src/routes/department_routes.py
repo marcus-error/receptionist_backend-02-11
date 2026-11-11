@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 
 from src.controllers import department_controller
-from src.validators.department_validator import DepartmentOut
+from src.validators.department_validator import DepartmentOut, DepartmentStaffOut
 
 router = APIRouter(prefix="/departments", tags=["Departments"])
 
@@ -10,3 +10,7 @@ router.add_api_route("", department_controller.create_department, methods=["POST
 router.add_api_route("/{dept_id}", department_controller.get_department, methods=["GET"], response_model=DepartmentOut)
 router.add_api_route("/{dept_id}", department_controller.update_department, methods=["PUT"], response_model=DepartmentOut)
 router.add_api_route("/{dept_id}", department_controller.delete_department, methods=["DELETE"])
+
+router.add_api_route("/{dept_id}/staff", department_controller.get_department_staff, methods=["GET"], response_model=list[DepartmentStaffOut])
+router.add_api_route("/{dept_id}/staff", department_controller.assign_staff_to_department, methods=["POST"], response_model=list[DepartmentStaffOut])
+router.add_api_route("/{dept_id}/staff/{staff_id}", department_controller.remove_staff_from_department, methods=["DELETE"])

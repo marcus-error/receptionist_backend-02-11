@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -35,5 +35,28 @@ class DepartmentOut(BaseModel):
     phone: Optional[str] = None
     email: Optional[str] = None
     status: str = "Active"
+    staff_count: Optional[int] = 0
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+
+
+class DepartmentStaffAssign(BaseModel):
+    staff_ids: Optional[List[int]] = None
+    staff_id: Optional[int] = None
+
+
+class DepartmentStaffOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    staff_id: int
+    name: str
+    department: str
+    organization_id: Optional[int] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    status: Optional[str] = "Available"
+    working_hours: Optional[str] = "09:00-18:00"
+    appointment_duration: Optional[str] = "30 min"
+    role: Optional[str] = None
+    assigned_at: Optional[datetime] = None

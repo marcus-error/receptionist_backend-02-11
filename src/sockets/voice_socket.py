@@ -470,20 +470,21 @@ async def voice_endpoint(websocket: WebSocket):
                 # ============================================================
                 target_lang, is_lang_switch = language_service.check_explicit_language_switch(transcription)
                 if is_lang_switch:
-                    booking_session.conversation_language = "en"
-                    current_lang = "en"
-                    lang_resp = language_service.get_language_switch_confirmation()
+                    if target_lang in ("ta", "en", "hi", "kn", "te"):
+                        booking_session.conversation_language = target_lang
+                    current_lang = target_lang or booking_session.conversation_language
+                    lang_resp = language_service.get_language_switch_confirmation(current_lang, booking_session=booking_session)
 
                     norm_ans = _normalize_speech(lang_resp)
                     if norm_ans:
                         recent_ai_utterances.append(norm_ans)
                     last_ai_speech_time = time.time()
 
-                    await websocket.send_json({"type": "analysis", "intent": "LANGUAGE_REDIRECT",
-                                               "emotion": "Neutral - 100%", "language": "en"})
+                    await websocket.send_json({"type": "analysis", "intent": "LANGUAGE_SWITCH",
+                                               "emotion": "Neutral - 100%", "language": current_lang})
                     await websocket.send_json({"type": "response", "text": lang_resp})
 
-                    audio_response = await tts_service.synthesize_stream_chunk_async(lang_resp, language="en")
+                    audio_response = await tts_service.synthesize_stream_chunk_async(lang_resp, language=current_lang)
                     if audio_response and len(audio_response) > 100:
                         audio_base64 = base64.b64encode(audio_response).decode('utf-8')
                         await websocket.send_json({"type": "audio", "audio": audio_base64})

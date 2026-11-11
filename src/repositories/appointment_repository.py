@@ -27,11 +27,14 @@ class AppointmentRepository:
         return query.first()
 
     def create(self, data: dict) -> Appointment:
+        from src.config.database import execute_with_retry
         appointment = Appointment(**data)
-        self.db.add(appointment)
-        self.db.commit()
-        self.db.refresh(appointment)
-        return appointment
+        def _commit_tx():
+            self.db.add(appointment)
+            self.db.commit()
+            self.db.refresh(appointment)
+            return appointment
+        return execute_with_retry(_commit_tx)
 
     def update(self, appointment: Appointment, data: dict) -> Appointment:
         for key, value in data.items():

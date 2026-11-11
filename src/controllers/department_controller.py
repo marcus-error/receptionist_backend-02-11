@@ -6,7 +6,13 @@ from src.config.database import get_db
 from src.middleware.auth_middleware import get_current_user
 from src.models.user import User
 from src.services.department_service import DepartmentService
-from src.validators.department_validator import DepartmentCreate, DepartmentOut, DepartmentUpdate
+from src.validators.department_validator import (
+    DepartmentCreate,
+    DepartmentOut,
+    DepartmentStaffAssign,
+    DepartmentStaffOut,
+    DepartmentUpdate,
+)
 
 
 def _get_org_id(user: Optional[User]) -> int:
@@ -33,7 +39,7 @@ def get_department(
     db: Session = Depends(get_db)
 ) -> DepartmentOut:
     org_id = _get_org_id(current_user)
-    return DepartmentService(db).get_department(dept_id, organization_id=org_id)
+    return DepartmentService(db).get_department_out(dept_id, organization_id=org_id)
 
 
 def create_department(
@@ -63,3 +69,36 @@ def delete_department(
     org_id = _get_org_id(current_user)
     DepartmentService(db).delete_department(dept_id, organization_id=org_id)
     return {"message": "Department deleted successfully"}
+
+
+def get_department_staff(
+    dept_id: int,
+    current_user: Optional[User] = Depends(get_current_user),
+    db: Session = Depends(get_db)
+) -> List[DepartmentStaffOut]:
+    org_id = _get_org_id(current_user)
+    return DepartmentService(db).get_department_staff(dept_id, organization_id=org_id)
+
+
+def assign_staff_to_department(
+    dept_id: int,
+    payload: DepartmentStaffAssign,
+    current_user: Optional[User] = Depends(get_current_user),
+    db: Session = Depends(get_db)
+) -> List[DepartmentStaffOut]:
+    org_id = _get_org_id(current_user)
+    staff_ids = payload.staff_ids or []
+    if payload.staff_id and payload.staff_id not in staff_ids:
+        staff_ids.append(payload.staff_id)
+    return DepartmentService(db).assign_staff_to_department(dept_id, staff_ids=staff_ids, organization_id=org_id)
+
+
+def remove_staff_from_department(
+    dept_id: int,
+    staff_id: int,
+    current_user: Optional[User] = Depends(get_current_user),
+    db: Session = Depends(get_db)
+) -> dict:
+    org_id = _get_org_id(current_user)
+    DepartmentService(db).remove_staff_from_department(dept_id, staff_id=staff_id, organization_id=org_id)
+    return {"message": "Staff member removed from department successfully"}

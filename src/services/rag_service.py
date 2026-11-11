@@ -1569,6 +1569,12 @@ class RagService:
         ctx_lower = master_ctx.lower() if master_ctx else ""
 
         DOMAIN_SIGNALS: list[tuple[list[str], dict]] = [
+            # Medical / Healthcare (prioritized: hospital, clinic, doctors, patients, departments)
+            (["hospital", "clinic", "doctor", "doctors", "physician", "patient", "cardiologist", "cardiology",
+              "neurologist", "dermatologist", "pediatrician", "orthopedic", "gynecologist", "dentist", "dental",
+              "surgeon", "ayurvedic", "siddha", "naturopathy", "homeopathy", "outpatient", "inpatient", "general medicine"],
+             {"entity_term": "doctor", "entity_term_plural": "doctors", "entity_action": "consult", "service_based": False,
+              "ask_target_question": "Which doctor or department would you like to consult?"}),
             # Education / School (prioritized for teacher/school scripts)
             (["teacher", "tutor", "faculty", "lecturer"],
              {"entity_term": "teacher", "entity_term_plural": "teachers", "entity_action": "meet", "service_based": False,
@@ -1581,15 +1587,6 @@ class RagService:
               "beauty", "salon", "spa", "makeup", "beard grooming", "hair spa", "stylist"],
              {"entity_term": "service", "entity_term_plural": "services", "entity_action": "book", "service_based": True,
               "ask_target_question": "Which service would you like to book?"}),
-            # Software / AI / Products
-            (["callzenza", "ai receptionist", "receptionist bot", "ai agent", "software", "product demo"],
-             {"entity_term": "service", "entity_term_plural": "services", "entity_action": "book", "service_based": True,
-              "ask_target_question": "Which service or product would you like to book?"}),
-            # Medical / Healthcare (using specific medical terms)
-            (["doctor", "physician", "cardiologist", "neurologist", "dermatologist",
-              "pediatrician", "orthopedic", "gynecologist", "dentist", "surgeon", "hospital", "clinic"],
-             {"entity_term": "doctor", "entity_term_plural": "doctors", "entity_action": "see", "service_based": False,
-              "ask_target_question": "Which doctor would you like to see?"}),
             # Legal
             (["attorney", "lawyer", "advocate", "solicitor", "paralegal"],
              {"entity_term": "attorney", "entity_term_plural": "attorneys", "entity_action": "meet", "service_based": False,
@@ -1614,6 +1611,10 @@ class RagService:
             (["veterinarian", "vet", "animal doctor", "veterinary"],
              {"entity_term": "vet", "entity_term_plural": "vets", "entity_action": "see", "service_based": False,
               "ask_target_question": "Which vet would you like to see?"}),
+            # Software / AI / Products (actual software products, not generic platform prompt words)
+            (["software demo", "saas product", "software subscription", "crm software", "software license", "cloud software", "product demo"],
+             {"entity_term": "service", "entity_term_plural": "services", "entity_action": "book", "service_based": True,
+              "ask_target_question": "Which service or product would you like to book?"}),
         ]
 
         for signals, terminology in DOMAIN_SIGNALS:

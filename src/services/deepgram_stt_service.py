@@ -46,10 +46,11 @@ class DeepgramStreamingSession:
         on_error: Optional[Callable[[str, Exception], Any]] = None,
         sample_rate: int = 8000,
         model: str = "nova-3",
-        endpointing_ms: int = 500,
-        utterance_end_ms: int = 1500,
+        endpointing_ms: int = 300,
+        utterance_end_ms: int = 1000,
         organization_id: Optional[int] = None,
         keywords: Optional[List[str]] = None,
+        language: Optional[str] = None,
     ):
         self.call_id = call_id
         self.on_partial = on_partial
@@ -59,11 +60,11 @@ class DeepgramStreamingSession:
         self.organization_id = organization_id
         self.keywords = keywords or []
         self.model = model or getattr(settings, "DEEPGRAM_MODEL", "nova-3") or "nova-3"
-        self.language = getattr(settings, "DEEPGRAM_LANGUAGE", "en") or "en"
+        self.language = language or getattr(settings, "DEEPGRAM_LANGUAGE", "en") or "en"
         raw_endpointing = endpointing_ms or getattr(settings, "DEEPGRAM_ENDPOINTING_MS", 300) or 300
-        self.endpointing_ms = max(250, int(raw_endpointing))
-        raw_u_end = utterance_end_ms or getattr(settings, "DEEPGRAM_UTTERANCE_END_MS", 1500) or 1500
-        self.utterance_end_ms = max(1000, int(raw_u_end))
+        self.endpointing_ms = max(250, min(1000, int(raw_endpointing)))
+        raw_u_end = utterance_end_ms or getattr(settings, "DEEPGRAM_UTTERANCE_END_MS", 1000) or 1000
+        self.utterance_end_ms = max(800, min(2000, int(raw_u_end)))
 
         self._audio_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
         self._ws = None
@@ -131,8 +132,17 @@ class DeepgramStreamingSession:
                 kw_list = booking_state_service.get_organization_services_and_departments(self.organization_id)
             except Exception:
                 pass
-        if kw_list and not is_multilingual_or_nova3:
-            import urllib.parse
+        import urllib.parse
+        if is_multilingual_or_nova3:
+            language_terms = ["Tamil", "English", "Hindi", "Kannada", "Telugu"]
+            kt_params = [f"&keyterm={urllib.parse.quote(term)}" for term in language_terms]
+            if kw_list:
+                for kw in kw_list[:10]:
+                    clean_kw = re.sub(r'[^a-zA-Z0-9\s]', '', kw).strip()
+                    if clean_kw and len(clean_kw) >= 3 and clean_kw not in language_terms:
+                        kt_params.append(f"&keyterm={urllib.parse.quote(clean_kw)}")
+            base_url += "".join(kt_params)
+        elif kw_list:
             kw_params = []
             for kw in kw_list[:15]:
                 clean_kw = re.sub(r'[^a-zA-Z0-9\s]', '', kw).strip()
@@ -254,6 +264,58 @@ class DeepgramStreamingSession:
                 f"[DEEPGRAM_RECONNECT_EXHAUSTED] call_id={self.call_id} "
                 f"max_reconnects={self._max_reconnects} reached — STT unavailable for this call"
             )
+            return False
+
+    async def switch_language(self, new_lang: str) -> bool:
+        """
+        Dynamically update the STT language mid-call.
+        Re-establishes the Deepgram WebSocket stream with the new language query parameter
+        without losing active call state.
+        """
+        target_lang = str(new_lang or "en").lower().strip()
+        if getattr(self, "language", None) == target_lang and self._connected:
+            return True
+
+        logger.info(f"[DEEPGRAM_LANG_SWITCH] call_id={self.call_id} switching language: '{getattr(self, 'language', 'en')}' -> '{target_lang}'")
+        self.language = target_lang
+
+        async with self._reconnect_lock:
+            if not self._running:
+                return False
+
+            self._connected = False
+
+            # Cancel existing send/recv tasks
+            for task in list(self._tasks):
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await asyncio.wait_for(asyncio.shield(task), timeout=0.3)
+                    except Exception:
+                        pass
+            self._tasks.clear()
+
+            # Close old WebSocket cleanly
+            if self._ws:
+                try:
+                    await self._ws.close()
+                except Exception:
+                    pass
+                self._ws = None
+
+            # Preserve audio queue and reset turn state safely (do not drop incoming audio)
+            self.reset_turn()
+
+            # Immediate reconnect with new language parameter
+            self._reconnect_count = 0
+            if await self._connect_ws():
+                send_task = asyncio.create_task(self._send_loop(), name=f"dg_send_{self.call_id}")
+                recv_task = asyncio.create_task(self._recv_loop(), name=f"dg_recv_{self.call_id}")
+                self._tasks = [send_task, recv_task]
+                logger.info(f"[DEEPGRAM_LANG_SWITCH_SUCCESS] call_id={self.call_id} now streaming STT in language='{target_lang}'")
+                return True
+
+            logger.error(f"[DEEPGRAM_LANG_SWITCH_FAIL] call_id={self.call_id} failed to connect with language='{target_lang}'")
             return False
 
     async def start(self):
@@ -388,8 +450,7 @@ class DeepgramStreamingSession:
         alt = alternatives[0]
         transcript = (alt.get("transcript") or "").strip()
         confidence = alt.get("confidence", 0.0)
-        # Enforce English-only STT recognition
-        self._last_detected_language = "en" 
+        self._last_detected_language = getattr(self, "language", "en") or "en"
         is_final = data.get("is_final", False)
         speech_final = data.get("speech_final", False)
 
@@ -510,9 +571,9 @@ class DeepgramStreamingSession:
                             "would", "should", "i", "you", "we", "my", "your", "do", "does"
                         }
                         if len(words) <= 3 or last_w in incomplete_words:
-                            wait_s = 1.5
+                            wait_s = 0.9
                         else:
-                            wait_s = 1.2
+                            wait_s = 0.7
                         await asyncio.sleep(wait_s)
                         if not self._turn_finalized and self._running and self._current_utt_id == target_id:
                             logger.info(f"[DEEPGRAM_ENDPOINT] Silence fallback finalized: '{txt}' utt_id={target_id}")
@@ -580,6 +641,8 @@ class DeepgramStreamingSession:
         t_first_partial = self._first_partial_time or t_start
         t_speech_endpoint = getattr(self, "_speech_endpoint_time", None) or now
         self._speech_endpoint_time = None
+        if t_speech_endpoint < t_start or (now - t_speech_endpoint) > 4.0:
+            t_speech_endpoint = now - 0.25
 
         first_partial_ms = max(40, round((t_first_partial - t_start) * 1000))
         final_ms = max(80, round((now - t_start) * 1000))
@@ -603,10 +666,15 @@ class DeepgramStreamingSession:
             f"text='{text}' detected_language={getattr(self, '_last_detected_language', '')}"
         )
 
+        saved_partial = str(getattr(self, "_last_partial_text", "") or "").strip()
+        if text.startswith("@") and saved_partial and "@" in saved_partial:
+            logger.info(f"[DEEPGRAM_PARTIAL_VS_FINAL] Discrepancy observed: final='{text}' partial='{saved_partial}'")
+
         metrics = {
             "call_id": self.call_id,
             "utt_id": utt_id,
             "text": text,
+            "partial_transcript": saved_partial,
             "confidence": real_conf,
             "audio_duration_s": actual_dur_s,
             "audio_duration_ms": customer_speech_duration_ms,
@@ -662,6 +730,7 @@ class DeepgramStreamingSession:
 
     async def _handle_utterance_end(self, data: Dict[str, Any]):
         """Deepgram indicates customer finished speaking turn."""
+        self._speech_endpoint_time = time.monotonic()
         if self._debounce_task and not self._debounce_task.done():
             self._debounce_task.cancel()
             self._debounce_task = None

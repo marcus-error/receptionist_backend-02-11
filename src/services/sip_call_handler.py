@@ -713,6 +713,8 @@ class SipCallSession:
         self.detected_language = "English"
         self.language_confidence = 1.0
         self.original_transcript = ""
+        self._pending_language_switch: Optional[Dict[str, Any]] = None
+        self._last_rtp_seq_end: Optional[int] = None
         self.transcript_language = "en"
         self.ai_response_language = "en"
         self.selected_tts_provider = "murf"
@@ -1037,6 +1039,8 @@ class SipCallSession:
         if not text:
             return
 
+        self._last_customer_partial = text
+
         now = time.monotonic()
 
         # Suppress AI speech echo
@@ -1178,41 +1182,131 @@ class SipCallSession:
             f"\n  text='{text}'"
         )
 
-        # Enforce English-only recognition and conversation lock
+        # Dynamic 5-Language Switching & Multilingual Conversation
         real_conf = float(metrics.get("confidence", 1.0))
         self.call_id = self.call_sid
         self.utterance_id = utt_id
         self.stt_language_confidence = real_conf
         self.original_transcript = text
 
-        self.detected_utterance_language = "en"
-        self.preferred_response_language = "en"
-        self.language_switch_requested = False
-        self.selected_tts_provider = "murf"
-        self.selected_tts_voice = "en-IN-isha"
-        self.transcript_language = "en"
-        self.language_code = "en"
-        self.current_lang = "en"
-        self.detected_language = "English"
-        self.language_confidence = real_conf
-        self.ai_response_language = "en"
-        if hasattr(self, "booking_session"):
-            self.booking_session.conversation_language = "en"
+        # Check pending language switch context from prior split utterance
+        now_t = time.monotonic()
+        pending_sw = getattr(self, "_pending_language_switch", None)
+        target_lang = None
+        is_switch = False
+        is_ambiguous = False
+        prefix_used = ""
 
-        # Intercept foreign language input or language switch requests
-        if language_service.is_language_switch_request(text) or language_service.is_non_english_input(text):
-            logger.info(f"[ENGLISH_ONLY_REDIRECT] Foreign language / switch request intercepted: '{text[:60]}'")
-            redirect_msg = language_service.get_language_switch_confirmation()
+        if pending_sw and (now_t - pending_sw.get("time", 0.0)) < 8.0:
+            prefix_used = pending_sw.get("text", "")
+            combined_text = f"{prefix_used} {text}".strip()
+            logger.info(f"[LANG_SWITCH_SPLIT_RESOLVE] Evaluating pending prefix='{prefix_used}' + text='{text}' -> combined='{combined_text}'")
+            target_lang, is_switch = language_service.check_explicit_language_switch(combined_text)
+            if not is_switch:
+                target_lang, is_switch = language_service.check_explicit_language_switch(text)
+            if is_switch and target_lang in ("ta", "en", "hi", "kn", "te"):
+                self._pending_language_switch = None
+            else:
+                # Ambiguous word following incomplete language switch (e.g. "Can you please talk in" -> "Summer")
+                # Requirement 5: Do not switch based on ambiguous words. Ask which supported language the customer wants.
+                is_ambiguous = True
+        else:
+            self._pending_language_switch = None
+            target_lang, is_switch = language_service.check_explicit_language_switch(text)
+
+        if not is_switch and not is_ambiguous:
+            if language_service.is_incomplete_language_switch(text):
+                # Customer said "Can you please talk in", "Please switch to", etc.
+                self._pending_language_switch = {"text": text, "time": now_t}
+                clarification_msg = language_service.get_language_clarification_prompt(self.current_lang)
+                self.session_history.append({"role": "user", "text": text})
+                self.session_history.append({"role": "model", "text": clarification_msg})
+                metrics["response_id"] = f"ai_lang_clarify_{int(time.time()*1000)}"
+                metrics["source"] = "LANGUAGE_CLARIFICATION"
+                logger.info(f"[LANG_SWITCH_INCOMPLETE_PROMPT] Incomplete request '{text}' -> Asking clarification in '{self.current_lang}'")
+                await self._speak(clarification_msg, "language_clarification", metrics)
+                return
+
+        if is_ambiguous:
+            clarification_msg = language_service.get_language_clarification_prompt(self.current_lang)
             self.session_history.append({"role": "user", "text": text})
-            self.session_history.append({"role": "model", "text": redirect_msg})
-            metrics["response_id"] = f"ai_en_redirect_{int(time.time()*1000)}"
-            metrics["source"] = "ENGLISH_ONLY_REDIRECT"
-            await self._speak(redirect_msg, "language_redirect", metrics)
+            self.session_history.append({"role": "model", "text": clarification_msg})
+            metrics["response_id"] = f"ai_lang_clarify_{int(time.time()*1000)}"
+            metrics["source"] = "LANGUAGE_CLARIFICATION"
+            logger.info(f"[LANG_SWITCH_AMBIGUOUS_PROMPT] Ambiguous request '{text}' after '{prefix_used}' -> Asking clarification in '{self.current_lang}'")
+            await self._speak(clarification_msg, "language_clarification", metrics)
             return
 
-        readable_utterance = "English"
-        readable_preferred = "English"
-        stt_detected_lang = "en"
+        if is_switch:
+            if target_lang in ("ta", "en", "hi", "kn", "te"):
+                # Customer explicitly requested a valid supported language
+                self.current_lang = target_lang
+                self.language_code = target_lang
+                self.detected_language = language_service.get_language_name(target_lang)
+                self.detected_utterance_language = target_lang
+                self.preferred_response_language = target_lang
+                self.ai_response_language = target_lang
+                self.transcript_language = target_lang
+                self.language_switch_requested = True
+                self.language_change_timestamp = datetime.now(timezone.utc).isoformat()
+                self._pending_language_switch = None
+
+                v_id, _, prov = language_service.get_tts_voice_and_model(target_lang)
+                self.selected_tts_voice = v_id
+                self.selected_tts_provider = prov
+
+                if hasattr(self, "booking_session") and self.booking_session:
+                    self.booking_session.conversation_language = target_lang
+
+                # Dynamically reconfigure Deepgram STT stream for the new language
+                if hasattr(self, "deepgram_session") and self.deepgram_session:
+                    try:
+                        await self.deepgram_session.switch_language(target_lang)
+                    except Exception as _stt_sw_err:
+                        logger.warning(f"[STT_LANG_SWITCH_ERR] {_stt_sw_err}")
+
+                switch_msg = language_service.get_language_switch_confirmation(
+                    target_lang, booking_session=getattr(self, "booking_session", None)
+                )
+
+                self.session_history.append({"role": "user", "text": text})
+                self.session_history.append({"role": "model", "text": switch_msg})
+                metrics["response_id"] = f"ai_lang_switch_{int(time.time()*1000)}"
+                metrics["source"] = "LANGUAGE_SWITCH"
+                metrics["language"] = self.current_lang
+                logger.info(f"[LANG_SWITCH_EXECUTED] call_id={self.call_sid} new_lang={target_lang} response='{switch_msg}'")
+                await self._speak(switch_msg, "language_switch", metrics)
+                return
+            else:
+                # Unsupported foreign language requested (e.g. Spanish, French)
+                unsupported_msg = language_service.get_language_switch_confirmation(None)
+                self.session_history.append({"role": "user", "text": text})
+                self.session_history.append({"role": "model", "text": unsupported_msg})
+                metrics["response_id"] = f"ai_lang_unsupported_{int(time.time()*1000)}"
+                metrics["source"] = "LANGUAGE_UNSUPPORTED"
+                await self._speak(unsupported_msg, "language_unsupported", metrics)
+                return
+
+        # Normal in-language conversation turn
+        detected_script_lang = language_service.detect_spoken_language(text, current_lang=self.current_lang)
+        self.current_lang = detected_script_lang
+        self.language_code = self.current_lang
+        self.detected_language = language_service.get_language_name(self.current_lang)
+        self.detected_utterance_language = self.current_lang
+        self.preferred_response_language = self.current_lang
+        self.ai_response_language = self.current_lang
+        self.transcript_language = self.current_lang
+        self.language_switch_requested = False
+
+        v_id, _, prov = language_service.get_tts_voice_and_model(self.current_lang)
+        self.selected_tts_voice = v_id
+        self.selected_tts_provider = prov
+        if hasattr(self, "booking_session") and self.booking_session:
+            self.booking_session.conversation_language = self.current_lang
+
+        readable_utterance = self.detected_language
+        readable_preferred = self.detected_language
+        stt_detected_lang = self.current_lang
         logger.info(
             f"\n[LANGUAGE_DETECTED]"
             f"\n  call_id={self.call_sid}"
@@ -1661,42 +1755,119 @@ class SipCallSession:
 
         txt_lower = transcription.lower().strip()
 
-        # ── PRIORITY 1: Dedicated Booking Confirmation Fast-Path ─────────────
-        # When booking state is WAITING_FOR_CONFIRMATION, route customer response directly to
-        # confirmation handler BEFORE normal greeting, general conversation, RAG, or intent detection.
-        from src.services.booking_state_service import BookingState
-        if self.booking_session and self.booking_session.state == BookingState.WAITING_FOR_CONFIRMATION:
-            t_conf0 = time.monotonic()
-            response_text = booking_state_service.handle_confirmation_turn(
-                self.booking_session, transcription, turn_id=utt_id, state_before=state_before
-            )
-            t_conf1 = time.monotonic()
-            state_ms = round((t_conf1 - t_conf0) * 1000)
+        # ── PRIORITY 0: Explicit Language Switch ──────────────────────────────
+        # Language switch takes highest precedence before any booking or question processing.
+        target_lang, is_switch, switch_reason = language_service.check_language_switch_detailed(transcription)
+        if is_switch:
+            if target_lang in ("ta", "en", "hi", "kn", "te"):
+                prev_lang = getattr(self, "preferred_response_language", "en")
+                self.preferred_response_language = target_lang
+                self.current_lang = target_lang
+                self.language_code = target_lang
+                self.detected_language = language_service.get_language_name(target_lang)
+                self.detected_utterance_language = target_lang
+                self.language_switch_requested = True
+                self.language_change_timestamp = datetime.now(timezone.utc).isoformat()
+                self._pending_language_switch = None
 
-            logger.info(
-                f"\n[CONFIRMATION_PRIORITY_ROUTE]"
-                f"\n  call_id={self.call_sid}"
-                f"\n  utterance_id={utt_id}"
-                f"\n  transcription='{transcription}'"
-                f"\n  state_after={self.booking_session.state}"
-                f"\n  response_text='{response_text}'"
-                f"\n  latency_ms={state_ms}"
-            )
+                if hasattr(self, "booking_session") and self.booking_session:
+                    self.booking_session.conversation_language = target_lang
 
-            if response_text:
-                intent_name = "appointment_booking"
-                self._messages.append({"role": "user", "text": transcription, "intent": intent_name})
+                v_id, _, prov = language_service.get_tts_voice_and_model(target_lang)
+                self.selected_tts_voice = v_id
+                self.selected_tts_provider = prov
+
+                if hasattr(self, "deepgram_session") and self.deepgram_session:
+                    try:
+                        asyncio.create_task(self.deepgram_session.switch_language(target_lang))
+                    except Exception as _stt_sw_err:
+                        logger.warning(f"[STT_LANG_SWITCH_ERR] {_stt_sw_err}")
+
+                logger.info(
+                    f"\n[LANGUAGE_STATE]"
+                    f"\n  call_id={self.call_sid}"
+                    f"\n  previous_preferred_language={prev_lang}"
+                    f"\n  new_preferred_language={target_lang}"
+                    f"\n  state_update_result=PERSISTED"
+                )
+
+                switch_msg = language_service.get_language_switch_confirmation(
+                    target_lang,
+                    booking_session=getattr(self, "booking_session", None),
+                    org_name=rag_service.get_organization_name(self.organization_id)
+                )
+
                 self.session_history.append({"role": "user", "text": transcription})
-                self.session_history.append({"role": "model", "text": response_text})
-                asyncio.create_task(asyncio.to_thread(self._log_to_db, "user", transcription, intent_name))
-
-                metrics["response_id"] = response_id
-                metrics["ai_end"]     = t_conf1
-                metrics["ai_latency"] = t_conf1 - t_ai_start
-                metrics["state_ms"]   = state_ms
-
-                await self._speak(response_text, intent_name, metrics)
+                self.session_history.append({"role": "model", "text": switch_msg})
+                metrics["response_id"] = f"ai_lang_switch_{int(time.time()*1000)}"
+                metrics["source"] = "LANGUAGE_SWITCH"
+                metrics["language"] = target_lang
+                await self._speak(switch_msg, "language_switch", metrics)
                 return
+
+            elif switch_reason == "ambiguous":
+                clarify_msg = language_service.get_language_clarification_prompt(self.current_lang)
+                self.session_history.append({"role": "user", "text": transcription})
+                self.session_history.append({"role": "model", "text": clarify_msg})
+                metrics["response_id"] = f"ai_lang_clarify_{int(time.time()*1000)}"
+                metrics["source"] = "LANGUAGE_CLARIFICATION"
+                await self._speak(clarify_msg, "language_clarification", metrics)
+                return
+
+            else:
+                unsupported_msg = language_service.get_language_switch_confirmation(None)
+                self.session_history.append({"role": "user", "text": transcription})
+                self.session_history.append({"role": "model", "text": unsupported_msg})
+                metrics["response_id"] = f"ai_lang_unsupported_{int(time.time()*1000)}"
+                metrics["source"] = "LANGUAGE_UNSUPPORTED"
+                await self._speak(unsupported_msg, "language_unsupported", metrics)
+                return
+
+        # ── PRIORITY 1: Active Booking State Priority ─────────────────────────
+        # When an appointment booking is active (COLLECTING_EMAIL, COLLECTING_PHONE, COLLECTING_PATIENT_NAME,
+        # WAITING_FOR_TIME, WAITING_FOR_DATE, WAITING_FOR_DOCTOR, WAITING_FOR_CONFIRMATION),
+        # booking state takes ABSOLUTE PRIORITY over general NLP intent classification.
+        # An incoming email, phone, name, or time must never be classified as general_conversation or general_question.
+        if self.booking_session and self.booking_session.is_active():
+            _is_cancel = any(w in txt_lower for w in ["cancel booking", "cancel appointment", "stop booking", "dont book", "don't book", "never mind", "forget it", "leave it"])
+            _is_emergency = any(w in txt_lower for w in ["emergency", "ambulance", "urgent care", "heart attack", "bleeding"])
+            _is_transfer = any(w in txt_lower for w in ["transfer to human", "speak to human", "real person", "human agent", "receptionist"])
+            _is_explicit_faq = (
+                any(q in txt_lower for q in ["where is the hospital", "where are you located", "visiting hours", "opening hours", "hospital address", "what is the location", "how to reach"])
+                and not any(w in txt_lower for w in ["appointment", "booking", "slot", "doctor", "email", "phone", "name", "@", ".com"])
+            )
+
+            if not (_is_cancel or _is_emergency or _is_transfer or _is_explicit_faq):
+                t_state_0 = time.monotonic()
+                self.booking_session.conversation_language = self.preferred_response_language
+                response_text = booking_state_service.process_booking_turn(transcription, self.booking_session, turn_id=utt_id)
+                t_state_1 = time.monotonic()
+                state_ms = round((t_state_1 - t_state_0) * 1000)
+
+                logger.info(
+                    f"\n[BOOKING_PRIORITY_ROUTE]"
+                    f"\n  call_id={self.call_sid}"
+                    f"\n  utterance_id={utt_id}"
+                    f"\n  transcription='{transcription}'"
+                    f"\n  state_after={self.booking_session.state}"
+                    f"\n  response_text='{response_text}'"
+                    f"\n  latency_ms={state_ms}"
+                )
+
+                if response_text:
+                    intent_name = "appointment_booking"
+                    self._messages.append({"role": "user", "text": transcription, "intent": intent_name})
+                    self.session_history.append({"role": "user", "text": transcription})
+                    self.session_history.append({"role": "model", "text": response_text})
+                    asyncio.create_task(asyncio.to_thread(self._log_to_db, "user", transcription, intent_name))
+
+                    metrics["response_id"] = response_id
+                    metrics["ai_end"]     = t_state_1
+                    metrics["ai_latency"] = t_state_1 - t_ai_start
+                    metrics["state_ms"]   = state_ms
+
+                    await self._speak(response_text, intent_name, metrics)
+                    return
         is_informational_query = (
             any(q in txt_lower for q in ["can you list", "what are", "who are", "which are", "tell me about", "where is", "where are", "how much", "what is", "who is", "list the", "list all", "list departments", "list teachers", "list doctors", "list services", "may i know", "can i know", "do you have", "what about"])
             or bool(re.search(r'^(?:what|who|which|how|where|when|can\s+you|could\s+you|tell\s+me|show|list)\b', txt_lower))
@@ -2152,10 +2323,12 @@ class SipCallSession:
                     logger.info(f"[LLM] Call ended or barge-in — aborting stream")
                     break
 
-                # ── Speak each sentence as it arrives (sentence-streaming TTS) ──
+                # ── Speak each sentence as it arrives (pipelined sentence-streaming TTS) ──
                 # Keep utt_id, response_id and speech endpoints in sent_metrics across all chunks
                 sent_metrics = {
                     "is_chunk": True,
+                    "pipelined_stream": True,
+                    "chunk_idx": sentence_index,
                     "response_id": response_id,
                     "utt_id": utt_id,
                     "speech_end_monotonic": metrics.get("speech_end_monotonic"),
@@ -2178,15 +2351,35 @@ class SipCallSession:
                 if self.ended or self._barge_in_event.is_set() or stream_abort.is_set():
                     break
 
+            # Await remaining playback for all pipelined chunks seamlessly
+            remaining_wait = max(0.0, getattr(self, "_ai_speaking_until", 0.0) - time.monotonic())
+            if remaining_wait > 0.05 and not self.ended and not self._barge_in_event.is_set():
+                try:
+                    await asyncio.wait_for(self._barge_in_event.wait(), timeout=remaining_wait)
+                    if self.ended:
+                        logger.info(f"[CALL_ENDED] Call {self.call_sid} ended during playback")
+                    else:
+                        logger.info(f"[PLAYBACK_INTERRUPTED] Customer spoke during playback remaining_s={remaining_wait:.2f}")
+                        if self.audio_clear_callback and not self.ended:
+                            self.audio_clear_callback()
+                except asyncio.TimeoutError:
+                    logger.info(f"[PLAYBACK_COMPLETED] call_id={self.call_sid} response_id={response_id} monotonic={time.monotonic():.4f}")
+
+            self._ai_speaking = False
+            self._last_ai_speak_end_time = time.monotonic()
+            self._ai_speaking_until = time.monotonic() + 0.15
+
             full_response = " ".join(full_response_parts).strip()
             metrics["ai_end"]        = time.monotonic()
             metrics["ai_latency_ms"] = round((metrics["ai_end"] - t_ai_start) * 1000)
             metrics["rag_used"]      = bool(context and len(context) > 0)
 
-            # Fallback if empty and no barge-in occurred
+            # Fallback if empty and no barge-in occurred (Requirement 12: Maintain active language)
             if not full_response and not self._barge_in_event.is_set() and not self.ended:
                 org_name = rag_service.get_organization_name(self.organization_id)
-                if org_name:
+                if self.current_lang != "en":
+                    full_response = language_service.get_language_fallback_prompt(self.current_lang, org_name)
+                elif org_name:
                     full_response = f"Thank you for contacting {org_name}. How may I assist you today?"
                 else:
                     full_response = "Thank you for contacting us. How may I assist you today?"
@@ -2350,6 +2543,15 @@ class SipCallSession:
                 return
             logger.info(f"[TTS] source=AI {len(audio_bytes)} bytes in {elapsed:.2f}s: '{text[:60]}'")
             logger.info(f"[TTS_GENERATION_STATUS] call_id={self.call_sid} utterance_id={utt_id} bytes={len(audio_bytes)} duration_ms={round(elapsed * 1000)} status=SUCCESS")
+            logger.info(
+                f"\n[LANGUAGE_RESPONSE]"
+                f"\n  call_id={self.call_sid}"
+                f"\n  preferred_response_language={getattr(self, 'preferred_response_language', self.current_lang)}"
+                f"\n  llm_output_language={self.current_lang}"
+                f"\n  tts_requested_language={self.current_lang}"
+                f"\n  actual_selected_tts_voice={getattr(self, 'selected_tts_voice', 'en-IN-isha')}"
+                f"\n  tts_result=SUCCESS"
+            )
 
             # Browser monitoring + UI transcript (emit BEFORE phone send for minimal perceived latency)
             ts = datetime.now(timezone.utc).isoformat()
@@ -2573,48 +2775,56 @@ class SipCallSession:
                         else:
                             tx_result = "DROPPED: no audio_send_callback"
 
-                        logger.info(
-                            f"\n[RTP_VOICE_TRANSMISSION]"
-                            f"\n  call_id={self.call_sid}"
-                            f"\n  utterance_id={utt_id}"
-                            f"\n  audio_source=AI_TTS"
-                            f"\n  decoded_pcm_bytes={len(pcm16_audio)}"
-                            f"\n  sample_rate=8000"
-                            f"\n  channel_count=1"
-                            f"\n  pcmu_encoded_bytes={len(pcmu_bytes)}"
-                            f"\n  rtp_packet_count={pkt_count}"
-                            f"\n  rtp_payload_bytes=160"
-                            f"\n  rtp_destination={rtp_dest_ip}:{rtp_dest_port}"
-                            f"\n  seq_start={seq_start}"
-                            f"\n  seq_end={seq_end}"
-                            f"\n  duration_s={audio_play_dur:.2f}"
-                            f"\n  rms_energy={pcm_rms}"
-                            f"\n  peak_amplitude={pcm_peak}"
-                            f"\n  actual_transmission_result={tx_result}"
-                        )
-                        logger.info(f"[RTP_AUDIO_TRANSMISSION] call_id={self.call_sid} utterance_id={utt_id} bytes={len(pcmu_bytes)} duration_s={audio_play_dur:.2f} status={tx_result}")
+                        # Structured Diagnostic Logs
+                        chunk_idx = metrics.get("chunk_idx", 0) if metrics else 0
+                        is_pipelined = bool(metrics and metrics.get("pipelined_stream"))
+                        resp_id = (metrics.get("response_id") if metrics else None) or getattr(self, "_current_response_id", "resp")
+
+                        logger.info(f"[TTS_CHUNK_RECEIVED] call_id={self.call_sid} response_id={resp_id} chunk_idx={chunk_idx} bytes={len(audio_bytes)}")
+                        logger.info(f"[MP3_DECODE_COMPLETE] call_id={self.call_sid} response_id={resp_id} raw_pcm_bytes={len(pcm16_audio)}")
+                        logger.info(f"[PCM_SAMPLES_RECEIVED] call_id={self.call_sid} response_id={resp_id} samples={len(pcm16_audio)//2}")
+                        logger.info(f"[RESAMPLED_SAMPLES] call_id={self.call_sid} rate=8000 channels=1 samples={len(pcm16_audio)//2}")
+                        logger.info(f"[PCMU_BYTES_ENCODED] call_id={self.call_sid} response_id={resp_id} bytes={len(pcmu_bytes)} packets={pkt_count}")
+
+                        # Read true hardware transmit queue depth from authoritative RTP sender
+                        q_depth = max(0, round((getattr(self, "_ai_speaking_until", 0.0) - time.monotonic()) * 50))
+                        if pycall and hasattr(pycall, "RTPClients") and pycall.RTPClients:
+                            real_rtp = pycall.RTPClients[0]
+                            real_q = getattr(getattr(real_rtp, "pmout", None), "queue_depth_packets", None)
+                            if real_q is not None:
+                                q_depth = real_q
+
+                        logger.info(f"[RTP_PACKET_ENQUEUED] call_id={self.call_sid} response_id={resp_id} packets={pkt_count} audio_queue_depth={q_depth}")
+                        logger.info(f"[PLAYBACK_STARTED] call_id={self.call_sid} response_id={resp_id} duration_s={audio_play_dur:.2f} monotonic={time.monotonic():.4f}")
 
                         # Feed AI speech to TwoWayCallRecorder for synchronized recording
                         if hasattr(self, "two_way_recorder") and pcm16_audio:
                             self.two_way_recorder.feed_ai_pcm16(pcm16_audio)
 
-                        # Yield event-loop time during the audio playback window, allowing instant barge-in
-                        if audio_play_dur > 0.05:
-                            try:
-                                await asyncio.wait_for(self._barge_in_event.wait(), timeout=audio_play_dur)
-                                logger.info("[BARGE_IN] Customer spoke - interrupted playback sleep")
-                                if self.audio_clear_callback:
-                                    try:
-                                        self.audio_clear_callback()
-                                    except Exception:
-                                        pass
-                            except asyncio.TimeoutError:
-                                pass
+                        if is_pipelined:
+                            # Advance playback end window without blocking the sentence loop
+                            self._ai_speaking = True
+                            self._ai_speaking_until = max(getattr(self, "_ai_speaking_until", 0.0), time.monotonic()) + audio_play_dur
+                        else:
+                            # Standalone utterance playback wait
+                            if audio_play_dur > 0.05:
+                                try:
+                                    await asyncio.wait_for(self._barge_in_event.wait(), timeout=audio_play_dur)
+                                    if self.ended:
+                                        logger.info(f"[CALL_ENDED] Call {self.call_sid} ended during playback")
+                                        return
+                                    logger.info(f"[PLAYBACK_INTERRUPTED] Customer spoke - interrupted playback sleep call_id={self.call_sid}")
+                                    if self.audio_clear_callback and not self.ended:
+                                        try:
+                                            self.audio_clear_callback()
+                                        except Exception:
+                                            pass
+                                except asyncio.TimeoutError:
+                                    logger.info(f"[PLAYBACK_COMPLETED] call_id={self.call_sid} response_id={resp_id} monotonic={time.monotonic():.4f}")
 
-                        # Mark end of this audio chunk for echo guard
-                        self._ai_speaking = False
-                        self._last_ai_speak_end_time = time.monotonic()
-                        self._ai_speaking_until = time.monotonic() + 0.15
+                            self._ai_speaking = False
+                            self._last_ai_speak_end_time = time.monotonic()
+                            self._ai_speaking_until = time.monotonic() + 0.15
 
                     elif self._barge_in_event.is_set():
                         logger.info("[BARGE_IN] Customer spoke - dropping AI audio")

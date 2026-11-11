@@ -137,6 +137,7 @@ class OrganizationDeletionService:
                    OR user_id IN (SELECT id FROM users WHERE organization_id = :org_id)
             """)),
             ("knowledge_documents", text("DELETE FROM knowledge_documents WHERE organization_id = :org_id")),
+            ("department_staff", text("DELETE FROM department_staff WHERE organization_id = :org_id")),
             ("staff", text("DELETE FROM staff WHERE organization_id = :org_id")),
             ("departments", text("DELETE FROM departments WHERE organization_id = :org_id")),
             ("users", text("DELETE FROM users WHERE organization_id = :org_id")),

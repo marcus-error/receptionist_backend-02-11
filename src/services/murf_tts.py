@@ -46,6 +46,8 @@ VOICE_ALIASES = {
 
 MURF_LANGUAGE_VOICES = {
     "en": "en-IN-isha",
+    "ta": "ta-IN-iniya",
+    "hi": "hi-IN-shweta",
 }
 
 MODEL_VERSION_MAP = {
@@ -143,9 +145,12 @@ class MurfTTSService:
         raw_target_model = model or env_model or "GEN2"
         target_voice, model_version = parse_voice_and_model(raw_target_voice, raw_target_model)
 
-        # Enforce English voice and GEN2 model for telephony
-        target_voice = target_voice or "en-IN-isha"
-        model_version = "GEN2"
+        # For Tamil (ta-IN-*) and Hindi (hi-IN-*) voices, Murf requires GEN1
+        if target_voice.startswith("ta-IN") or target_voice.startswith("hi-IN"):
+            model_version = "GEN1"
+        elif not model:
+            target_voice = target_voice or "en-IN-isha"
+            model_version = model_version or "GEN2"
 
         if not api_key:
             latency_ms = int((time.time() - t0) * 1000)
