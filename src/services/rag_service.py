@@ -568,110 +568,167 @@ class RagService:
 
         return ""
 
+    def get_business_name(
+        self,
+        organization_id: Optional[int] = None,
+        document_id: Optional[str] = None,
+        scope: Optional[str] = None
+    ) -> str:
+        """
+        Dynamically extracts the genuine Business / Organization Name from:
+        1. Explicit metadata in active script/doc content (Organization Name:, Company Name:, etc.)
+        2. Spoken assistant or brand patterns (e.g. "AI assistant for Aminoid AI", "welcome to Sarans Hospitals")
+        3. Script header block (e.g. "SARANS HOSPITALS — RAG-STRUCTURED INBOUND AI SCRIPT")
+        4. Cleaned document title (stripped of file extensions, version numbers, and generic script/rag keywords)
+        5. Authenticated database Organization.name (if not a generic placeholder like "Default Organization")
+        
+        Strict Rules:
+        - Never returns filenames or file extensions.
+        - Never returns "Default Organization", "unknown", "our team", or generic words.
+        - Never invents business names.
+        """
+        def _clean_biz_name(cand: str) -> str:
+            if not cand:
+                return ""
+            c = cand.strip()
+            c = re.sub(r'[*_#`]', '', c).strip()
+            c = re.sub(r'\s*\(.*?\)', '', c).strip()
+            if c.isupper():
+                c = c.title()
+            c = re.sub(r'\bAi\b', 'AI', c)
+            c = re.sub(r'\bUsa\b', 'USA', c)
+            c = re.sub(r'\bLlc\b', 'LLC', c)
+            c = re.sub(r'\s+', ' ', c).strip()
+            return c
+
+        # 1. Fetch content and doc_title from SQLite for the target document or active script
+        target_doc = None
+        target_doc_id = document_id or self._resolve_active_document_id(organization_id, scope=scope)
+        db_org_name = ""
+        try:
+            from src.config.database import SessionLocal
+            from src.models.knowledge_doc import KnowledgeDocument
+            from src.models.organization import Organization
+            db = SessionLocal()
+            try:
+                if target_doc_id:
+                    try:
+                        d_num = int(target_doc_id)
+                        target_doc = db.query(KnowledgeDocument).filter(KnowledgeDocument.id == d_num).first()
+                    except ValueError:
+                        target_doc = db.query(KnowledgeDocument).filter(KnowledgeDocument.title == str(target_doc_id)).first()
+
+                # Also inspect database Organization.name
+                if organization_id:
+                    org = db.query(Organization).filter(Organization.id == int(organization_id)).first()
+                    if org and org.name and org.name.strip().lower() not in {"default organization", "organization", "company", "business", "unknown", "none"}:
+                        db_org_name = _clean_biz_name(org.name)
+            finally:
+                db.close()
+        except Exception as e:
+            logger.debug(f"Error fetching doc for business name: {e}")
+
+        content = ""
+        doc_title = ""
+        if target_doc:
+            content = str(target_doc.content or "")
+            doc_title = str(target_doc.title or "")
+            if not content and target_doc.file_path:
+                try:
+                    import os
+                    if os.path.exists(target_doc.file_path):
+                        with open(target_doc.file_path, "r", encoding="utf-8", errors="ignore") as fp:
+                            content = fp.read()
+                except Exception:
+                    pass
+
+        if not content and organization_id:
+            content = self.get_organization_master_context(organization_id, document_id=document_id, scope=scope) or ""
+
+        # 2. Check explicit metadata fields in content
+        if content:
+            m_meta = re.search(
+                r'(?:Company\s*/\s*Organization Name|Organization Name|Business Name|Company Name|Hospital Name|Clinic Name|Salon Name|School Name|Restaurant Name|Hotel Name|Agency Name|Firm Name)(?:\s*:|\s*\n+)\s*([^\n\r]+)',
+                content,
+                re.IGNORECASE
+            )
+            if m_meta:
+                cand = _clean_biz_name(m_meta.group(1))
+                if len(cand) > 2 and cand.lower() not in ("unknown", "n/a", "none", "our team"):
+                    return cand
+
+            # 3. Check assistant patterns e.g. "AI assistant for Aminoid AI" or "the Aminoid AI assistant"
+            m_asst = re.search(
+                r'(?:ai\s+assistant|assistant|virtual\s+assistant)\s+(?:for|at|of)\s+([A-Z][A-Za-z0-9\s&\'\.\-]+?)(?:\.|\?|\!|,|\s+I can|\s+how may|\s+how can|\n|$)',
+                content
+            )
+            if m_asst:
+                cand = _clean_biz_name(m_asst.group(1))
+                if len(cand) > 2 and cand.lower() not in ("our team", "the company", "the team", "us"):
+                    return cand
+
+            # 4. Check welcome/thank you patterns e.g. "Welcome to Sarans Hospitals"
+            m_welcome = re.search(
+                r'(?:welcome to|thank you for calling|thanks for calling)\s+([A-Z][A-Za-z0-9\s&\'\.\-]+?)(?:\.|\?|\!|,|\s+how may|\s+how can|\s+thank you|\n|$)',
+                content,
+                re.IGNORECASE
+            )
+            if m_welcome:
+                cand = _clean_biz_name(m_welcome.group(1))
+                if len(cand) > 2 and cand.lower() not in ("our team", "the company", "the team", "the call", "us", "doctor", "dr."):
+                    return cand
+
+            # 5. Check header block e.g. "SARANS HOSPITALS — RAG-STRUCTURED INBOUND AI SCRIPT"
+            m_hdr = re.search(
+                r'^(?:#+\s*)?([A-Za-z0-9\s&\'\.\-]{3,40}?)\s*(?:[\—\-\|]\s*(?:RAG|INBOUND|OUTBOUND|CONVERSATION|AI SCRIPT|SCRIPT|MASTER FAQ|INFORMATION)|\s+INFORMATION|\s+MASTER FAQ|\n+(?:OUTBOUND|INBOUND)?\s*RAG\s+SCRIPT)',
+                content,
+                re.MULTILINE | re.IGNORECASE
+            )
+            if m_hdr:
+                cand = _clean_biz_name(m_hdr.group(1))
+                if len(cand) > 2 and not any(w in cand.lower() for w in ["section", "general", "overview", "inbound", "outbound", "script"]):
+                    return cand
+
+        # 6. Extract clean business name from document title
+        if doc_title:
+            title_clean = re.sub(r'\.(pdf|docx|txt|doc|csv)$', '', doc_title, flags=re.IGNORECASE)
+            title_clean = re.sub(r'^(?:master_rag_knowledge_base_|rag_knowledge_base_|knowledge_base_|master_rag_|rag_)', '', title_clean, flags=re.IGNORECASE)
+            title_clean = re.sub(r'\s*\(\d+\)', '', title_clean)
+            title_clean = re.sub(r'\b\d+\b', '', title_clean)
+            keywords_to_remove = [
+                r'inbound\s+rag\s+conversation\s+script',
+                r'rag\s+inbound\s+script\s+fine\s+tuned',
+                r'telesales\s+walkin\s+recruitment',
+                r'inbound\s+script',
+                r'outbound\s+rag\s+script',
+                r'outbound\s+script',
+                r'receptionist\s+rag\s+formatted',
+                r'receptionist\s+script',
+                r'rag\s+script',
+                r'conversation\s+script',
+                r'script',
+                r'rag'
+            ]
+            t = title_clean.replace('_', ' ').strip()
+            for kw in keywords_to_remove:
+                t = re.sub(kw, '', t, flags=re.IGNORECASE).strip()
+            t = re.sub(r'[-—–]', '', t).strip()
+            cand = _clean_biz_name(t)
+            if len(cand) > 2 and not any(w in cand.lower() for w in ["simple english", "knowledge base", "document", "test"]):
+                return cand
+
+        # 7. Fallback to database Organization.name
+        if db_org_name:
+            return db_org_name
+
+        return ""
+
     def get_organization_name(self, organization_id: Optional[int] = None, document_id: Optional[str] = None, scope: Optional[str] = None) -> str:
         """
         Dynamically extracts the Organization / Business Name from the database or active Knowledge Base.
         Returns empty string if no custom brand is specified.
         """
-        # Strict Rule 3: Fetch the organisation name dynamically from the database first
-        if organization_id:
-            try:
-                from src.config.database import SessionLocal
-                from src.models.organization import Organization
-                db = SessionLocal()
-                try:
-                    org = db.query(Organization).filter(Organization.id == int(organization_id)).first()
-                    if org and org.name and org.name.strip().lower() not in {"default organization", "organization", "company", "business", "unknown", "none"}:
-                        res_name = org.name.strip()
-                        res_name = re.sub(r'\bAi\b', 'AI', res_name)
-                        return res_name
-                finally:
-                    db.close()
-            except Exception:
-                pass
-
-        master_ctx = self.get_organization_master_context(organization_id, document_id=document_id, scope=scope)
-        if master_ctx:
-            match = re.search(
-                r'(?:Company\s*/\s*Organization Name|Organization Name|Business Name|Company Name|Hospital Name|Clinic Name|Salon Name|School Name|Restaurant Name|Hotel Name|Agency Name|Firm Name)(?:\s*:|\s*\n+)\s*([^\n\r]+)',
-                master_ctx,
-                re.IGNORECASE
-            )
-            if match:
-                clean_name = re.sub(r'[*_#`]', '', match.group(1)).strip()
-                if clean_name.isupper():
-                    clean_name = clean_name.title()
-                clean_name = re.sub(r'\bAi\b', 'AI', clean_name)
-                clean_name = re.sub(r'\bUsa\b', 'USA', clean_name)
-                clean_name = re.sub(r'\bLlc\b', 'LLC', clean_name)
-                if len(clean_name) > 1 and not any(w in clean_name.lower() for w in ["unknown", "n/a", "none"]):
-                    return clean_name
-
-            # Check for "Welcome to [Organization Name]" in master context
-            m_welcome = re.search(r'welcome to\s+([A-Za-z0-9\s&\'\-]+?)(?:\.|\?|\!|,|how may|thank you|\n|$)', master_ctx, re.IGNORECASE)
-            if m_welcome:
-                clean_w = re.sub(r'[*_#`]', '', m_welcome.group(1)).strip()
-                if clean_w.isupper():
-                    clean_w = clean_w.title()
-                clean_w = re.sub(r'\bAi\b', 'AI', clean_w)
-                clean_w = re.sub(r'\bUsa\b', 'USA', clean_w)
-                clean_w = re.sub(r'\bLlc\b', 'LLC', clean_w)
-                if len(clean_w) > 2 and not any(w in clean_w.lower() for w in ["unknown", "n/a", "none", "our team", "the call", "doctor", "dr."]):
-                    return clean_w
-
-            header_match = re.search(r'#+\s*([A-Za-z0-9\s\.\-&,\']+?)(?:[\-\n\r]|$)', master_ctx)
-            if header_match:
-                candidate = re.sub(r'[*_#`]', '', header_match.group(1)).strip()
-                stop_phrases = [
-                    "test receptionist script", "receptionist script", "inbound script", "outbound script",
-                    "test script", "rag knowledge base", "section", "organization overview", "knowledge base",
-                    "master rag", "school information", "hospital information", "salon information",
-                    "company information", "doctor directory", "doctors directory", "staff directory",
-                    "directory", "departments", "department", "services", "treatments", "pricing",
-                    "hours", "timings", "contact", "faq", "faqs", "greeting & call opening", "greeting",
-                    "call opening"
-                ]
-                for sp in stop_phrases:
-                    candidate = re.sub(re.escape(sp), '', candidate, flags=re.IGNORECASE).strip()
-                candidate = re.sub(r'\s*(?:inbound|outbound)?\s*script\s*$', '', candidate, flags=re.IGNORECASE).strip()
-                if candidate.isupper():
-                    candidate = candidate.title()
-                candidate = re.sub(r'\bAi\b', 'AI', candidate)
-                candidate = re.sub(r'\bUsa\b', 'USA', candidate)
-                candidate = re.sub(r'\bLlc\b', 'LLC', candidate)
-                if candidate and len(candidate) > 2 and not any(w in candidate.lower() for w in ["script", "receptionist", "knowledge base", "directory"]):
-                    return candidate
-
-        # If active document exists, attempt to extract clean title from SQLite
-        target_doc_id = document_id or self._resolve_active_document_id(organization_id)
-        if target_doc_id:
-            try:
-                from src.config.database import SessionLocal
-                from src.models.knowledge_doc import KnowledgeDocument
-                db = SessionLocal()
-                try:
-                    try:
-                        doc_id_num = int(target_doc_id)
-                        doc = db.query(KnowledgeDocument).filter(KnowledgeDocument.id == doc_id_num).first()
-                        if doc and organization_id is not None and doc.organization_id is not None and doc.organization_id != int(organization_id):
-                            doc = None
-                    except ValueError:
-                        doc = None
-                    if doc and doc.title:
-                        title_clean = re.sub(r'\.(pdf|txt|docx|doc)$', '', doc.title, flags=re.IGNORECASE)
-                        title_clean = re.sub(r'^(master_rag_knowledge_base_|rag_knowledge_base_|knowledge_base_)', '', title_clean, flags=re.IGNORECASE)
-                        title_clean = re.sub(r'(_rag)?(_inbound|_outbound)?(_script)?(_fine_tuned)?$', '', title_clean, flags=re.IGNORECASE)
-                        title_clean = title_clean.replace('_', ' ').strip().title()
-                        title_clean = re.sub(r'\bAi\b', 'AI', title_clean)
-                        bad_generic_keywords = ["simple english", "knowledge base", "master rag", "script", "document", "receptionist", "test"]
-                        if title_clean and not any(kw in title_clean.lower() for kw in bad_generic_keywords) and len(title_clean) > 2:
-                            return title_clean
-                finally:
-                    db.close()
-            except Exception:
-                pass
-
-        return ""
+        return self.get_business_name(organization_id=organization_id, document_id=document_id, scope=scope)
 
     @staticmethod
     def _clean_spoken_text(text: str) -> str:
@@ -681,8 +738,8 @@ class RagService:
         # Remove stage directions in parentheses or brackets e.g. (warmly), [in a friendly tone]
         s = re.sub(r'^\s*[\(\[][^\)\]]+[\)\]]\s*', '', s)
         s = re.sub(r'\s*[\(\[][^\)\]]+[\)\]]\s*$', '', s)
-        # Remove leading speaker label e.g. "AI Agent:", "AI Receptionist:", "Receptionist:", "Agent:"
-        s = re.sub(r'^(?:AI\s+Agent|AI\s+Receptionist|AI\s+Assistant|Receptionist|Assistant|Agent|AI)\s*:\s*', '', s, flags=re.IGNORECASE)
+        # Remove leading speaker label e.g. "AI Agent:", "AI Receptionist:", "Receptionist:", "Agent:", "MURI:"
+        s = re.sub(r'^[ \t*\-•#]*(?:[A-Za-z0-9_]+\s*(?:\([^\)]+\)\s*)?)?\s*:\s*', '', s)
         # Remove instruction triggers like "Say:", "Says:"
         s = re.sub(r'^(?:Say|Says|Speaks|Spoken|Greet with)\s*:\s*', '', s, flags=re.IGNORECASE)
         # Strip quotes and markdown formatting
@@ -713,9 +770,12 @@ class RagService:
             "retrieve", "check", "when", "the receptionist", "if a customer",
             "verify", "identify", "must", "note:", "step", "flow", "instructions:",
             "system:", "prompt:", "hospital name:", "company name:", "organization name:",
-            "address:", "phone:", "timing:", "hours:", "department:", "services:"
+            "address:", "phone:", "timing:", "hours:", "department:", "services:",
+            "disclose ai", "get the name", "chunks retrieved", "guardrails",
+            "internal use", "lead capture", "conversation flow", "stage",
+            "muri's goal", "goal", "none needed"
         ]
-        if any(clean.lower().startswith(bp) for bp in bad_prefixes):
+        if any(clean.lower().startswith(bp) or bp in clean.lower() for bp in bad_prefixes):
             return False
         words = clean.split()
         if len(words) < 3:
@@ -737,9 +797,14 @@ class RagService:
         if not text or not text.strip():
             return ""
         clean_src = text.strip()
-        quote_chars = '"\'“”‘’«»„‟\x91\x92\x93\x94\u201c\u201d\u2018\u2019'
 
-        # 1. Look for explicit GREETING section header on its own line (using horizontal whitespace so it never crosses newlines)
+        bad_instruction_words = [
+            "disclose ai", "get the name", "chunks retrieved", "guardrails",
+            "internal use", "lead capture", "conversation flow", "stage",
+            "muri's goal", "goal", "none needed"
+        ]
+
+        # 1. Look for explicit GREETING section header on its own line
         hdr_regex = re.compile(
             r'(?m)^[ \t*\-•#]*(?:\d+[\.\)][ \t]*)?(?:\*\*|__)?'
             r'(?:Voice Greeting|Inbound Greeting|Outbound Greeting|Opening Greeting|Receptionist Greeting|'
@@ -756,65 +821,70 @@ class RagService:
         for m in hdr_regex.finditer(clean_src):
             same_line = m.group(1).strip()
             post_text = clean_src[m.end():]
-
-            # A. Check for quoted text in block (handles both single-line and multiline quoted greetings)
             block_text = (same_line + "\n" + post_text).strip() if same_line else post_text.strip()
-            q_match = re.search(r'[' + quote_chars + r']\s*(.+?)\s*[' + quote_chars + r']', block_text, re.DOTALL)
+
+            # A. Check for quoted text in block using matched double quotes or non-contraction single quotes
+            q_match = re.search(r'["“\u201c]([^"”\u201d]{10,400})["”\u201d]', block_text)
+            if not q_match:
+                q_match = re.search(r'(?<![A-Za-z])[\'‘\u2018]([^\'’\u2019]{10,400})[\'’\u2019](?![A-Za-z])', block_text)
             if q_match:
-                candidate = self._clean_spoken_text(q_match.group(1))
-                if self._is_valid_spoken_greeting(candidate, doc_title):
-                    # Ensure candidate doesn't cross into subsequent section headers
-                    if not re.search(r'\n\s*#+\s+|\n\s*(?:Page\s+\d+|[A-Z0-9\s]{4,}:)', candidate):
-                        return candidate
+                candidate = self._clean_spoken_text(q_match.group(1).replace('\n', ' '))
+                if not any(bw in candidate.lower() for bw in bad_instruction_words):
+                    if self._is_valid_spoken_greeting(candidate, doc_title):
+                        if not re.search(r'\n\s*#+\s+|\n\s*(?:Page\s+\d+|[A-Z0-9\s]{4,}:)', candidate):
+                            return candidate
 
             # B. If same_line has complete spoken text after colon/dash
-            if same_line and not any(same_line.startswith(q) for q in quote_chars):
+            if same_line and not any(same_line.startswith(q) for q in ['"', '“', "'"]):
                 candidate = self._clean_spoken_text(same_line)
-                if self._is_valid_spoken_greeting(candidate, doc_title) and any(candidate.endswith(p) for p in [".", "!", "?"]):
-                    return candidate
+                if not any(bw in candidate.lower() for bw in bad_instruction_words):
+                    if self._is_valid_spoken_greeting(candidate, doc_title) and any(candidate.endswith(p) for p in [".", "!", "?"]):
+                        return candidate
 
             # C. Collect lines immediately following the heading until section break or complete paragraph
             lines = post_text.splitlines()
             collected = []
-            for line in lines[:10]:
+            for line in lines[:8]:
                 l_str = line.strip()
                 if not l_str:
                     if collected:
                         break
                     continue
                 # Stop if hitting another section header
-                if re.match(r'^[ \t*\-•#]*(?:[A-Z0-9\.\s]{4,}:|#+\s+|\d+\.)', l_str) and not any(l_str.lower().startswith(p) for p in ["receptionist", "ai", "agent", "say"]):
+                if re.match(r'^[ \t*\-•#]*(?:[A-Z0-9\.\s]{4,}:|#+\s+|\d+\.)', l_str) and not any(l_str.lower().startswith(p) for p in ["receptionist", "ai", "agent", "say", "muri"]):
                     break
                 if l_str.lower().startswith("page "):
                     break
+                if any(bw in l_str.lower() for bw in bad_instruction_words):
+                    continue
                 collected.append(l_str)
-                # Check if we have formed a complete greeting ending with sentence punctuation
                 cand = self._clean_spoken_text(" ".join(collected))
-                if any(cand.endswith(p) for p in [".", "!", "?"]) and len(cand.split()) >= 8:
+                if any(cand.endswith(p) for p in [".", "!", "?"]) and len(cand.split()) >= 6:
                     if self._is_valid_spoken_greeting(cand, doc_title):
                         return cand
 
             if collected:
                 full_candidate = self._clean_spoken_text(" ".join(collected))
-                if self._is_valid_spoken_greeting(full_candidate, doc_title):
-                    return full_candidate
+                if not any(bw in full_candidate.lower() for bw in bad_instruction_words):
+                    if self._is_valid_spoken_greeting(full_candidate, doc_title):
+                        return full_candidate
 
-        # 2. Check dialogue lines at start of script: Receptionist: "..." or Receptionist: ...
-        diag_regex = re.compile(
-            r'(?m)^[\s*\-•]*(?:AI\s+Receptionist|Receptionist|AI\s+Assistant|Assistant|Agent|AI)\s*:\s*([^\n\r]+)',
-            re.IGNORECASE
+        # 2. Check dialogue lines at start of script: e.g. MURI: "..." or Receptionist: "..."
+        diag_matches = re.finditer(
+            r'(?m)^[ \t*\-•#]*(?:[A-Za-z0-9_]+\s*(?:\([^\)]+\)\s*)?)?\s*:\s*["“\u201c]([^"”\u201d\r\n]{10,400})["”\u201d]',
+            clean_src
         )
-        for dm in diag_regex.finditer(clean_src[:3000]):
-            cand_line = dm.group(1).strip()
-            q_diag = re.search(r'[' + quote_chars + r']\s*(.+?)\s*[' + quote_chars + r']', cand_line)
-            candidate = self._clean_spoken_text(q_diag.group(1) if q_diag else cand_line)
-            if self._is_valid_spoken_greeting(candidate, doc_title):
-                return candidate
+        for dm in diag_matches:
+            cand = self._clean_spoken_text(dm.group(1))
+            if not any(bw in cand.lower() for bw in bad_instruction_words):
+                if any(cand.lower().startswith(g) for g in ["hello", "hi", "good morning", "good afternoon", "good evening", "welcome", "vanakkam", "namaste", "வணக்கம்"]):
+                    if self._is_valid_spoken_greeting(cand, doc_title):
+                        return cand
 
         # 3. Check standalone direct quote at the very start of the script
-        direct_q = re.search(r'^\s*[' + quote_chars + r']\s*(.+?)\s*[' + quote_chars + r']', clean_src, re.DOTALL)
+        direct_q = re.search(r'^\s*["“\u201c]([^"”\u201d]{10,400})["”\u201d]', clean_src, re.DOTALL)
         if direct_q:
-            candidate = self._clean_spoken_text(direct_q.group(1))
+            candidate = self._clean_spoken_text(direct_q.group(1).replace('\n', ' '))
             if self._is_valid_spoken_greeting(candidate, doc_title):
                 return candidate
 
@@ -914,23 +984,34 @@ class RagService:
         """
         import re as _re
         time_prefix = cls._get_time_aware_greeting_prefix(organization_id=organization_id)
+        g = (greeting or "").strip()
+
+        # Check for multilingual greeting (e.g. Tamil or Hindi)
+        is_tamil = bool(_re.search(r'[\u0b80-\u0bff]', g)) or any(g.lower().startswith(t) for t in ["vanakkam", "வணக்கம்"])
+        is_hindi = bool(_re.search(r'[\u0900-\u097f]', g)) or any(g.lower().startswith(h) for h in ["namaste", "नमस्ते"])
+        is_telugu = bool(_re.search(r'[\u0c00-\u0c7f]', g))
+        is_kannada = bool(_re.search(r'[\u0c80-\u0cff]', g))
+
+        if is_tamil or is_hindi or is_telugu or is_kannada:
+            return g
+
         resolved_org = ""
 
-        # 1. Check if the greeting itself contains an explicit organization brand (from active script)
-        if greeting:
-            m_org = _re.search(r'(?:welcome to|thank you for calling|thanks for calling|this is)\s+([A-Za-z0-9\s&\'\-]+?)(?:\.|\?|\!|,|\s+how may|\s+how can|\s+thank you|\n|$)', greeting, _re.IGNORECASE)
+        # 1. Check if explicit org_name passed
+        if org_name and org_name.strip().lower() not in ("default organization", "organization", "company", "business", "unknown", "none"):
+            resolved_org = org_name.strip()
+
+        # 2. Check if the greeting itself contains an explicit organization brand (from active script)
+        if not resolved_org and g:
+            m_org = _re.search(r'(?:welcome to|thank you for calling|thanks for calling|assistant for)\s+([A-Za-z0-9\s&\'\-]+?)(?:\.|\?|\!|,|\s+how may|\s+how can|\s+thank you|\s+I can|\n|$)', g, _re.IGNORECASE)
             if m_org:
                 extracted = m_org.group(1).strip()
                 if len(extracted) > 2 and extracted.lower() not in ("default organization", "organization", "company", "business", "unknown", "none", "our team", "the call", "us"):
                     resolved_org = extracted
 
-        # 2. Check if explicit org_name passed
-        if not resolved_org and org_name and org_name.strip().lower() not in ("default organization", "organization", "company", "business", "unknown", "none"):
-            resolved_org = org_name.strip()
-
-        # 3. Fetch organisation name dynamically from the database
+        # 3. Fetch organisation name dynamically from the database / active script
         if not resolved_org and organization_id is not None:
-            resolved_org = rag_service.get_organization_name(organization_id)
+            resolved_org = rag_service.get_business_name(organization_id=organization_id, scope=scope)
 
         if resolved_org and resolved_org.isupper():
             resolved_org = resolved_org.title()
@@ -939,7 +1020,6 @@ class RagService:
         if not resolved_org or resolved_org.strip().lower() in ("default organization", "unknown", "none"):
             resolved_org = "our team"
 
-        g = (greeting or "").strip()
         scope_str = str(scope or "").lower()
         is_outbound = "outbound" in scope_str
 
@@ -1028,22 +1108,18 @@ class RagService:
             "greeting": str or None,
             "script_id": int or None,
             "script_title": str or None,
+            "script_version": str,
+            "business_name": str,
             "extracted_greeting": str,
             "source": str,  # ACTIVE_SCRIPT, ACTIVE_KNOWLEDGE_DOC, DYNAMIC_DB_FALLBACK, NONE
             "cache_hit": bool,
-            "cache_version": str
+            "greeting_language": str
         }
         """
         if not hasattr(self, "_greeting_cache"):
             self._greeting_cache = {}
 
         time_prefix = self._get_time_aware_greeting_prefix(organization_id=organization_id)
-        cache_key = f"org_{organization_id}_doc_{document_id}_scope_{scope}_short_{short}_time_{time_prefix}"
-
-        if cache_key in self._greeting_cache:
-            res = dict(self._greeting_cache[cache_key])
-            res["cache_hit"] = True
-            return res
 
         try:
             from src.config.database import SessionLocal
@@ -1051,346 +1127,193 @@ class RagService:
             db = SessionLocal()
             try:
                 # 1. Explicit document_id requested
-                doc_explicit = None
+                target_doc = None
                 if document_id:
                     try:
                         doc_num = int(document_id)
-                        doc_explicit = db.query(KnowledgeDocument).filter(
+                        target_doc = db.query(KnowledgeDocument).filter(
                             KnowledgeDocument.id == doc_num,
-                            KnowledgeDocument.ai_usage == "Active",
                             KnowledgeDocument.status.in_([KnowledgeDocStatus.INDEXED, "Indexed", "INDEXED", "indexed"])
                         ).first()
                     except ValueError:
-                        doc_explicit = db.query(KnowledgeDocument).filter(
+                        target_doc = db.query(KnowledgeDocument).filter(
                             KnowledgeDocument.title == str(document_id),
-                            KnowledgeDocument.ai_usage == "Active",
                             KnowledgeDocument.status.in_([KnowledgeDocStatus.INDEXED, "Indexed", "INDEXED", "indexed"])
                         ).first()
 
-                    if doc_explicit:
+                    if target_doc:
                         # Tenant isolation check
                         if organization_id is not None:
-                            if doc_explicit.organization_id is not None and doc_explicit.organization_id != int(organization_id):
-                                doc_explicit = None
-                            elif doc_explicit.organization_id is None and doc_explicit.scope == "superadmin_assistant":
-                                doc_explicit = None
-                        elif organization_id is None and doc_explicit.organization_id is not None:
-                            doc_explicit = None
+                            if target_doc.organization_id is not None and target_doc.organization_id != int(organization_id):
+                                target_doc = None
+                            elif target_doc.organization_id is None and target_doc.scope == "superadmin_assistant":
+                                target_doc = None
+                        elif organization_id is None and target_doc.organization_id is not None:
+                            target_doc = None
 
-                    if doc_explicit:
-                        content = str(doc_explicit.content or "").strip()
-                        if not content and doc_explicit.file_path:
-                            try:
-                                import os
-                                if os.path.exists(doc_explicit.file_path):
-                                    with open(doc_explicit.file_path, "r", encoding="utf-8", errors="ignore") as fp:
-                                        content = fp.read().strip()
-                            except Exception:
-                                pass
-
-                        logger.info(
-                            f"\n[GREETING_SCRIPT_RESOLUTION]"
-                            f"\n  organization_id={organization_id}"
-                            f"\n  active_script_id={doc_explicit.id}"
-                            f"\n  active_script_title='{doc_explicit.title}'"
-                            f"\n  script_status=ACTIVE"
-                        )
-
-                        raw_greeting = self.extract_greeting_from_content(content, is_script_doc=True, doc_title=doc_explicit.title)
-                        cache_ver = self._get_document_version(doc_explicit.id)
-                        if raw_greeting:
-                            greeting = self._apply_time_aware_prefix(raw_greeting, organization_id=organization_id, scope=scope, short=short)
-                            logger.info(
-                                f"\n[GREETING_EXTRACTION]"
-                                f"\n  source='{doc_explicit.title}'"
-                                f"\n  section_found=True"
-                                f"\n  extracted_text='{greeting}'"
-                                f"\n  extraction_status=SUCCESS"
-                            )
-                            details = {
-                                "greeting": greeting,
-                                "script_id": doc_explicit.id,
-                                "script_title": doc_explicit.title,
-                                "extracted_greeting": raw_greeting,
-                                "source": "ACTIVE_SCRIPT",
-                                "cache_hit": False,
-                                "cache_version": cache_ver or "v1",
-                            }
-                            self._greeting_cache[cache_key] = details
-                            return details
-                        elif doc_explicit.document_type not in ["SCRIPT", "INBOUND_SCRIPT", "OUTBOUND_SCRIPT"] and content and content.strip():
-                            # Priority 2: General knowledge document with organization info but no explicit greeting section
-                            synth_greeting = self.synthesize_greeting_from_doc(content, doc_explicit.title, scope=scope, organization_id=organization_id)
-                            logger.info(
-                                f"\n[GREETING_EXTRACTION]"
-                                f"\n  source='{doc_explicit.title}'"
-                                f"\n  section_found=False (synthesized_from_document_identity)"
-                                f"\n  extracted_text='{synth_greeting}'"
-                                f"\n  extraction_status=SUCCESS"
-                            )
-                            details = {
-                                "greeting": synth_greeting,
-                                "script_id": doc_explicit.id,
-                                "script_title": doc_explicit.title,
-                                "extracted_greeting": "synthesized_from_document_identity",
-                                "source": "ACTIVE_KNOWLEDGE_DOC",
-                                "cache_hit": False,
-                                "cache_version": cache_ver or "v1",
-                            }
-                            self._greeting_cache[cache_key] = details
-                            return details
-                        else:
-                            logger.warning(
-                                f"\n[GREETING_EXTRACTION]"
-                                f"\n  source='{doc_explicit.title}'"
-                                f"\n  section_found=False"
-                                f"\n  extracted_text=none"
-                                f"\n  extraction_status=NOT_FOUND"
-                            )
-                            logger.error(
-                                f"[GREETING_CONFIG_ERROR] Active script id={doc_explicit.id} ('{doc_explicit.title}') does not contain a greeting section."
-                            )
-                            if allow_db_fallback:
-                                db_fallback = self.extract_short_greeting("", organization_id=organization_id, scope=scope, doc_title=doc_explicit.title)
-                                details = {
-                                    "greeting": db_fallback,
-                                    "script_id": doc_explicit.id,
-                                    "script_title": doc_explicit.title,
-                                    "extracted_greeting": "",
-                                    "source": "DYNAMIC_DB_FALLBACK",
-                                    "cache_hit": False,
-                                    "cache_version": "db_v1",
-                                }
-                                self._greeting_cache[cache_key] = details
-                                return details
-                            return {
-                                "greeting": None,
-                                "script_id": doc_explicit.id,
-                                "script_title": doc_explicit.title,
-                                "extracted_greeting": "",
-                                "source": "NONE",
-                                "cache_hit": False,
-                                "cache_version": "none",
-                            }
-
-                # 2. Dynamic active script lookup directly from SQLite
-                base_q = db.query(KnowledgeDocument).filter(
-                    KnowledgeDocument.ai_usage == "Active",
-                    KnowledgeDocument.status.in_([KnowledgeDocStatus.INDEXED, "Indexed", "INDEXED", "indexed"])
-                )
-
-                if organization_id is not None:
-                    org_int = int(organization_id)
-                    has_own_doc = db.query(KnowledgeDocument).filter(
-                        KnowledgeDocument.organization_id == org_int,
+                # 2. Dynamic active script lookup directly from SQLite if not explicit
+                if not target_doc:
+                    base_q = db.query(KnowledgeDocument).filter(
                         KnowledgeDocument.ai_usage == "Active",
                         KnowledgeDocument.status.in_([KnowledgeDocStatus.INDEXED, "Indexed", "INDEXED", "indexed"])
-                    ).first()
-                    if has_own_doc:
-                        base_q = base_q.filter(KnowledgeDocument.organization_id == org_int)
-                    elif org_int in (1, None):
-                        base_q = base_q.filter(
-                            (KnowledgeDocument.organization_id == org_int) |
-                            (KnowledgeDocument.organization_id.is_(None) & (KnowledgeDocument.scope != "superadmin_assistant"))
-                        )
+                    )
+
+                    if organization_id is not None:
+                        org_int = int(organization_id)
+                        has_own_doc = db.query(KnowledgeDocument).filter(
+                            KnowledgeDocument.organization_id == org_int,
+                            KnowledgeDocument.ai_usage == "Active",
+                            KnowledgeDocument.status.in_([KnowledgeDocStatus.INDEXED, "Indexed", "INDEXED", "indexed"])
+                        ).first()
+                        if has_own_doc:
+                            base_q = base_q.filter(KnowledgeDocument.organization_id == org_int)
+                        elif org_int in (1, None):
+                            base_q = base_q.filter(
+                                (KnowledgeDocument.organization_id == org_int) |
+                                (KnowledgeDocument.organization_id.is_(None) & (KnowledgeDocument.scope != "superadmin_assistant"))
+                            )
+                        else:
+                            base_q = base_q.filter(KnowledgeDocument.organization_id == org_int)
                     else:
-                        base_q = base_q.filter(KnowledgeDocument.organization_id == org_int)
-                else:
-                    base_q = base_q.filter(
-                        KnowledgeDocument.organization_id.is_(None),
-                        KnowledgeDocument.scope == "superadmin_assistant"
-                    )
+                        base_q = base_q.filter(
+                            KnowledgeDocument.organization_id.is_(None),
+                            KnowledgeDocument.scope == "superadmin_assistant"
+                        )
 
-                scope_str = str(scope or "inbound").lower()
-                if "outbound" in scope_str:
-                    outbound_cand = base_q.filter(
-                        (KnowledgeDocument.document_type.in_(["OUTBOUND_SCRIPT", "CAMPAIGN_SCRIPT"])) |
-                        KnowledgeDocument.title.ilike("%outbound%") |
-                        (KnowledgeDocument.scope == "outbound")
-                    ).order_by(KnowledgeDocument.organization_id.desc(), KnowledgeDocument.updated_at.desc(), KnowledgeDocument.id.desc()).all()
-                    
-                    general_cand = base_q.filter(KnowledgeDocument.scope != "inbound").order_by(
-                        KnowledgeDocument.organization_id.desc(), KnowledgeDocument.updated_at.desc(), KnowledgeDocument.id.desc()
-                    ).all()
-                    candidate_docs = outbound_cand or general_cand
-                else:
-                    inbound_q = base_q.filter(
-                        KnowledgeDocument.document_type.notin_(["OUTBOUND_SCRIPT", "CAMPAIGN_SCRIPT"]),
-                        ~KnowledgeDocument.title.ilike("%outbound%"),
-                        KnowledgeDocument.scope != "outbound",
-                    )
-                    t1_docs = inbound_q.filter(KnowledgeDocument.document_type.in_(["SCRIPT", "INBOUND_SCRIPT"])).order_by(
-                        KnowledgeDocument.organization_id.desc(), KnowledgeDocument.updated_at.desc(), KnowledgeDocument.id.desc()
-                    ).all()
-                    t2_docs = inbound_q.filter(KnowledgeDocument.title.ilike("%script%")).order_by(
-                        KnowledgeDocument.organization_id.desc(), KnowledgeDocument.updated_at.desc(), KnowledgeDocument.id.desc()
-                    ).all()
-                    t3_docs = inbound_q.order_by(
-                        KnowledgeDocument.organization_id.desc(), KnowledgeDocument.updated_at.desc(), KnowledgeDocument.id.desc()
-                    ).all()
-                    seen_ids = set()
-                    candidate_docs = []
-                    for doc_list in [t1_docs, t2_docs, t3_docs]:
-                        for d in doc_list:
-                            if d.id not in seen_ids:
-                                seen_ids.add(d.id)
-                                candidate_docs.append(d)
+                    scope_str = str(scope or "inbound").lower()
+                    if "outbound" in scope_str:
+                        candidate_docs = base_q.filter(
+                            (KnowledgeDocument.document_type.in_(["OUTBOUND_SCRIPT", "CAMPAIGN_SCRIPT"])) |
+                            KnowledgeDocument.title.ilike("%outbound%") |
+                            (KnowledgeDocument.scope == "outbound")
+                        ).order_by(KnowledgeDocument.organization_id.desc(), KnowledgeDocument.updated_at.desc(), KnowledgeDocument.id.desc()).all()
+                        if not candidate_docs:
+                            candidate_docs = base_q.filter(KnowledgeDocument.scope != "inbound").order_by(
+                                KnowledgeDocument.organization_id.desc(), KnowledgeDocument.updated_at.desc(), KnowledgeDocument.id.desc()
+                            ).all()
+                    else:
+                        inbound_q = base_q.filter(
+                            KnowledgeDocument.document_type.notin_(["OUTBOUND_SCRIPT", "CAMPAIGN_SCRIPT"]),
+                            ~KnowledgeDocument.title.ilike("%outbound%"),
+                            KnowledgeDocument.scope != "outbound",
+                        )
+                        t1_docs = inbound_q.filter(KnowledgeDocument.document_type.in_(["SCRIPT", "INBOUND_SCRIPT"])).order_by(
+                            KnowledgeDocument.organization_id.desc(), KnowledgeDocument.updated_at.desc(), KnowledgeDocument.id.desc()
+                        ).all()
+                        t2_docs = inbound_q.filter(KnowledgeDocument.title.ilike("%script%")).order_by(
+                            KnowledgeDocument.organization_id.desc(), KnowledgeDocument.updated_at.desc(), KnowledgeDocument.id.desc()
+                        ).all()
+                        t3_docs = inbound_q.order_by(
+                            KnowledgeDocument.organization_id.desc(), KnowledgeDocument.updated_at.desc(), KnowledgeDocument.id.desc()
+                        ).all()
+                        seen_ids = set()
+                        candidate_docs = []
+                        for doc_list in [t1_docs, t2_docs, t3_docs]:
+                            for d in doc_list:
+                                if d.id not in seen_ids:
+                                    seen_ids.add(d.id)
+                                    candidate_docs.append(d)
 
-                if not candidate_docs:
-                    logger.warning(
-                        f"\n[GREETING_SCRIPT_RESOLUTION]"
-                        f"\n  organization_id={organization_id}"
-                        f"\n  active_script_id=none"
-                        f"\n  active_script_title=none"
-                        f"\n  script_status=MISSING"
-                    )
-                    logger.warning(
-                        f"\n[GREETING_EXTRACTION]"
-                        f"\n  source=NONE"
-                        f"\n  section_found=False"
-                        f"\n  extracted_text=none"
-                        f"\n  extraction_status=NO_ACTIVE_SCRIPT"
-                    )
+                    if candidate_docs:
+                        target_doc = candidate_docs[0]
+
+                if not target_doc:
+                    # No active script found
+                    business_name = self.get_business_name(organization_id=organization_id, scope=scope) or "our team"
+                    cache_key = f"org_{organization_id}_script_none_ver_none_lang_en_time_{time_prefix}_short_{short}"
+                    if cache_key in self._greeting_cache:
+                        res = dict(self._greeting_cache[cache_key])
+                        res["cache_hit"] = True
+                        return res
+
                     if allow_db_fallback and organization_id is not None:
-                        db_fallback = self.extract_short_greeting("", organization_id=organization_id, scope=scope)
-                        logger.info(f"[GREETING_DB_FALLBACK] Using dynamic DB greeting fallback for org {organization_id}: '{db_fallback}'")
+                        db_fallback = self.extract_short_greeting("", org_name=business_name, organization_id=organization_id, scope=scope)
                         details = {
                             "greeting": db_fallback,
                             "script_id": None,
                             "script_title": None,
+                            "script_version": "none",
+                            "business_name": business_name,
                             "extracted_greeting": "",
                             "source": "DYNAMIC_DB_FALLBACK",
                             "cache_hit": False,
-                            "cache_version": "db_v1",
+                            "greeting_language": "en",
                         }
-                        self._greeting_cache[cache_key] = details
-                        return details
-                    logger.error(
-                        f"[GREETING_CONFIG_ERROR] No active script configured for organization_id={organization_id}."
-                    )
-                    return {
-                        "greeting": None,
-                        "script_id": None,
-                        "script_title": None,
-                        "extracted_greeting": "",
-                        "source": "NONE",
-                        "cache_hit": False,
-                        "cache_version": "none",
-                    }
-
-                for doc in candidate_docs:
-                    logger.info(
-                        f"\n[GREETING_SCRIPT_RESOLUTION]"
-                        f"\n  organization_id={organization_id}"
-                        f"\n  active_script_id={doc.id}"
-                        f"\n  active_script_title='{doc.title}'"
-                        f"\n  script_status=ACTIVE"
-                    )
-
-                    raw_content = str(doc.content or "").strip()
-                    if not raw_content and doc.file_path:
-                        try:
-                            import os
-                            if os.path.exists(doc.file_path):
-                                with open(doc.file_path, "r", encoding="utf-8", errors="ignore") as fp:
-                                    raw_content = fp.read().strip()
-                        except Exception:
-                            pass
-
-                    if not raw_content:
-                        continue
-
-                    is_script = (doc.document_type in ["SCRIPT", "INBOUND_SCRIPT"]) or ("script" in (doc.title or "").lower())
-                    raw_greeting = self.extract_greeting_from_content(raw_content, is_script_doc=is_script, doc_title=doc.title)
-                    cache_ver = self._get_document_version(doc.id)
-                    if raw_greeting:
-                        greeting = self._apply_time_aware_prefix(raw_greeting, organization_id=organization_id, scope=scope, short=short)
-                        logger.info(
-                            f"\n[GREETING_EXTRACTION]"
-                            f"\n  source='{doc.title}'"
-                            f"\n  section_found=True"
-                            f"\n  extracted_text='{greeting}'"
-                            f"\n  extraction_status=SUCCESS"
-                        )
-                        details = {
-                            "greeting": greeting,
-                            "script_id": doc.id,
-                            "script_title": doc.title,
-                            "extracted_greeting": raw_greeting,
-                            "source": "ACTIVE_SCRIPT",
-                            "cache_hit": False,
-                            "cache_version": cache_ver or "v1",
-                        }
-                        self._greeting_cache[cache_key] = details
-                        return details
-                    elif doc.document_type not in ["SCRIPT", "INBOUND_SCRIPT", "OUTBOUND_SCRIPT"] and raw_content and raw_content.strip():
-                        synth_greeting = self.synthesize_greeting_from_doc(raw_content, doc.title, scope=scope, organization_id=organization_id)
-                        logger.info(
-                            f"\n[GREETING_EXTRACTION]"
-                            f"\n  source='{doc.title}'"
-                            f"\n  section_found=False (synthesized_from_document_identity)"
-                            f"\n  extracted_text='{synth_greeting}'"
-                            f"\n  extraction_status=SUCCESS"
-                        )
-                        details = {
-                            "greeting": synth_greeting,
-                            "script_id": doc.id,
-                            "script_title": doc.title,
-                            "extracted_greeting": "synthesized_from_document_identity",
-                            "source": "ACTIVE_KNOWLEDGE_DOC",
-                            "cache_hit": False,
-                            "cache_version": cache_ver or "v1",
-                        }
-                        self._greeting_cache[cache_key] = details
-                        return details
                     else:
-                        logger.warning(
-                            f"\n[GREETING_EXTRACTION]"
-                            f"\n  source='{doc.title}'"
-                            f"\n  section_found=False"
-                            f"\n  extracted_text=none"
-                            f"\n  extraction_status=NOT_FOUND"
-                        )
-                        logger.error(
-                            f"[GREETING_CONFIG_ERROR] Active script id={doc.id} ('{doc.title}') does not contain a greeting section."
-                        )
-                        if allow_db_fallback:
-                            db_fallback = self.extract_short_greeting("", organization_id=organization_id, scope=scope, doc_title=doc.title)
-                            details = {
-                                "greeting": db_fallback,
-                                "script_id": doc.id,
-                                "script_title": doc.title,
-                                "extracted_greeting": "",
-                                "source": "DYNAMIC_DB_FALLBACK",
-                                "cache_hit": False,
-                                "cache_version": "db_v1",
-                            }
-                            self._greeting_cache[cache_key] = details
-                            return details
-
-                top_doc = candidate_docs[0]
-                if allow_db_fallback and organization_id is not None:
-                    db_fallback = self.extract_short_greeting("", organization_id=organization_id, scope=scope, doc_title=top_doc.title)
-                    details = {
-                        "greeting": db_fallback,
-                        "script_id": top_doc.id,
-                        "script_title": top_doc.title,
-                        "extracted_greeting": "",
-                        "source": "DYNAMIC_DB_FALLBACK",
-                        "cache_hit": False,
-                        "cache_version": "db_v1",
-                    }
+                        details = {
+                            "greeting": None,
+                            "script_id": None,
+                            "script_title": None,
+                            "script_version": "none",
+                            "business_name": business_name,
+                            "extracted_greeting": "",
+                            "source": "NONE",
+                            "cache_hit": False,
+                            "greeting_language": "en",
+                        }
                     self._greeting_cache[cache_key] = details
                     return details
-                return {
-                    "greeting": None,
-                    "script_id": top_doc.id,
-                    "script_title": top_doc.title,
-                    "extracted_greeting": "",
-                    "source": "NONE",
+
+                # We have a valid target_doc
+                active_script_id = target_doc.id
+                active_script_title = target_doc.title
+                script_version = self._get_document_version(str(target_doc.id))
+                business_name = self.get_business_name(organization_id=organization_id, document_id=str(target_doc.id), scope=scope) or "our team"
+
+                raw_content = str(target_doc.content or "").strip()
+                if not raw_content and target_doc.file_path:
+                    try:
+                        import os
+                        if os.path.exists(target_doc.file_path):
+                            with open(target_doc.file_path, "r", encoding="utf-8", errors="ignore") as fp:
+                                raw_content = fp.read().strip()
+                    except Exception:
+                        pass
+
+                is_script = (target_doc.document_type in ["SCRIPT", "INBOUND_SCRIPT"]) or ("script" in (target_doc.title or "").lower())
+                raw_greeting = self.extract_greeting_from_content(raw_content, is_script_doc=is_script, doc_title=target_doc.title)
+
+                # Determine language
+                is_tamil = bool(re.search(r'[஀-௿]', raw_greeting)) or any(raw_greeting.strip().lower().startswith(t) for t in ["vanakkam", "வணக்கம்"])
+                is_hindi = bool(re.search(r'[ऀ-ॿ]', raw_greeting)) or any(raw_greeting.strip().lower().startswith(h) for h in ["namaste", "नमस्ते"])
+                is_telugu = bool(re.search(r'[ఀ-౿]', raw_greeting))
+                is_kannada = bool(re.search(r'[ಀ-೿]', raw_greeting))
+                greeting_lang = "ta" if is_tamil else ("hi" if is_hindi else ("te" if is_telugu else ("kn" if is_kannada else "en")))
+
+                # Cache key strictly incorporates organization_id, active_script_id, script_version, greeting_language, time_prefix, and short format
+                cache_key = f"org_{organization_id}_script_{active_script_id}_ver_{script_version}_lang_{greeting_lang}_time_{time_prefix}_short_{short}"
+
+                if cache_key in self._greeting_cache:
+                    res = dict(self._greeting_cache[cache_key])
+                    res["cache_hit"] = True
+                    return res
+
+                if raw_greeting:
+                    greeting = self._apply_time_aware_prefix(raw_greeting, org_name=business_name, organization_id=organization_id, scope=scope, short=short)
+                    source = "ACTIVE_SCRIPT"
+                elif target_doc.document_type not in ["SCRIPT", "INBOUND_SCRIPT", "OUTBOUND_SCRIPT"] and raw_content:
+                    greeting = self.synthesize_greeting_from_doc(raw_content, target_doc.title, scope=scope, organization_id=organization_id)
+                    source = "ACTIVE_KNOWLEDGE_DOC"
+                elif allow_db_fallback:
+                    greeting = self.extract_short_greeting("", org_name=business_name, organization_id=organization_id, scope=scope)
+                    source = "DYNAMIC_DB_FALLBACK"
+                else:
+                    greeting = None
+                    source = "NONE"
+
+                details = {
+                    "greeting": greeting,
+                    "script_id": active_script_id,
+                    "script_title": active_script_title,
+                    "script_version": script_version,
+                    "business_name": business_name,
+                    "extracted_greeting": raw_greeting,
+                    "source": source,
                     "cache_hit": False,
-                    "cache_version": "none",
+                    "greeting_language": greeting_lang,
                 }
+                self._greeting_cache[cache_key] = details
+                return details
             finally:
                 db.close()
         except Exception as exc:
@@ -1399,10 +1322,12 @@ class RagService:
                 "greeting": None,
                 "script_id": None,
                 "script_title": None,
+                "script_version": "none",
+                "business_name": "our team",
                 "extracted_greeting": "",
                 "source": "ERROR",
                 "cache_hit": False,
-                "cache_version": "none",
+                "greeting_language": "en",
             }
 
     def get_active_greeting(

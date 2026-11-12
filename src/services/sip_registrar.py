@@ -1581,10 +1581,12 @@ class SipRegistrar:
                         return
 
                     # Resolve Active Script Document for this organization dynamically
-                    _, script_id_int, script_title_str = rag_service.get_active_greeting(
+                    active_details = rag_service.get_active_greeting_details(
                         organization_id=resolved_org_id,
                         scope="inbound"
                     )
+                    script_id_int = active_details.get("script_id")
+                    script_title_str = active_details.get("script_title")
                     script_status = "NONE"
                     script_retrieval_result = "NOT_FOUND"
                     script_version = "none"
@@ -1592,7 +1594,7 @@ class SipRegistrar:
                         resolved_script_id = str(script_id_int)
                         script_status = "ACTIVE"
                         script_retrieval_result = "FOUND"
-                        script_version = rag_service._get_document_version(resolved_script_id)
+                        script_version = active_details.get("script_version") or rag_service._get_document_version(resolved_script_id)
 
                     logger.info(
                         f"\n[ACTIVE_SCRIPT_RESOLUTION]"

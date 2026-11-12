@@ -2879,10 +2879,12 @@ class SipCallSession:
             greeting = details.get("greeting")
             script_id = details.get("script_id")
             script_title = details.get("script_title")
+            script_version = details.get("script_version", "v1")
+            business_name = details.get("business_name") or rag_service.get_business_name(self.organization_id, document_id=str(script_id) if script_id else None)
             extracted_greeting = details.get("extracted_greeting", "")
             selected_source = details.get("source", "ACTIVE_SCRIPT")
             cache_hit = details.get("cache_hit", False)
-            cache_version = details.get("cache_version", "v1")
+            greeting_lang = details.get("greeting_language", "en")
 
             if script_id:
                 self.active_script_id = str(script_id)
@@ -2891,10 +2893,10 @@ class SipCallSession:
 
             # If no active script exists at all (script_id is None), apply dynamic DB greeting fallback
             if (not greeting or not greeting.strip()) and script_id is None:
-                greeting = rag_service.extract_short_greeting("", organization_id=self.organization_id, scope=dir_scope)
+                greeting = rag_service.extract_short_greeting("", org_name=business_name, organization_id=self.organization_id, scope=dir_scope)
                 selected_source = "DYNAMIC_DB_FALLBACK"
                 extracted_greeting = ""
-                cache_version = "db_v1"
+                script_version = "db_v1"
                 cache_hit = False
 
             if not greeting or not greeting.strip():
@@ -2915,47 +2917,37 @@ class SipCallSession:
             tts_input_text = greeting
             utt_id = "utt_greeting"
 
-            # Mandatory diagnostic log matching user specification exactly
+            org_name = rag_service.get_organization_name(self.organization_id) or business_name or f"Organization {self.organization_id}"
+
+            # Mandatory structured logs per specification
             logger.info(
-                f"\n[GREETING_SELECTION_DIAGNOSTIC]"
-                f"\n  call_id={self.call_sid}"
-                f"\n  call_direction={call_direction}"
-                f"\n  organisation_id={self.organization_id}"
+                f"\n[ACTIVE_GREETING_CONTEXT]"
+                f"\n  organization_id={self.organization_id}"
+                f"\n  organization_name={org_name}"
                 f"\n  active_script_id={final_script_id}"
                 f"\n  active_script_title='{final_script_title}'"
-                f"\n  selected_greeting_source={selected_source}"
-                f"\n  extracted_greeting='{extracted_greeting}'"
-                f"\n  final_greeting_text='{final_greeting_text}'"
+                f"\n  script_version={script_version}"
+            )
+
+            logger.info(
+                f"\n[DYNAMIC_GREETING_SELECTION]"
+                f"\n  greeting_source={selected_source}"
+                f"\n  business_name={business_name}"
+                f"\n  greeting_language={greeting_lang}"
                 f"\n  greeting_cache_hit={cache_hit}"
-                f"\n  cache_version={cache_version}"
-                f"\n  TTS_input_text='{tts_input_text}'"
-                f"\n  RTP_utterance_id={utt_id}"
+                f"\n  final_greeting_text='{final_greeting_text}'"
             )
 
             # Verification: Ensure final_greeting_text and TTS_input_text match exactly
             assert final_greeting_text == tts_input_text, "final_greeting_text and TTS_input_text must match exactly"
 
-            logger.info(
-                f"\n[GREETING_RESPONSE]"
-                f"\n  call_id={self.call_sid}"
-                f"\n  call_direction={call_direction}"
-                f"\n  source={selected_source}"
-                f"\n  organization_id={self.organization_id}"
-                f"\n  active_script_id={final_script_id}"
-                f"\n  response_text='{final_greeting_text}'"
-            )
-
-            greeting_lang = "en"
-            self.current_lang = "en"
+            self.current_lang = greeting_lang
 
             logger.info(
                 f"\n[GREETING_TTS]"
                 f"\n  call_id={self.call_sid}"
-                f"\n  call_direction={call_direction}"
-                f"\n  source={selected_source}"
-                f"\n  status=SYNTHESIZING"
-                f"\n  language={greeting_lang}"
                 f"\n  text='{tts_input_text}'"
+                f"\n  status=SYNTHESIZING"
             )
 
             self.booking_session.greeting_sent = True
@@ -2983,8 +2975,7 @@ class SipCallSession:
             logger.info(
                 f"\n[GREETING_TTS]"
                 f"\n  call_id={self.call_sid}"
-                f"\n  call_direction={call_direction}"
-                f"\n  source={selected_source}"
+                f"\n  text='{final_greeting_text}'"
                 f"\n  status=SUCCESS"
             )
         except Exception as exc:

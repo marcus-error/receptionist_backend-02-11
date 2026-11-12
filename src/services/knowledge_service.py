@@ -769,6 +769,12 @@ class KnowledgeService:
             self.db.commit()
             self.db.refresh(doc)
 
+            try:
+                from src.services.rag_service import rag_service
+                rag_service.clear_organization_cache(doc.organization_id)
+            except Exception:
+                pass
+
             if doc.ai_usage == "Active":
                 self._sync_organization_greeting(doc, text_content)
 
