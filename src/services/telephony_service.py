@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 import socket
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import func
@@ -117,7 +117,10 @@ class TelephonyService:
         if host in ("127.0.0.1", "localhost"):
             try:
                 import subprocess
-                wsl_out = subprocess.check_output(["wsl.exe", "--", "hostname", "-I"], text=True, timeout=2.0).strip()
+                try:
+                    wsl_out = subprocess.check_output(["wsl.exe", "--", "hostname", "-i"], text=True, timeout=2.0, stderr=subprocess.DEVNULL).strip()
+                except Exception:
+                    wsl_out = subprocess.check_output(["wsl.exe", "--", "hostname", "-I"], text=True, timeout=2.0, stderr=subprocess.DEVNULL).strip()
                 if wsl_out:
                     wsl_ip = wsl_out.split()[0]
                     if wsl_ip not in hosts_to_probe:
@@ -183,76 +186,66 @@ class TelephonyService:
         except Exception as dns_err:
             return False, f"Could not resolve host '{host}': {dns_err}", None
 
-    def get_sip_config(self, probe: bool = True) -> SipConfigOut:
-        """Fetch active SIP trunk configuration for the user's organization."""
-        config = self.db.query(SipConfig).filter(
-            SipConfig.organization_id == self.org_id
-        ).first()
+    def _config_to_out(
+        self,
+        config: Optional[SipConfig],
+        probe: bool = False,
+        latency_ms: Optional[int] = None,
+        connection_detail: Optional[str] = None
+    ) -> SipConfigOut:
+        total_calls, active_calls, last_call_at = self._get_live_call_stats()
+        from src.services.sip_registrar import get_registration_status as _get_reg
+        _reg = _get_reg(organization_id=self.org_id)
 
         if not config:
-            config = SipConfig(
-                user_id=self.user_id,
-                organization_id=self.org_id,
-                sip_host="",
-                sip_username="",
-                sip_port=5060,
-                status="disconnected"
-            )
-            self.db.add(config)
-            self.db.commit()
-            self.db.refresh(config)
-
-        total_calls, active_calls, last_call_at = self._get_live_call_stats()
-
-        from src.services.sip_registrar import get_registration_status
-        reg_status = get_registration_status(organization_id=self.org_id)
-
-        target_host = (config.sip_host or config.domain or config.sip_proxy or config.sip_server or "") if config else ""
-
-        if not config or not target_host:
             return SipConfigOut(
-                id=config.id if config else None,
-                account_name=config.account_name if config else None,
-                sip_server=config.sip_server if config else None,
-                sip_proxy=config.sip_proxy if config else None,
-                sip_username=config.sip_username if config else None,
-                domain=config.domain if config else None,
-                login=config.login if config else None,
-                display_name=config.display_name if config else None,
-                voicemail_number=config.voicemail_number if config else None,
-                dialing_prefix=config.dialing_prefix if config else None,
-                dial_plan=config.dial_plan if config else None,
-                hide_caller_id=config.hide_caller_id if config else "Disabled",
-                media_encryption=config.media_encryption if config else "Disabled",
-                transport=config.transport if config else "UDP",
-                public_address=config.public_address if config else "Auto",
-                register_refresh=config.register_refresh if config else 300,
-                keep_alive=config.keep_alive if config else 15,
-                publish_presence=config.publish_presence if config else False,
-                allow_ip_rewrite=config.allow_ip_rewrite if config else False,
-                ice=config.ice if config else False,
-                disable_session_timers=config.disable_session_timers if config else False,
-                sip_host=target_host,
-                sip_port=config.sip_port if config else 5060,
-                did_number=config.did_number if config else None,
-                has_password=bool(config.sip_password_encrypted) if config else False,
+                id=None,
+                account_name=None,
+                sip_server=None,
+                sip_proxy=None,
+                sip_username=None,
+                domain=None,
+                login=None,
+                display_name=None,
+                voicemail_number=None,
+                dialing_prefix=None,
+                dial_plan=None,
+                hide_caller_id="Disabled",
+                media_encryption="Disabled",
+                transport="UDP",
+                public_address="Auto",
+                register_refresh=300,
+                keep_alive=15,
+                publish_presence=False,
+                allow_ip_rewrite=False,
+                ice=False,
+                disable_session_timers=False,
+                sip_host="",
+                sip_port=5060,
+                did_number=None,
+                sip_extension=None,
+                sip_ws_url=None,
+                stun_server=None,
+                is_active=False,
+                has_password=False,
                 status="disconnected",
-                registration_status=reg_status["status"],
-                registration_detail=reg_status["detail"],
+                registration_status=_reg.get("status", "unregistered"),
+                registration_detail="No active SIP configuration. Please activate a SIP configuration.",
                 last_connected_at=None,
-                last_registered_at=config.last_registered_at.isoformat() if config and config.last_registered_at else None,
+                last_registered_at=None,
                 total_calls=total_calls,
                 active_calls=active_calls,
                 last_call_at=last_call_at,
                 latency_ms=None,
-                connection_detail="No SIP host configured",
+                connection_detail="No SIP configuration configured",
             )
 
-        latency_ms = None
-        connection_detail = "Real-time probe skipped"
+        target_host = (config.sip_host or config.domain or config.sip_proxy or config.sip_server or "").strip()
+        port = config.sip_port or 5060
+
         if probe and target_host:
-            is_ok, detail, lat = self.probe_sip_host(target_host, config.sip_port or 5060)
-            if not is_ok and reg_status.get("status") == "registered":
+            is_ok, detail, lat = self.probe_sip_host(target_host, port)
+            if not is_ok and _reg.get("status") == "registered":
                 is_ok = True
                 detail = f"SIP Trunk Active & Registered via UDP (Latency: ~{lat or 15} ms)"
                 lat = lat or 15
@@ -264,9 +257,13 @@ class TelephonyService:
                 if is_ok:
                     config.last_connected_at = func.now()
                 self.db.commit()
+        elif connection_detail is None:
+            connection_detail = "Real-time probe skipped"
 
-        from src.services.sip_registrar import get_registration_status as _get_reg
-        _reg = _get_reg(organization_id=self.org_id)
+        is_active_flag = bool(config.is_active)
+        effective_reg_status = _reg.get("status", "unregistered") if is_active_flag else "unregistered"
+        effective_reg_detail = _reg.get("detail", config.registration_detail or "") if is_active_flag else "Inactive"
+
         return SipConfigOut(
             id=config.id,
             account_name=config.account_name,
@@ -290,14 +287,18 @@ class TelephonyService:
             ice=bool(config.ice),
             disable_session_timers=bool(config.disable_session_timers),
             sip_host=target_host,
-            sip_port=config.sip_port or 5060,
+            sip_port=port,
             did_number=config.did_number,
+            sip_extension=config.sip_extension,
+            sip_ws_url=config.sip_ws_url,
+            stun_server=config.stun_server,
+            is_active=is_active_flag,
             has_password=bool(config.sip_password_encrypted),
             status=config.status or "disconnected",
-            registration_status=_reg["status"],
-            registration_detail=_reg["detail"],
-            last_connected_at=config.last_connected_at.isoformat() if config and config.last_connected_at else None,
-            last_registered_at=config.last_registered_at.isoformat() if config and config.last_registered_at else None,
+            registration_status=effective_reg_status,
+            registration_detail=effective_reg_detail,
+            last_connected_at=config.last_connected_at.isoformat() if config.last_connected_at else None,
+            last_registered_at=config.last_registered_at.isoformat() if config.last_registered_at else None,
             total_calls=total_calls,
             active_calls=active_calls,
             last_call_at=last_call_at,
@@ -305,20 +306,7 @@ class TelephonyService:
             connection_detail=connection_detail,
         )
 
-    def update_sip_config(self, payload: SipConfigIn) -> SipConfigOut:
-        """Save or update SIP trunk credentials securely and run real live probe."""
-        config = self.db.query(SipConfig).filter(
-            SipConfig.organization_id == self.org_id
-        ).first()
-
-        if not config:
-            config = SipConfig(
-                user_id=self.user_id,
-                organization_id=self.org_id,
-            )
-            self.db.add(config)
-
-        # Update all reference fields
+    def _apply_payload_to_config(self, config: SipConfig, payload: SipConfigIn):
         if payload.account_name is not None:
             config.account_name = payload.account_name.strip()
         if payload.sip_server is not None:
@@ -361,9 +349,6 @@ class TelephonyService:
             config.ice = bool(payload.ice)
         if payload.disable_session_timers is not None:
             config.disable_session_timers = bool(payload.disable_session_timers)
-
-        if payload.sip_host is not None and payload.sip_host.strip():
-            config.sip_host = payload.sip_host.strip()
         if payload.sip_port is not None:
             config.sip_port = int(payload.sip_port)
         if payload.sip_password is not None and payload.sip_password.strip():
@@ -371,19 +356,216 @@ class TelephonyService:
         if hasattr(payload, 'did_number') and payload.did_number is not None:
             config.did_number = payload.did_number.strip()
 
-        # Deduce primary sip_host target for network probing
-        target_host = (config.sip_host or config.domain or config.sip_proxy or config.sip_server or "127.0.0.1").strip()
+    def list_sip_configs(self) -> List[SipConfigOut]:
+        """List all SIP configurations for the user's organization."""
+        configs = self.db.query(SipConfig).filter(
+            SipConfig.organization_id == self.org_id
+        ).order_by(SipConfig.is_active.desc(), SipConfig.id.desc()).all()
+        return [self._config_to_out(c, probe=False) for c in configs]
+
+    def get_sip_config(self, probe: bool = True, config_id: Optional[int] = None) -> SipConfigOut:
+        """Fetch active SIP trunk configuration (or specific ID) for the organization."""
+        if config_id:
+            config = self.db.query(SipConfig).filter(
+                SipConfig.id == config_id,
+                SipConfig.organization_id == self.org_id
+            ).first()
+            if not config:
+                raise HTTPException(status_code=404, detail=f"SIP configuration #{config_id} not found.")
+            return self._config_to_out(config, probe=probe)
+
+        # 1. Look for explicitly active configuration
+        config = self.db.query(SipConfig).filter(
+            SipConfig.organization_id == self.org_id,
+            SipConfig.is_active == True
+        ).first()
+
+        # 2. If none active, fallback to latest configuration for display/editing
+        if not config:
+            config = self.db.query(SipConfig).filter(
+                SipConfig.organization_id == self.org_id
+            ).order_by(SipConfig.id.desc()).first()
+
+        return self._config_to_out(config, probe=probe)
+
+    def create_sip_config(self, payload: SipConfigIn) -> SipConfigOut:
+        """Create a new SIP configuration. Status is strictly INACTIVE by default."""
+        config = SipConfig(
+            user_id=self.user_id,
+            organization_id=self.org_id,
+            is_active=False,  # CRITICAL: Always INACTIVE by default
+            status="disconnected",
+            registration_status="unregistered",
+        )
+        self._apply_payload_to_config(config, payload)
+        target_host = (config.sip_host or config.domain or config.sip_proxy or config.sip_server or "").strip()
         config.sip_host = target_host
 
-        # Run real network socket probe before marking connected
-        is_ok, detail, latency_ms = self.probe_sip_host(target_host, config.sip_port or 5060)
+        is_ok, detail, latency_ms = False, "Not probed", None
+        if target_host:
+            is_ok, detail, latency_ms = self.probe_sip_host(target_host, config.sip_port or 5060)
+            config.status = "connected" if is_ok else "disconnected"
+            if is_ok:
+                config.last_connected_at = func.now()
+
+        self.db.add(config)
+        self.db.commit()
+        self.db.refresh(config)
+
+        # CRITICAL: Saving does NOT activate SIP or start registrar!
+        return self._config_to_out(config, probe=False, latency_ms=latency_ms, connection_detail=detail)
+
+    def update_sip_config(self, payload: SipConfigIn, config_id: Optional[int] = None) -> SipConfigOut:
+        """Save or update SIP trunk credentials securely. Saving does NOT activate SIP."""
+        if config_id:
+            config = self.db.query(SipConfig).filter(
+                SipConfig.id == config_id,
+                SipConfig.organization_id == self.org_id
+            ).first()
+            if not config:
+                raise HTTPException(status_code=404, detail=f"SIP configuration #{config_id} not found.")
+        else:
+            config = self.db.query(SipConfig).filter(
+                SipConfig.organization_id == self.org_id,
+                SipConfig.is_active == True
+            ).first()
+            if not config:
+                config = self.db.query(SipConfig).filter(
+                    SipConfig.organization_id == self.org_id
+                ).order_by(SipConfig.id.desc()).first()
+
+        if not config:
+            return self.create_sip_config(payload)
+
+        self._apply_payload_to_config(config, payload)
+        target_host = (config.sip_host or config.domain or config.sip_proxy or config.sip_server or "").strip()
+        config.sip_host = target_host
+
+        is_ok, detail, latency_ms = False, "Not probed", None
+        if target_host:
+            is_ok, detail, latency_ms = self.probe_sip_host(target_host, config.sip_port or 5060)
+            if not is_ok and target_host in ("127.0.0.1", "localhost"):
+                try:
+                    import subprocess
+                    try:
+                        wsl_out = subprocess.check_output(["wsl.exe", "--", "hostname", "-i"], text=True, timeout=2.0, stderr=subprocess.DEVNULL).strip()
+                    except Exception:
+                        wsl_out = subprocess.check_output(["wsl.exe", "--", "hostname", "-I"], text=True, timeout=2.0, stderr=subprocess.DEVNULL).strip()
+                    if wsl_out:
+                        wsl_ip = wsl_out.split()[0]
+                        is_ok_wsl, detail_wsl, lat_wsl = self.probe_sip_host(wsl_ip, config.sip_port or 5060)
+                        if is_ok_wsl:
+                            config.sip_host = wsl_ip
+                            target_host = wsl_ip
+                            is_ok, detail, latency_ms = is_ok_wsl, detail_wsl, lat_wsl
+                except Exception:
+                    pass
+
+            config.status = "connected" if is_ok else "disconnected"
+            if is_ok:
+                config.last_connected_at = func.now()
+
+        self.db.commit()
+        self.db.refresh(config)
+
+        # Only if THIS configuration was ALREADY explicitly active, update Asterisk & registrar
+        if config.is_active:
+            plain_password = decrypt_secret(config.sip_password_encrypted) if config.sip_password_encrypted else ""
+            try:
+                from src.services.asterisk_configurator import AsteriskConfigurator
+                AsteriskConfigurator.sync_sip_config(
+                    org_id=config.organization_id or self.org_id or 1,
+                    user_id=config.user_id or self.user_id or 1,
+                    sip_host=target_host,
+                    sip_username=config.sip_username or config.login or "1000",
+                    sip_password=plain_password or "1234",
+                    sip_port=config.sip_port or 5060,
+                    did_number=config.did_number,
+                )
+            except Exception as sync_err:
+                logger.warning(f"[TelephonyService] Asterisk dynamic config sync exception: {sync_err}")
+
+            if config.sip_password_encrypted and (config.sip_username or config.login) and target_host:
+                try:
+                    from src.services.sip_registrar import start_registrar
+                    start_registrar(
+                        sip_host=target_host,
+                        sip_username=(config.sip_username or config.login or "").strip(),
+                        sip_password=plain_password,
+                        sip_port=config.sip_port or 5060,
+                        did_number=config.did_number,
+                        organization_id=self.org_id,
+                        force_restart=True,
+                    )
+                except Exception as reg_err:
+                    logger.warning(f"[TelephonyService] Auto-registrar restart exception: {reg_err}")
+
+        return self._config_to_out(config, probe=False, latency_ms=latency_ms, connection_detail=detail)
+
+    def delete_sip_config(self, config_id: int) -> dict:
+        """Delete an existing SIP configuration."""
+        config = self.db.query(SipConfig).filter(
+            SipConfig.id == config_id,
+            SipConfig.organization_id == self.org_id
+        ).first()
+
+        if not config:
+            raise HTTPException(status_code=404, detail=f"SIP configuration #{config_id} not found.")
+
+        # If it was active, stop the registrar
+        if config.is_active:
+            try:
+                from src.services.sip_registrar import stop_registrar
+                stop_registrar(organization_id=self.org_id)
+            except Exception as exc:
+                logger.warning(f"[TelephonyService] Exception stopping registrar during delete: {exc}")
+
+        self.db.delete(config)
+        self.db.commit()
+        return {"success": True, "message": f"SIP configuration #{config_id} deleted successfully."}
+
+    def activate_sip_config(self, config_id: int) -> SipConfigOut:
+        """
+        Explicitly activate a SIP configuration.
+        Validates target server and credentials, ensures only 1 active config per tenant,
+        and starts the background SIP registrar.
+        """
+        config = self.db.query(SipConfig).filter(
+            SipConfig.id == config_id,
+            SipConfig.organization_id == self.org_id
+        ).first()
+
+        if not config:
+            raise HTTPException(status_code=404, detail=f"SIP configuration #{config_id} not found.")
+
+        target_host = (config.sip_host or config.domain or config.sip_proxy or config.sip_server or "").strip()
+        target_user = (config.sip_username or config.login or "").strip()
+        port = config.sip_port or 5060
+
+        if not target_host or not target_user:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot activate SIP configuration: SIP Host/Domain and Username are required."
+            )
+
+        if not config.sip_password_encrypted:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot activate SIP configuration: SIP Password is required."
+            )
+
+        # Validate network connection and credentials
+        is_ok, detail, latency_ms = self.probe_sip_host(target_host, port)
         if not is_ok and target_host in ("127.0.0.1", "localhost"):
             try:
                 import subprocess
-                wsl_out = subprocess.check_output(["wsl.exe", "--", "hostname", "-I"], text=True, timeout=2.0).strip()
+                try:
+                    wsl_out = subprocess.check_output(["wsl.exe", "--", "hostname", "-i"], text=True, timeout=2.0, stderr=subprocess.DEVNULL).strip()
+                except Exception:
+                    wsl_out = subprocess.check_output(["wsl.exe", "--", "hostname", "-I"], text=True, timeout=2.0, stderr=subprocess.DEVNULL).strip()
                 if wsl_out:
                     wsl_ip = wsl_out.split()[0]
-                    is_ok_wsl, detail_wsl, lat_wsl = self.probe_sip_host(wsl_ip, config.sip_port or 5060)
+                    is_ok_wsl, detail_wsl, lat_wsl = self.probe_sip_host(wsl_ip, port)
                     if is_ok_wsl:
                         config.sip_host = wsl_ip
                         target_host = wsl_ip
@@ -391,89 +573,88 @@ class TelephonyService:
             except Exception:
                 pass
 
-        if is_ok:
-            config.status = "connected"
-            config.last_connected_at = func.now()
-        else:
-            config.status = "disconnected"
+        if not is_ok:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot activate SIP configuration: Target SIP server {target_host}:{port} is unreachable. Details: {detail}"
+            )
 
+        # Deactivate all other configs for this organization (single active invariant)
+        self.db.query(SipConfig).filter(
+            SipConfig.organization_id == self.org_id,
+            SipConfig.id != config_id
+        ).update({"is_active": False, "registration_status": "unregistered"})
+
+        # Activate target config
+        config.is_active = True
+        config.status = "connected"
+        config.last_connected_at = func.now()
+        config.registration_status = "registering"
+        config.registration_detail = f"Activating SIP Trunk on {target_host}:{port}"
         self.db.commit()
         self.db.refresh(config)
 
         plain_password = decrypt_secret(config.sip_password_encrypted) if config.sip_password_encrypted else ""
 
-        # Dynamically synchronize Asterisk PJSIP & Dialplan configuration files
+        # Sync Asterisk PJSIP & Dialplan configuration files
         try:
             from src.services.asterisk_configurator import AsteriskConfigurator
             AsteriskConfigurator.sync_sip_config(
-                org_id=config.organization_id or self.org_id or 1,
-                user_id=config.user_id or self.user_id or 1,
-                sip_host=config.sip_host or "127.0.0.1",
-                sip_username=config.sip_username or config.login or "1000",
-                sip_password=plain_password or "1234",
-                sip_port=config.sip_port or 5060,
+                org_id=self.org_id,
+                user_id=self.user_id,
+                sip_host=target_host,
+                sip_username=target_user,
+                sip_password=plain_password,
+                sip_port=port,
                 did_number=config.did_number,
             )
         except Exception as sync_err:
             logger.warning(f"[TelephonyService] Asterisk dynamic config sync exception: {sync_err}")
 
-        # Automatically restart background registrar with newly saved credentials for this tenant only
-        if config.sip_password_encrypted and (config.sip_username or config.login) and target_host:
-            try:
-                from src.services.sip_registrar import start_registrar
-                start_registrar(
-                    sip_host=target_host,
-                    sip_username=(config.sip_username or config.login or "").strip(),
-                    sip_password=plain_password,
-                    sip_port=config.sip_port or 5060,
-                    did_number=config.did_number,
-                    organization_id=self.org_id,
-                    force_restart=True,
-                )
-            except Exception as reg_err:
-                logger.warning(f"[TelephonyService] Auto-registrar restart exception: {reg_err}")
+        # Start background registrar
+        try:
+            from src.services.sip_registrar import start_registrar
+            start_registrar(
+                sip_host=target_host,
+                sip_username=target_user,
+                sip_password=plain_password,
+                sip_port=port,
+                did_number=config.did_number,
+                organization_id=self.org_id,
+                force_restart=True,
+            )
+        except Exception as reg_err:
+            logger.warning(f"[TelephonyService] Registrar start exception during activation: {reg_err}")
 
-        total_calls, active_calls, last_call_at = self._get_live_call_stats()
+        return self._config_to_out(config, probe=False, latency_ms=latency_ms, connection_detail=detail)
 
-        from src.services.sip_registrar import get_registration_status as _get_reg
-        _reg = _get_reg(organization_id=self.org_id)
-        return SipConfigOut(
-            id=config.id,
-            account_name=config.account_name,
-            sip_server=config.sip_server,
-            sip_proxy=config.sip_proxy,
-            sip_username=config.sip_username,
-            domain=config.domain,
-            login=config.login,
-            display_name=config.display_name,
-            voicemail_number=config.voicemail_number,
-            dialing_prefix=config.dialing_prefix,
-            dial_plan=config.dial_plan,
-            hide_caller_id=config.hide_caller_id or "Disabled",
-            media_encryption=config.media_encryption or "Disabled",
-            transport=config.transport or "UDP",
-            public_address=config.public_address or "Auto",
-            register_refresh=config.register_refresh or 300,
-            keep_alive=config.keep_alive or 15,
-            publish_presence=bool(config.publish_presence),
-            allow_ip_rewrite=bool(config.allow_ip_rewrite),
-            ice=bool(config.ice),
-            disable_session_timers=bool(config.disable_session_timers),
-            sip_host=config.sip_host or "",
-            sip_port=config.sip_port or 5060,
-            did_number=config.did_number,
-            has_password=bool(config.sip_password_encrypted),
-            status=config.status or "disconnected",
-            registration_status=_reg["status"],
-            registration_detail=_reg["detail"],
-            last_connected_at=config.last_connected_at.isoformat() if config.last_connected_at else None,
-            last_registered_at=config.last_registered_at.isoformat() if config and config.last_registered_at else None,
-            total_calls=total_calls,
-            active_calls=active_calls,
-            last_call_at=last_call_at,
-            latency_ms=latency_ms,
-            connection_detail=detail,
-        )
+    def deactivate_sip_config(self, config_id: Optional[int] = None) -> SipConfigOut:
+        """Deactivate a SIP configuration and stop registrar."""
+        if config_id:
+            config = self.db.query(SipConfig).filter(
+                SipConfig.id == config_id,
+                SipConfig.organization_id == self.org_id
+            ).first()
+        else:
+            config = self.db.query(SipConfig).filter(
+                SipConfig.organization_id == self.org_id,
+                SipConfig.is_active == True
+            ).first()
+
+        if config:
+            config.is_active = False
+            config.registration_status = "unregistered"
+            config.registration_detail = "Deactivated by user"
+            self.db.commit()
+            self.db.refresh(config)
+
+        try:
+            from src.services.sip_registrar import stop_registrar
+            stop_registrar(organization_id=self.org_id)
+        except Exception as stop_err:
+            logger.warning(f"[TelephonyService] Stop registrar exception: {stop_err}")
+
+        return self._config_to_out(config, probe=False)
 
     async def test_sip_connection(self, payload: SipTestRequest) -> dict:
         """Test network reachability and socket response of the target SIP Trunk server."""
@@ -651,66 +832,51 @@ class TelephonyService:
 
     def register_sip_trunk(self, payload: SipRegisterRequest) -> dict:
         """
-        Trigger SIP REGISTER using the provided credentials (or the saved config).
+        Trigger SIP REGISTER / Activation using the provided credentials (or the saved config).
         Scoped strictly to the authenticated tenant organization.
         """
-        from src.services.sip_registrar import start_registrar
+        config = self.db.query(SipConfig).filter(
+            SipConfig.organization_id == self.org_id,
+            SipConfig.is_active == True
+        ).first()
+        if not config:
+            config = self.db.query(SipConfig).filter(
+                SipConfig.organization_id == self.org_id
+            ).order_by(SipConfig.id.desc()).first()
 
-        # Resolve credentials: query by organization_id
-        config = self.db.query(SipConfig).filter(SipConfig.organization_id == self.org_id).first()
+        if not config:
+            config = SipConfig(
+                user_id=self.user_id,
+                organization_id=self.org_id,
+                is_active=False,
+            )
+            self.db.add(config)
 
-        sip_host = (payload.sip_host or payload.domain or payload.sip_proxy or payload.sip_server or
-                    (config.sip_host if config else None) or (config.domain if config else None) or
-                    (config.sip_proxy if config else None) or (config.sip_server if config else None) or "")
-        sip_user = (payload.sip_username or payload.login or (config.sip_username if config else None) or
-                    (config.login if config else None) or "")
-
-        # Resolve password: if payload has one, encrypt and persist; else decrypt stored password
+        # Update any supplied payload fields
+        target_host = payload.sip_host or payload.domain or payload.sip_proxy or payload.sip_server
+        if target_host:
+            config.sip_host = target_host.strip()
+        if payload.sip_username or payload.login:
+            config.sip_username = (payload.sip_username or payload.login).strip()
         if payload.sip_password and payload.sip_password.strip():
-            sip_pass = payload.sip_password.strip()
-            if config:
-                config.sip_password_encrypted = encrypt_secret(sip_pass)
-                self.db.commit()
-        else:
-            sip_pass = decrypt_secret(config.sip_password_encrypted) if (config and config.sip_password_encrypted) else ""
+            config.sip_password_encrypted = encrypt_secret(payload.sip_password.strip())
+        if payload.sip_port:
+            config.sip_port = int(payload.sip_port)
+        if payload.did_number:
+            config.did_number = payload.did_number.strip()
 
-        # Strictly organization-isolated: no global environment credential fallback
+        self.db.commit()
+        self.db.refresh(config)
 
-        sip_port = int(payload.sip_port or (config.sip_port if config else None) or 5060)
-        did_number = payload.did_number or (config.did_number if config else None)
-
-        if not sip_host or not sip_user:
-            raise HTTPException(status_code=400, detail="SIP Host and Username are required to register.")
-        if not sip_pass:
-            raise HTTPException(status_code=400, detail="SIP Password is required to register.")
-
-        # Save DID number & mark registering
-        if config:
-            if did_number:
-                config.did_number = did_number
-            config.registration_status = "registering"
-            config.registration_detail = f"Initiating SIP registration with {sip_host}:{sip_port}"
-            self.db.commit()
-
-        # Start registrar in background for this organization ONLY
-        registrar = start_registrar(
-            sip_host=sip_host,
-            sip_username=sip_user,
-            sip_password=sip_pass,
-            sip_port=sip_port,
-            did_number=did_number,
-            organization_id=self.org_id,
-            force_restart=True,
-        )
-
+        res = self.activate_sip_config(config.id)
         return {
             "success": True,
-            "message": f"SIP registration initiated for {sip_user}@{sip_host}:{sip_port} (Org {self.org_id}). Checking status...",
+            "message": f"SIP activation initiated for {res.sip_username}@{res.sip_host}:{res.sip_port} (Org {self.org_id}).",
             "status": "registering",
-            "sip_host": sip_host,
-            "sip_username": sip_user,
-            "sip_port": sip_port,
-            "did_number": did_number,
+            "sip_host": res.sip_host,
+            "sip_username": res.sip_username,
+            "sip_port": res.sip_port,
+            "did_number": res.did_number,
             "organization_id": self.org_id,
         }
 
@@ -723,14 +889,8 @@ class TelephonyService:
         return status
 
     def unregister_sip_trunk(self) -> dict:
-        """Stop the SIP UA and unregister from the SIP server for this organization."""
-        from src.services.sip_registrar import stop_registrar
-        stop_registrar(organization_id=self.org_id)
-        config = self.db.query(SipConfig).filter(SipConfig.organization_id == self.org_id).first()
-        if config:
-            config.registration_status = "unregistered"
-            config.registration_detail = "SIP trunk deactivated by user"
-            self.db.commit()
+        """Stop the SIP UA, unregister, and mark inactive for this organization."""
+        self.deactivate_sip_config()
         return {"success": True, "message": f"SIP trunk deactivated successfully for organization {self.org_id}."}
 
     def make_outbound_call(self, payload, lead_id=None, outbound_script=None) -> dict:
@@ -742,20 +902,29 @@ class TelephonyService:
         csid = f'sip_out_{uuid.uuid4().hex[:10]}'
         logger.info(f'[TelephonyService] Outbound SIP call initiated to {to_num} (SID: {csid}, Org: {self.org_id})')
 
-        # Load organization SIP configuration
-        sip_cfg = self.db.query(SipConfig).filter(SipConfig.organization_id == self.org_id).first()
-        sip_host = (sip_cfg.sip_host or sip_cfg.domain or sip_cfg.sip_server or "").strip() if sip_cfg else ""
-        sip_user = (sip_cfg.sip_username or sip_cfg.login or "").strip() if sip_cfg else ""
+        # Load organization active SIP configuration
+        sip_cfg = self.db.query(SipConfig).filter(
+            SipConfig.organization_id == self.org_id,
+            SipConfig.is_active == True,
+        ).first()
+
+        if not sip_cfg or not sip_cfg.is_active:
+            raise HTTPException(
+                status_code=400,
+                detail="No active SIP configuration. Please activate a SIP configuration."
+            )
+
+        sip_host = (sip_cfg.sip_host or sip_cfg.domain or sip_cfg.sip_server or "").strip()
+        sip_user = (sip_cfg.sip_username or sip_cfg.login or "").strip()
         sip_pass = decrypt_secret(sip_cfg.sip_password_encrypted) if (sip_cfg and sip_cfg.sip_password_encrypted) else ""
-        sip_port = (sip_cfg.sip_port or 5060) if sip_cfg else 5060
-        did_num = (sip_cfg.did_number or "").strip() if sip_cfg else ""
+        sip_port = (sip_cfg.sip_port or 5060)
+        did_num = (sip_cfg.did_number or "").strip()
 
         # Strictly organization-isolated: no global environment credential fallback
-
         if not sip_host or not sip_user:
             raise HTTPException(
                 status_code=400,
-                detail=f"Organization {self.org_id} does not have an active SIP configuration. Please configure and register your SIP trunk first."
+                detail="No active SIP configuration. Please activate a SIP configuration."
             )
 
         # Normalize number format using SIP dialing prefix from DB config

@@ -250,6 +250,10 @@ class RagService:
                     del self._greeting_cache[k]
             if hasattr(self, "_doc_version_cache"):
                 self._doc_version_cache.clear()
+            if hasattr(self, "_script_metadata_cache"):
+                keys_to_del = [k for k in self._script_metadata_cache if str(k).startswith(prefix1) or str(k).startswith(prefix2)]
+                for k in keys_to_del:
+                    del self._script_metadata_cache[k]
 
             try:
                 from src.services.cache_service import cache_service
@@ -259,6 +263,8 @@ class RagService:
             logger.info(f"[MASTER CONTEXT FLUSHED] In-memory cache cleared strictly for org={organization_id}.")
         else:
             self.clear_cache()
+            if hasattr(self, "_script_metadata_cache"):
+                self._script_metadata_cache.clear()
             try:
                 from src.services.cache_service import cache_service
                 cache_service.clear_all()
@@ -453,6 +459,18 @@ class RagService:
 
                     if target_doc:
                         resolved_id = str(target_doc.id)
+
+                    if not resolved_id and organization_id is not None:
+                        # Graceful fallback: If no document is explicitly flagged 'Active', resolve the tenant's latest indexed document
+                        fallback_base = db.query(KnowledgeDocument).filter(
+                            KnowledgeDocument.status.in_([KnowledgeDocStatus.INDEXED, "Indexed", "INDEXED", "indexed"]),
+                            KnowledgeDocument.document_type.notin_(["OUTBOUND_SCRIPT", "CAMPAIGN_SCRIPT", "STAFF_DIRECTORY"]),
+                            ~KnowledgeDocument.title.ilike("%outbound%"),
+                            KnowledgeDocument.scope != "outbound",
+                        )
+                        fb_doc = _query_candidate(fallback_base)
+                        if fb_doc:
+                            resolved_id = str(fb_doc.id)
                 elif scope == "superadmin_assistant":
                     sa_doc = base_query.filter(
                         KnowledgeDocument.organization_id.is_(None),
@@ -468,6 +486,129 @@ class RagService:
         except Exception as err:
             logger.warning(f"Error resolving active document ID from SQLite: {err}")
         return None
+
+    def get_active_script_metadata(
+        self,
+        organization_id: Optional[int] = None,
+        document_id: Optional[str] = None,
+        scope: Optional[str] = "inbound"
+    ) -> Dict[str, Any]:
+        """
+        Retrieves active script metadata including business name, business type,
+        booking type, and permitted products/services with strict tenant isolation.
+        Caches metadata in-memory by tenant ID and doc version.
+        """
+        active_doc_id = self._resolve_active_document_id(organization_id, document_id=document_id, scope=scope)
+        doc_version = self._get_document_version(active_doc_id) if active_doc_id else "0"
+
+        if not hasattr(self, "_script_metadata_cache"):
+            self._script_metadata_cache = {}
+
+        cache_key = f"org_{organization_id}_doc_{active_doc_id}_v_{doc_version}_scope_{scope}"
+        if cache_key in self._script_metadata_cache:
+            return self._script_metadata_cache[cache_key]
+
+        business_name = None
+        business_type = "GENERAL"
+        booking_type = "BUSINESS_CONSULTATION"
+        doc_title = "Active Script"
+        permitted_products = []
+        permitted_services = []
+        doc_content = ""
+
+        try:
+            from src.config.database import SessionLocal
+            from src.models.knowledge_doc import KnowledgeDocument
+            from src.models.organization import Organization
+            db = SessionLocal()
+            try:
+                # 1. Fetch organization default name
+                if organization_id is not None:
+                    org = db.query(Organization).filter(Organization.id == int(organization_id)).first()
+                    if org and org.name and org.name.lower() != "default organization":
+                        business_name = org.name
+
+                # 2. Fetch document
+                doc = None
+                if active_doc_id:
+                    try:
+                        doc = db.query(KnowledgeDocument).filter(KnowledgeDocument.id == int(active_doc_id)).first()
+                    except ValueError:
+                        doc = db.query(KnowledgeDocument).filter(KnowledgeDocument.title == str(active_doc_id)).first()
+
+                if doc:
+                    doc_title = doc.title or "Active Script"
+                    doc_content = doc.content or ""
+
+                    content_lower = doc_content.lower()
+                    title_lower = doc_title.lower()
+
+                    hosp_keywords = [
+                        "hospital", "clinic", "patient", "doctor", "doctors", "department",
+                        "siddha", "ayurvedic", "naturopathy", "physician", "consultation",
+                        "medical", "treatment", "opd", "cardiology", "dental", "pediatric"
+                    ]
+                    soft_keywords = [
+                        "software", "saas", "crm", "ai receptionist", "demo", "chatbot",
+                        "hrms", "erp", "voice agent", "developer", "platform", "cloud",
+                        "api", "telesales", "walkin", "sales demo", "product demo"
+                    ]
+
+                    hosp_score = sum(content_lower.count(k) for k in hosp_keywords)
+                    soft_score = sum(content_lower.count(k) for k in soft_keywords)
+
+                    if any(k in title_lower for k in ["hospital", "clinic", "sarans", "medical"]):
+                        hosp_score += 15
+                    if any(k in title_lower for k in ["aminoid", "software", "crm", "saas"]):
+                        soft_score += 15
+
+                    if hosp_score > soft_score and hosp_score >= 3:
+                        business_type = "HOSPITAL"
+                        booking_type = "HOSPITAL_APPOINTMENT"
+                    elif soft_score > hosp_score and soft_score >= 3:
+                        business_type = "SOFTWARE"
+                        booking_type = "SALES_DEMO"
+                    else:
+                        business_type = "GENERAL"
+                        booking_type = "BUSINESS_CONSULTATION"
+
+                    # Resolve business name from title / content
+                    if "sarans hospital" in content_lower or "sarans hospital" in title_lower:
+                        business_name = "Sarans Hospitals"
+                    elif "aminoid ai" in content_lower or "aminoid ai" in title_lower:
+                        business_name = "Aminoid AI"
+                    elif not business_name:
+                        name_match = re.search(r'(?:Company Name|Business Name|Thank you for calling|Welcome to)\s*[:—\-]?\s*([A-Za-z0-9\s&]{3,40})', doc_content, re.IGNORECASE)
+                        if name_match:
+                            business_name = name_match.group(1).strip().strip(".\r\n")
+                        else:
+                            clean_t = re.sub(r'[_—\-]', ' ', doc_title)
+                            clean_t = re.sub(r'\.(pdf|docx|txt)$', '', clean_t, flags=re.I).strip()
+                            clean_t = re.sub(r'\b(rag|inbound|script|fine tuned|conversation|org\d+)\b', '', clean_t, flags=re.I).strip()
+                            if clean_t and len(clean_t) > 2:
+                                business_name = clean_t.title()
+
+                if not business_name:
+                    business_name = "Our Company"
+
+            finally:
+                db.close()
+        except Exception as e:
+            logger.warning(f"Error fetching script metadata: {e}")
+            business_name = business_name or "Our Company"
+
+        result = {
+            "active_script_id": active_doc_id,
+            "active_script_name": doc_title,
+            "business_name": business_name,
+            "business_type": business_type,
+            "booking_type": booking_type,
+            "permitted_products": permitted_products,
+            "permitted_services": permitted_services,
+            "content_length": len(doc_content),
+        }
+        self._script_metadata_cache[cache_key] = result
+        return result
 
     def get_organization_master_context(self, organization_id: Optional[int] = None, document_id: Optional[str] = None, scope: Optional[str] = None) -> str:
         """

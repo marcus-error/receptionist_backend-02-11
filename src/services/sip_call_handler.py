@@ -43,7 +43,7 @@ from src.services.ai_service import ai_service
 from src.services.nlp_service import nlp_service
 from src.services.emotion_service import emotion_service
 from src.services.rag_service import rag_service
-from src.services.booking_state_service import booking_state_service
+from src.services.booking_state_service import booking_state_service, BookingState
 from src.services.call_service import CallService
 from src.services.language_service import language_service
 from src.models.call_log import CallType
@@ -631,10 +631,22 @@ class SipCallSession:
         self.active_script_greeting: Optional[str] = None
         from src.services.rag_service import rag_service
         dir_scope = "outbound" if self.call_type == CallType.OUTBOUND else "inbound"
-        self.active_script_id   = active_script_id or rag_service._resolve_active_document_id(self.organization_id, document_type="SCRIPT", scope=dir_scope)
-        if not self.active_script_id:
-            self.active_script_id = rag_service._resolve_active_document_id(self.organization_id, scope=dir_scope)
+        script_meta = rag_service.get_active_script_metadata(self.organization_id, document_id=active_script_id, scope=dir_scope)
+        self.active_script_id   = script_meta.get("active_script_id")
+        self.active_script_title = script_meta.get("active_script_name")
+        self.business_name      = script_meta.get("business_name")
+        self.business_type      = script_meta.get("business_type")
+        self.booking_type       = script_meta.get("booking_type")
         self.active_knowledge_id = active_knowledge_id or self.active_script_id or rag_service._resolve_active_document_id(self.organization_id, scope=dir_scope)
+
+        logger.info(
+            f"\n[ACTIVE_SCRIPT_CONTEXT]"
+            f"\n  organization_id={self.organization_id}"
+            f"\n  active_script_id={self.active_script_id}"
+            f"\n  active_script_name={self.active_script_title}"
+            f"\n  business_type={self.business_type}"
+            f"\n  booking_type={self.booking_type}"
+        )
         # Receives PCMU u8 bytes to send via pyVoIP write_audio
         self.audio_send_callback  = audio_send_callback
         # Clears RTP TX buffer on barge-in
@@ -693,7 +705,11 @@ class SipCallSession:
         self.booking_session.conversation_id = self.session_id
         self.booking_session.organization_id = organization_id
         self.booking_session.agent_id = self.agent_id
+        self.booking_session.active_doc_id = self.active_script_id
         self.booking_session.active_rag_id = self.active_knowledge_id
+        self.booking_session.business_name = self.business_name
+        self.booking_session.business_type = self.business_type
+        self.booking_session.booking_type = self.booking_type
         self.booking_session.caller_phone = self.caller_phone
         self.booking_session.caller_name = self.caller_name
         self.booking_session.call_type = self.call_type
@@ -1722,6 +1738,10 @@ class SipCallSession:
             return
         self._processed_turns.add(turn_key)
 
+        if getattr(self.booking_session, "state", "") in (BookingState.CALL_TERMINATING, BookingState.CALL_COMPLETED) or self.ended:
+            logger.info(f"[CALL_TERMINATING] Suppressing utterance processing during call completion: '{transcription}'")
+            return
+
         # Generate a fresh unique response ID for this customer turn
         response_id = f"resp_{uuid.uuid4().hex[:8]}"
         self._current_response_id = response_id
@@ -1854,6 +1874,15 @@ class SipCallSession:
                     f"\n  latency_ms={state_ms}"
                 )
 
+                logger.info(
+                    f"\n[INTENT_ROUTING]"
+                    f"\n  caller_utterance='{transcription}'"
+                    f"\n  detected_intent='appointment_booking'"
+                    f"\n  selected_workflow='APPOINTMENT_BOOKING_PRIORITY'"
+                    f"\n  active_business_type='{getattr(self, 'business_type', 'GENERAL')}'"
+                    f"\n  routing_reason='booking_session_active'"
+                )
+
                 if response_text:
                     intent_name = "appointment_booking"
                     self._messages.append({"role": "user", "text": transcription, "intent": intent_name})
@@ -1867,12 +1896,28 @@ class SipCallSession:
                     metrics["state_ms"]   = state_ms
 
                     await self._speak(response_text, intent_name, metrics)
+                    await self._handle_booking_confirmed_termination()
                     return
         is_informational_query = (
             any(q in txt_lower for q in ["can you list", "what are", "who are", "which are", "tell me about", "where is", "where are", "how much", "what is", "who is", "list the", "list all", "list departments", "list teachers", "list doctors", "list services", "may i know", "can i know", "do you have", "what about"])
             or bool(re.search(r'^(?:what|who|which|how|where|when|can\s+you|could\s+you|tell\s+me|show|list)\b', txt_lower))
         )
-        is_booking_keyword = any(k in txt_lower for k in ["book an appointment", "book appointment", "schedule an appointment", "make an appointment", "book a slot", "book my", "reserve", "want to book", "need to book", "i want an appointment", "i need an appointment"]) and not is_informational_query
+        is_demo_keyword = any(k in txt_lower for k in [
+            "demo", "schedule demo", "book demo", "want demo", "need demo", "schedule a demo", "book a demo",
+            "want a demo", "need a demo", "have a demo", "see a demo", "take a demo"
+        ])
+        is_consult_keyword = any(k in txt_lower for k in [
+            "schedule a call", "book a call", "consultation", "schedule consultation"
+        ])
+        is_booking_keyword = (
+            any(k in txt_lower for k in [
+                "book an appointment", "book appointment", "schedule an appointment", "make an appointment",
+                "book a slot", "book my", "reserve", "want to book", "need to book", "i want an appointment",
+                "i need an appointment"
+            ])
+            or is_demo_keyword
+            or is_consult_keyword
+        ) and not is_informational_query
 
         # 1. Immediate Intent & Emotion Detection
         intent_name = "general_question"
@@ -1954,6 +1999,16 @@ class SipCallSession:
         else:
             should_route_booking = not is_intent_switch and (self.booking_session.is_active() or is_booking_keyword)
 
+        selected_wf = "APPOINTMENT_BOOKING" if should_route_booking else ("STAFF_DIRECTORY" if intent_name in ("staff_lookup", "staff_availability", "doctor_information") else "RAG_KNOWLEDGE_BASE")
+        logger.info(
+            f"\n[INTENT_ROUTING]"
+            f"\n  caller_utterance='{transcription}'"
+            f"\n  detected_intent='{intent_name}'"
+            f"\n  selected_workflow='{selected_wf}'"
+            f"\n  active_business_type='{getattr(self, 'business_type', 'GENERAL')}'"
+            f"\n  routing_reason='{'active_session_or_keyword' if should_route_booking else 'intent_classification'}'"
+        )
+
         # 1b. Genuine End-of-Call Detection (Graceful Hangup after Thank You / Goodbye)
         is_closing = _is_genuine_closing_phrase(transcription)
         if self.booking_session.is_active() and not self.booking_session.is_completed:
@@ -2021,6 +2076,7 @@ class SipCallSession:
             metrics["state_ms"]   = state_ms
 
             await self._speak(response_text, intent_name, metrics)
+            await self._handle_booking_confirmed_termination()
             return
 
         # ── Staff Directory Routing (Staff Lookup & Availability Only) ───
@@ -2860,6 +2916,33 @@ class SipCallSession:
 
         self._messages.append({"role": "assistant", "text": text})
         asyncio.create_task(asyncio.to_thread(self._log_to_db, "assistant", text, intent))
+
+    async def _handle_booking_confirmed_termination(self):
+        """
+        After booking is confirmed and final confirmation message is fully played,
+        automatically terminate the call via SIP BYE and mark status COMPLETED.
+        """
+        if getattr(self.booking_session, "state", None) == BookingState.BOOKING_CONFIRMED and getattr(self.booking_session, "appointment_id", None):
+            logger.info(
+                f"\n[BOOKING_CONFIRMATION]"
+                f"\n  confirmation_count={getattr(self.booking_session, 'confirmation_count', 1)}"
+                f"\n  playback_status=COMPLETED"
+                f"\n  appointment_id={self.booking_session.appointment_id}"
+            )
+            if not self._barge_in_event.is_set() and not self.ended:
+                self.booking_session.state = BookingState.CALL_TERMINATING
+                await asyncio.sleep(0.5)  # Small safety drain for RTP jitter buffer
+                if not self._barge_in_event.is_set() and not self.ended:
+                    logger.info(
+                        f"\n[AUTO_CALL_TERMINATION]"
+                        f"\n  call_id={self.call_sid}"
+                        f"\n  booking_status=CONFIRMED"
+                        f"\n  confirmation_playback_completed=True"
+                        f"\n  sip_bye_sent=True"
+                        f"\n  call_status=COMPLETED"
+                    )
+                    self.booking_session.state = BookingState.CALL_COMPLETED
+                    await terminate_call(self.call_sid, reason="CALL_COMPLETED_AFTER_BOOKING_CONFIRMED")
 
     async def _send_opening_greeting(self):
         try:

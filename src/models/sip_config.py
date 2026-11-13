@@ -42,9 +42,10 @@ class SipConfig(Base):
     sip_host = Column(String(255), nullable=True)
     sip_port = Column(Integer, default=5060)
     did_number = Column(String(50), nullable=True)        # Business DID / phone number
-    sip_extension = Column(String(50), default="1001")
-    sip_ws_url = Column(String(255), default="wss://49.249.142.147:8089/ws")
-    stun_server = Column(String(255), default="stun:stun.l.google.com:19302")
+    sip_extension = Column(String(50), nullable=True)
+    sip_ws_url = Column(String(255), nullable=True)
+    stun_server = Column(String(255), nullable=True)
+    is_active = Column(Boolean, default=False, nullable=False, index=True)
     status = Column(String(50), default="disconnected")   # network probe: "connected" / "disconnected"
     registration_status = Column(String(50), default="unregistered")  # SIP UA: "registered" / "unregistered" / "registering" / "error"
     registration_detail = Column(String(500), nullable=True)          # last registration attempt detail

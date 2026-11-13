@@ -11,13 +11,17 @@ logger = logging.getLogger(__name__)
 
 class BookingState:
     IDLE = "IDLE"
+    GENERAL_CONVERSATION = "GENERAL_CONVERSATION"
+    PRODUCT_ENQUIRY = "PRODUCT_ENQUIRY"
     APPOINTMENT_START = "APPOINTMENT_START"
     BOOKING_STARTED = "BOOKING_STARTED"
     WAITING_FOR_DOCTOR = "WAITING_FOR_DOCTOR"
     WAITING_FOR_DEPARTMENT = "WAITING_FOR_DOCTOR"
     VERIFYING_DOCTOR = "VERIFYING_DOCTOR"
     WAITING_FOR_DATE = "WAITING_FOR_DATE"
+    WAITING_FOR_BOOKING_DATE = "WAITING_FOR_DATE"
     WAITING_FOR_TIME = "WAITING_FOR_TIME"
+    WAITING_FOR_BOOKING_TIME = "WAITING_FOR_TIME"
     CHECKING_AVAILABILITY = "CHECKING_AVAILABILITY"
     WAITING_FOR_CONFIRMATION = "WAITING_FOR_CONFIRMATION"
     CONFIRMATION_ACCEPTED = "CONFIRMATION_ACCEPTED"
@@ -26,14 +30,18 @@ class BookingState:
     BOOKING_CANCELLED = "BOOKING_CANCELLED"
     COLLECTING_PATIENT_NAME = "COLLECTING_PATIENT_NAME"
     WAITING_FOR_PATIENT_NAME = "COLLECTING_PATIENT_NAME"
+    WAITING_FOR_NAME = "COLLECTING_PATIENT_NAME"
     COLLECTING_EMAIL = "COLLECTING_EMAIL"
     WAITING_FOR_EMAIL = "COLLECTING_EMAIL"
     COLLECTING_PHONE = "COLLECTING_PHONE"
     WAITING_FOR_CONTACT = "COLLECTING_PHONE"
+    WAITING_FOR_PHONE = "COLLECTING_PHONE"
     BOOKING = "BOOKING"
     BOOKED = "BOOKED"
     FAILED = "FAILED"
     COMPLETED = "COMPLETED"
+    CALL_TERMINATING = "CALL_TERMINATING"
+    CALL_COMPLETED = "CALL_COMPLETED"
 
 
 class FieldState:
@@ -55,7 +63,16 @@ class BookingSession:
     Structured Session Memory for Appointment Booking & Multi-Turn Conversations.
     Retains verified state across multiple turns without losing state.
     """
-    def __init__(self, session_id: str, conversation_id: Optional[str] = None, call_sid: Optional[str] = None, organization_id: int = 1):
+    def __init__(
+        self,
+        session_id: str,
+        conversation_id: Optional[str] = None,
+        call_sid: Optional[str] = None,
+        organization_id: int = 1,
+        business_type: str = "HOSPITAL",
+        booking_type: str = "HOSPITAL_APPOINTMENT",
+        business_name: str = "Sarans Hospitals"
+    ):
         self.session_id = session_id
         self.conversation_id: str = conversation_id or session_id
         self.call_sid: str = call_sid or session_id
@@ -67,6 +84,12 @@ class BookingSession:
         self.active_doc_id: Optional[str] = None
         self.active_rag_title: str = "Active Knowledge Base"
         self.active_doc_title: str = "Active Knowledge Base"
+        self.business_type: str = business_type
+        self.booking_type: str = booking_type
+        self.business_name: str = business_name
+        self.confirmation_count: int = 0
+        self.confirmation_message: Optional[str] = None
+        self.confirmed_appointment_id: Optional[int] = None
 
         self.state = BookingState.IDLE
         self.conversation_started: bool = False
@@ -597,11 +620,13 @@ class BookingSession:
                 has_valid_dept = True
 
         has_valid_service = bool(self.service or self.product or self.booking_data.get("service") or self.booking_data.get("product"))
-        if not has_valid_doctor and not has_valid_dept and not has_valid_service:
-            missing.append("department_or_doctor")
-        elif not has_valid_doctor and not self.booking_data.get("department_only_booking") and not has_valid_service:
-            # Department provided, doctor can be resolved or requested
-            pass
+        is_demo_or_consultation = getattr(self, "booking_type", None) in ("SALES_DEMO", "BUSINESS_CONSULTATION") or getattr(self, "business_type", None) == "SOFTWARE"
+        if not is_demo_or_consultation:
+            if not has_valid_doctor and not has_valid_dept and not has_valid_service:
+                missing.append("department_or_doctor")
+            elif not has_valid_doctor and not self.booking_data.get("department_only_booking") and not has_valid_service:
+                # Department provided, doctor can be resolved or requested
+                pass
 
         if not self.date:
             missing.append("appointment_date")
@@ -1241,11 +1266,16 @@ class BookingStateService:
         if not name or not name.strip():
             return None
 
-        clean = re.sub(r'[^a-zA-Z\u0900-\u097F\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\s]', '', name).strip()
+        # Strip common introductory prefix patterns
+        clean = re.sub(r'^(?:(?:my|the)\s+)?(?:full\s+|first\s+|last\s+)?name\s+(?:is|was)\s+', '', name, flags=re.IGNORECASE)
+        clean = re.sub(r'^(?:this\s+is|myself|i\s+am|i\'?m|call\s+me|it\'?s)\s+', '', clean, flags=re.IGNORECASE)
+        clean = re.sub(r'^(?:full\s+name|first\s+name|last\s+name)\s+', '', clean, flags=re.IGNORECASE)
+        clean = re.sub(r'[^a-zA-Z\u0900-\u097F\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\s]', '', clean).strip()
         _fillers = {
             "sure", "yes", "yeah", "ok", "okay", "hi", "hello", "hey", "well",
             "thanks", "thank", "you", "sir", "madam", "please", "myself", "this",
-            "it", "its", "is", "am", "im", "my", "name", "names", "call", "me",
+            "it", "its", "is", "was", "are", "here", "am", "im", "my", "name", "names",
+            "full", "first", "last", "middle", "call", "me",
             "dr", "doctor", "mr", "mrs", "ms", "miss", "prof",
             "before", "after", "during", "while", "say", "says", "saying", "said",
             "tell", "tells", "telling", "told", "speak", "talk", "listen", "hear"
@@ -1869,6 +1899,14 @@ class BookingStateService:
                 elif service_based:
                     return f"{name_ack}మీరు ఏ సేవను బుక్ చేయాలనుకుంటున్నారు?"
             return f"{name_ack}{rag_question}"
+
+        # Hospital domain fallback
+        if getattr(session, "booking_type", "") == "HOSPITAL_APPOINTMENT" or getattr(session, "business_type", "") == "HOSPITAL":
+            if lang in ("ta", "tanglish", "ta_mix"):
+                return f"{name_ack}எந்த மருத்துவரை அல்லது துறையை நீங்கள் பார்க்க விரும்புகிறீர்கள்?"
+            elif lang == "hi":
+                return f"{name_ack}Aap kis doctor ya vibhaag se milna chahte hain?"
+            return f"{name_ack}Which doctor or department would you like to consult?"
 
         # Generic neutral fallback — no business noun hardcoded
         if lang in ("ta", "tanglish", "ta_mix"):
@@ -3615,7 +3653,7 @@ class BookingStateService:
                     session.patient_name = cand
             elif (not session.patient_name or len(session.patient_name.split()) < 2) and (session.state in (BookingState.WAITING_FOR_PATIENT_NAME, BookingState.COLLECTING_PATIENT_NAME) or session.last_asked_field == "patient_name"):
                 # When system explicitly asked for name, strip conversational prefix cleanly
-                cleaned = re.sub(r'^(?:(?:sure|yes|yeah|ok|okay|hi|hello|hey|good\s+(?:morning|afternoon|evening)|well|actually)\s*,?\s*)*(?:it\'s|its|it\s+is|this\s+is|i\s+am|i\'m|my\s+name\s+is|my\s+name|name\s+is|you\s+can\s+call\s+me|call\s+me)?\s*,?\s*', '', text, flags=re.IGNORECASE).strip()
+                cleaned = re.sub(r'^(?:(?:sure|yes|yeah|ok|okay|hi|hello|hey|good\s+(?:morning|afternoon|evening)|well|actually)\s*,?\s*)*(?:it\'s|its|it\s+is|this\s+is|i\s+am|i\'m|my\s+(?:full\s+|first\s+|last\s+)?name\s+(?:is|was)|my\s+name|name\s+(?:is|was)|you\s+can\s+call\s+me|call\s+me)?\s*,?\s*', '', text, flags=re.IGNORECASE).strip()
                 cleaned = re.sub(r'[,;]?\s*(?:and|&)?\s*(?:i\s+want|want\s+to|book|need|schedule|with|for|my\s+email|my\s+mail|my\s+phone|my\s+number|my\s+mobile|email|mail|phone|number|mobile).*$', '', cleaned, flags=re.IGNORECASE).strip()
                 cleaned = re.sub(r'[^\w\s\u0900-\u097F\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF]', '', cleaned).strip()
                 cleaned = re.sub(_name_suffix_pattern, '', cleaned, flags=re.IGNORECASE).strip()
@@ -3641,7 +3679,8 @@ class BookingStateService:
             session.booking_data.get("caller_id_suggested")
             and (not session.contact_number or session.contact_number == "Unknown")
             and session.caller_phone
-            and session.caller_phone not in ("Unknown", "Unknown Caller", "Private Number", "09410697548", "+919410697548")
+            and session.caller_phone not in ("Unknown", "Unknown Caller", "Private Number")
+            and (not session.booking_data.get("trunk_did") or session.caller_phone.lstrip('+').lstrip('0') != session.booking_data.get("trunk_did").lstrip('+').lstrip('0'))
         ):
             is_affirm = (
                 any(w in txt_lower.split() for w in ["yes", "yeah", "yep", "sure", "correct", "fine", "ok", "okay", "ha", "haan", "sari", "aam"])
@@ -4055,9 +4094,10 @@ class BookingStateService:
         session.state_version = getattr(session, "state_version", 0) + 1
         state_before = copy.deepcopy(session.get_state_dict())
 
-        # Presence check ("are you there", "can you hear me") during active booking
+        # Presence check ("are you there", "can you hear me", "hello") during active booking
         presence_phrases = ["can you hear me", "are you there", "am i audible", "can you hear", "hear me", "is anyone there"]
-        if any(phrase in txt_lower for phrase in presence_phrases) and not any(w in txt_lower for w in ["book", "appointment", "doctor", "schedule", "reserve"]):
+        is_bare_hello = txt_lower.rstrip(".,?!") in ("hello", "hi", "hey", "hello there", "hi there", "hello?", "hi?")
+        if (any(phrase in txt_lower for phrase in presence_phrases) or is_bare_hello) and not any(w in txt_lower for w in ["book", "appointment", "doctor", "schedule", "reserve", "demo"]):
             silence_prompt = self.get_silence_prompt(session)
             resp = f"Yes, I'm right here! {silence_prompt}"
             self._log_conversation_turn(session, text, resp, "presence_reassurance", state_before=state_before)
@@ -4090,8 +4130,9 @@ class BookingStateService:
             self._log_conversation_turn(session, text, resp, "booking_cancelled", state_before=state_before)
             return _ret(resp)
 
-        # If already booked in this session
-        if session.state in (BookingState.BOOKED, BookingState.COMPLETED) and session.appointment_id:
+        # If already booked/confirmed in this session
+        is_already_confirmed = session.state in (BookingState.BOOKING_CONFIRMED, BookingState.CALL_TERMINATING, BookingState.CALL_COMPLETED, BookingState.BOOKED, BookingState.COMPLETED)
+        if is_already_confirmed and session.appointment_id:
             # Check pleasantries / thanks / closing first
             if any(w in txt_lower for w in ["thank you", "thanks", "bye", "goodbye", "that's all", "that is all", "nothing else", "no that's it"]):
                 resp = f"You're very welcome, {session.patient_name or 'there'}! Your appointment is all set. Have a wonderful day!"
@@ -4103,11 +4144,14 @@ class BookingStateService:
                 return _ret(resp)
 
             if not any(w in txt_lower for w in ["new appointment", "another appointment", "book again", "book another", "one more appointment"]):
-                resp = f"Your appointment with {session.doctor} on {session.date} at {session.time} is already confirmed under Appointment ID #{session.appointment_id}."
-                if lang in ("ta", "tanglish", "ta_mix"):
-                    resp = f"உங்க appointment {session.doctor}-கூட {session.date} அன்று {session.time}-க்கு confirm ஆயிடுச்சு (ID #{session.appointment_id})."
-                elif lang == "hi":
-                    resp = f"Aapka appointment {session.doctor} ke saath {session.date} ko {session.time} par already confirmed hai (ID #{session.appointment_id})."
+                if getattr(session, "confirmation_message", None):
+                    return _ret(session.confirmation_message)
+                b_name = session.business_name or "our team"
+                if session.booking_type == "SALES_DEMO":
+                    resp = f"Your demo appointment is confirmed for {session.date} at {session.time}. Your appointment ID is #{session.appointment_id}. Thank you for calling {b_name}."
+                else:
+                    target_d = session.doctor or "Representative"
+                    resp = f"Your appointment with {target_d} on {session.date} at {session.time} is already confirmed under Appointment ID #{session.appointment_id}. Thank you for calling {b_name}."
                 self._log_conversation_turn(session, text, resp, "already_booked", state_before=state_before)
                 return _ret(resp)
             else:
@@ -4410,6 +4454,144 @@ class BookingStateService:
                 self._log_conversation_turn(session, text, resp, "doctor_confirmed_check_slots", state_before=state_before)
                 return _ret(resp)
 
+        # 1.6 Doctor Availability Inquiry / Department Doctor Inquiry (Scenarios 2, 3, 4, 5)
+        # Evaluated BEFORE unverified entity check so availability questions are never blocked by generic entity fallbacks!
+        _DOCTOR_AVAILABILITY_PATTERNS = [
+            "doctors available", "doctor available", "doctors are available", "doctor is available",
+            "what are the doctors", "which doctors are", "who are the doctors", "who is the doctor",
+            "which doctor is", "what doctor is", "what doctors do you have", "which doctors do you have",
+            "list of doctors", "list doctors", "list the doctors", "any doctor available", "any doctors available",
+            "available doctors", "available doctor", "who is available", "who are available",
+            "doctors today", "doctors tomorrow", "doctor list", "show doctors", "tell me doctors",
+            "what doctors available", "which doctors available", "available specialist", "available specialists",
+            "doctors available today", "doctors available tomorrow", "is there a doctor", "are there doctors",
+        ]
+        is_asking_doctors_available = (
+            any(p in txt_lower for p in _DOCTOR_AVAILABILITY_PATTERNS)
+            or (
+                any(w in txt_lower for w in ["what", "which", "who", "tell me", "list", "any", "show"])
+                and any(w in txt_lower for w in ["doctor", "doctors", "dr", "dr.", "specialist", "specialists", "physician", "physicians"])
+                and any(w in txt_lower for w in ["available", "free", "working", "there", "today", "tomorrow", "present", "schedule", "on", "have"])
+            )
+            or any(phrase in txt_lower for phrase in [
+                "எந்த டாக்டர்", "யார் டாக்டர்", "டாக்டர் விவரம்", "டாக்டர்கள் இருக்காங்க", "யார் யார் இருக்காங்க", "டாக்டர்கள்",
+                "kaunse doctor", "kaun kaun se doctor", "doctor available hain", "doctor ki list", "doctor hain",
+                "yava doctor", "evaru doctor", "ವೈದ್ಯರು ಲಭ್ಯ", "ಯಾವ ವೈದ್ಯರು", "ವೈದ್ಯರ", "డాక్టర్లు అందుబాటులో", "ఏ డాక్టర్లు", "డాక్టర్ల"
+            ])
+        )
+
+        has_doctor_keyword = any(k in txt_lower for k in ["dr", "dr.", "doctor", "physician"])
+        is_asking_specific_doctor = (
+            bool(re.search(r'\b(?:is|can\s+i\s+(?:see|meet|consult)|does)\s+(?:dr\.?|doctor|physician)?\s*([a-zA-Z\s]+?)\s+(?:available|free|in|working|present|there)\b', txt_lower))
+            or (has_doctor_keyword and any(w in txt_lower for w in ["available", "free", "there", "working", "schedule", "today", "tomorrow"]))
+        )
+
+        if is_asking_doctors_available or is_asking_specific_doctor:
+            session.booking_data.pop("unverified_entity_requested", None)
+            session.booking_data.pop("unknown_doctor_requested", None)
+            session.booking_data.pop("ambiguous_entity_candidate", None)
+            session.booking_data.pop("user_requested_entity_term", None)
+
+            target_date_str = None
+            if "day after tomorrow" in txt_lower:
+                target_date_str = "day after tomorrow"
+            elif any(w in txt_lower for w in ["tomorrow", "naalai", "kal", "repu", "naale"]):
+                target_date_str = "tomorrow"
+            elif any(w in txt_lower for w in ["today", "indru", "innikku", "aaj", "ee roju", "indu"]):
+                target_date_str = "today"
+            else:
+                for day_n in ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]:
+                    if day_n in txt_lower:
+                        target_date_str = day_n
+                        break
+            if not target_date_str:
+                target_date_str = session.date or "today"
+
+            session.date = "Today" if target_date_str.lower() in ("today", "indru", "aaj") else ("Tomorrow" if target_date_str.lower() in ("tomorrow", "naalai", "kal") else target_date_str.title())
+
+            target_dept = session.department
+            common_depts = [
+                "cardiology", "general medicine", "dental care", "dental",
+                "ayurvedic consultant", "ayurvedic", "siddha consultant", "siddha",
+                "naturopathy & yoga consultant", "naturopathy", "orthopedics",
+                "pediatrics", "dermatology", "neurology", "gynecology"
+            ]
+            for cd in common_depts:
+                if cd in txt_lower:
+                    target_dept = cd.title()
+                    session.department = target_dept
+                    break
+
+            org_id = getattr(session, "organization_id", 1) or 1
+            specific_doctor = None
+            if is_asking_specific_doctor or has_doctor_keyword:
+                from src.config.database import SessionLocal
+                from src.models.staff import Staff
+                with SessionLocal() as db:
+                    org_staff = db.query(Staff).filter(Staff.organization_id == org_id).all()
+                    for s in org_staff:
+                        if not s.name:
+                            continue
+                        clean_s = re.sub(r'^(?:dr\.?|doctor|mr\.?|mrs\.?|ms\.?)\s+', '', s.name, flags=re.I).strip().lower()
+                        if clean_s and (clean_s in txt_lower or self._is_doctor_name_match(text, s.name)):
+                            specific_doctor = s
+                            break
+
+            if specific_doctor:
+                session.doctor = specific_doctor.name
+                session.doctor_id = specific_doctor.id
+                session.doctor_locked = True
+                session.state = BookingState.WAITING_FOR_TIME
+                session.last_asked_field = "time"
+                avail_resp = self.check_doctor_availability_live(specific_doctor.name, target_date_str, session=session)
+                if not avail_resp.lower().startswith("for") and not avail_resp.lower().startswith("yes"):
+                    resp = f"Yes, {specific_doctor.name} is available {session.date.lower()}. {avail_resp}"
+                else:
+                    resp = f"Yes, {avail_resp}"
+                self._log_conversation_turn(session, text, resp, "specific_doctor_availability_checked", state_before=state_before)
+                return _ret(resp)
+
+            resp, available_docs = self.get_available_doctors_for_date(
+                target_date_str=target_date_str,
+                department=target_dept,
+                organization_id=org_id,
+                session=session,
+                lang=lang
+            )
+            self._log_conversation_turn(session, text, resp, "presented_available_doctors", state_before=state_before)
+            return _ret(resp)
+
+        # Check if caller explicitly asked for available slots
+        if any(phrase in txt_lower for phrase in [
+            "available slots", "slots available", "what slots", "which slots",
+            "time slots", "open slots", "free slots", "available times", "available time",
+            "schedule of doctor", "schedule of staff", "what time slots do you have", "what times"
+        ]):
+            doc_to_check = session.doctor
+            if not doc_to_check:
+                session.state = BookingState.WAITING_FOR_DOCTOR
+                session.last_asked_field = "doctor"
+                first_name = (session.patient_name or "").split()[0] if session.patient_name and self.is_valid_person_name(session.patient_name) else ""
+                name_ack_slots = f"Thanks, {first_name}. " if first_name else "Sure! "
+                if lang in ("ta", "tanglish", "ta_mix"):
+                    resp = f"{name_ack_slots}Available slots பார்க்க, எந்த மருத்துவரை அல்லது துறையை நீங்கள் பார்க்க விரும்புகிறீர்கள்?"
+                elif lang == "hi":
+                    resp = f"{name_ack_slots}Available slots dekhne ke liye, aap kis doctor ya vibhaag se milna chahte hain?"
+                elif lang in ("kn", "kannada"):
+                    resp = f"{name_ack_slots}ಲಭ್ಯವಿರುವ ಸಮಯ ಸ್ಲಾಟ್‌ಗಳನ್ನು ನೋಡಲು, ನೀವು ಯಾವ ವೈದ್ಯರನ್ನು ಅಥವಾ ವಿಭಾಗವನ್ನು ಸಂಪರ್ಕಿಸಲು ಬಯಸುತ್ತೀರಿ?"
+                elif lang in ("te", "telugu"):
+                    resp = f"{name_ack_slots}అందుబాటులో ఉన్న సమయ స్లాట్‌లను తనిఖీ చేయడానికి, మీరు ఏ వైద్యుడిని లేదా విభాగాన్ని సంప్రదించాలనుకుంటున్నారు?"
+                else:
+                    resp = f"{name_ack_slots}To check available time slots, which doctor or department would you like to consult?"
+                self._log_conversation_turn(session, text, resp, "ask_doctor_for_slots", state_before=state_before)
+                return _ret(resp)
+
+            session.state = BookingState.WAITING_FOR_TIME
+            session.last_asked_field = "time"
+            resp = self.check_doctor_availability_live(doc_to_check, session.date, session=session)
+            self._log_conversation_turn(session, text, resp, "presented_slots", state_before=state_before)
+            return _ret(resp)
+
         # Handle unverified staff/person/service requested against active organization
         if session.booking_data.get("unverified_entity_requested") or session.booking_data.get("unknown_doctor_requested"):
             unverified = session.booking_data.pop("unverified_entity_requested", None) or session.booking_data.pop("unknown_doctor_requested", None)
@@ -4608,138 +4790,6 @@ class BookingStateService:
                     self._log_conversation_turn(session, text, resp, "date_changed_ask_doctor", state_before=state_before)
                     return _ret(resp)
 
-        # 1.6 Doctor Availability Inquiry / Department Doctor Inquiry (Scenarios 2, 3, 4, 5)
-        _DOCTOR_AVAILABILITY_PATTERNS = [
-            "doctors available", "doctor available", "doctors are available", "doctor is available",
-            "what are the doctors", "which doctors are", "who are the doctors", "who is the doctor",
-            "which doctor is", "what doctor is", "what doctors do you have", "which doctors do you have",
-            "list of doctors", "list doctors", "list the doctors", "any doctor available", "any doctors available",
-            "available doctors", "available doctor", "who is available", "who are available",
-            "doctors today", "doctors tomorrow", "doctor list", "show doctors", "tell me doctors",
-            "what doctors available", "which doctors available", "available specialist", "available specialists",
-            "doctors available today", "doctors available tomorrow", "is there a doctor", "are there doctors",
-        ]
-        is_asking_doctors_available = (
-            any(p in txt_lower for p in _DOCTOR_AVAILABILITY_PATTERNS)
-            or (
-                any(w in txt_lower for w in ["what", "which", "who", "tell me", "list", "any", "show"])
-                and any(w in txt_lower for w in ["doctor", "doctors", "dr", "dr.", "specialist", "specialists", "physician", "physicians"])
-                and any(w in txt_lower for w in ["available", "free", "working", "there", "today", "tomorrow", "present", "schedule", "on", "have"])
-            )
-            or any(phrase in txt_lower for phrase in [
-                "எந்த டாக்டர்", "யார் டாக்டர்", "டாக்டர் விவரம்", "டாக்டர்கள் இருக்காங்க", "யார் யார் இருக்காங்க", "டாக்டர்கள்",
-                "kaunse doctor", "kaun kaun se doctor", "doctor available hain", "doctor ki list", "doctor hain",
-                "yava doctor", "evaru doctor", "ವೈದ್ಯರು ಲಭ್ಯ", "ಯಾವ ವೈದ್ಯರು", "ವೈದ್ಯರ", "డాక్టర్లు అందుబాటులో", "ఏ డాక్టర్లు", "డాక్టర్ల"
-            ])
-        )
-
-        has_doctor_keyword = any(k in txt_lower for k in ["dr", "dr.", "doctor", "physician"])
-        is_asking_specific_doctor = (
-            bool(re.search(r'\b(?:is|can\s+i\s+(?:see|meet|consult)|does)\s+(?:dr\.?|doctor|physician)?\s*([a-zA-Z\s]+?)\s+(?:available|free|in|working|present|there)\b', txt_lower))
-            or (has_doctor_keyword and any(w in txt_lower for w in ["available", "free", "there", "working", "schedule", "today", "tomorrow"]))
-        )
-
-        if is_asking_doctors_available or is_asking_specific_doctor:
-            target_date_str = None
-            if "day after tomorrow" in txt_lower:
-                target_date_str = "day after tomorrow"
-            elif any(w in txt_lower for w in ["tomorrow", "naalai", "kal", "repu", "naale"]):
-                target_date_str = "tomorrow"
-            elif any(w in txt_lower for w in ["today", "indru", "innikku", "aaj", "ee roju", "indu"]):
-                target_date_str = "today"
-            else:
-                for day_n in ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]:
-                    if day_n in txt_lower:
-                        target_date_str = day_n
-                        break
-            if not target_date_str:
-                target_date_str = session.date or "today"
-
-            session.date = "Today" if target_date_str.lower() in ("today", "indru", "aaj") else ("Tomorrow" if target_date_str.lower() in ("tomorrow", "naalai", "kal") else target_date_str.title())
-
-            target_dept = session.department
-            common_depts = [
-                "cardiology", "general medicine", "dental care", "dental",
-                "ayurvedic consultant", "ayurvedic", "siddha consultant", "siddha",
-                "naturopathy & yoga consultant", "naturopathy", "orthopedics",
-                "pediatrics", "dermatology", "neurology", "gynecology"
-            ]
-            for cd in common_depts:
-                if cd in txt_lower:
-                    target_dept = cd.title()
-                    session.department = target_dept
-                    break
-
-            org_id = getattr(session, "organization_id", 1) or 1
-            specific_doctor = None
-            if is_asking_specific_doctor or has_doctor_keyword:
-                from src.config.database import SessionLocal
-                from src.models.staff import Staff
-                with SessionLocal() as db:
-                    org_staff = db.query(Staff).filter(Staff.organization_id == org_id).all()
-                    for s in org_staff:
-                        if not s.name:
-                            continue
-                        clean_s = re.sub(r'^(?:dr\.?|doctor|mr\.?|mrs\.?|ms\.?)\s+', '', s.name, flags=re.I).strip().lower()
-                        if clean_s and (clean_s in txt_lower or self._is_doctor_name_match(text, s.name)):
-                            specific_doctor = s
-                            break
-
-            if specific_doctor:
-                session.doctor = specific_doctor.name
-                session.doctor_id = specific_doctor.id
-                session.doctor_locked = True
-                session.state = BookingState.WAITING_FOR_TIME
-                session.last_asked_field = "time"
-                avail_resp = self.check_doctor_availability_live(specific_doctor.name, target_date_str, session=session)
-                if not avail_resp.lower().startswith("for") and not avail_resp.lower().startswith("yes"):
-                    resp = f"Yes, {specific_doctor.name} is available {session.date.lower()}. {avail_resp}"
-                else:
-                    resp = f"Yes, {avail_resp}"
-                self._log_conversation_turn(session, text, resp, "specific_doctor_availability_checked", state_before=state_before)
-                return _ret(resp)
-
-            resp, available_docs = self.get_available_doctors_for_date(
-                target_date_str=target_date_str,
-                department=target_dept,
-                organization_id=org_id,
-                session=session,
-                lang=lang
-            )
-            self._log_conversation_turn(session, text, resp, "presented_available_doctors", state_before=state_before)
-            return _ret(resp)
-
-        # 2. Check if caller explicitly asked for available slots (Scenario 7)
-        if any(phrase in txt_lower for phrase in [
-            "available slots", "slots available", "what slots", "which slots",
-            "time slots", "open slots", "free slots", "available times", "available time",
-            "schedule of doctor", "schedule of staff", "what time slots do you have", "what times"
-        ]):
-            doc_to_check = session.doctor
-            if not doc_to_check:
-                session.state = BookingState.WAITING_FOR_DOCTOR
-                session.last_asked_field = "doctor"
-                first_name = (session.patient_name or "").split()[0] if session.patient_name and self.is_valid_person_name(session.patient_name) else ""
-                name_ack_slots = f"Thanks, {first_name}. " if first_name else "Sure! "
-                if lang in ("ta", "tanglish", "ta_mix"):
-                    resp = f"{name_ack_slots}Available slots பார்க்க, எந்த மருத்துவரை அல்லது துறையை நீங்கள் பார்க்க விரும்புகிறீர்கள்?"
-                elif lang == "hi":
-                    resp = f"{name_ack_slots}Available slots dekhne ke liye, aap kis doctor ya vibhaag se milna chahte hain?"
-                elif lang in ("kn", "kannada"):
-                    resp = f"{name_ack_slots}ಲಭ್ಯವಿರುವ ಸಮಯ ಸ್ಲಾಟ್‌ಗಳನ್ನು ನೋಡಲು, ನೀವು ಯಾವ ವೈದ್ಯರನ್ನು ಅಥವಾ ವಿಭಾಗವನ್ನು ಸಂಪರ್ಕಿಸಲು ಬಯಸುತ್ತೀರಿ?"
-                elif lang in ("te", "telugu"):
-                    resp = f"{name_ack_slots}అందుబాటులో ఉన్న సమయ స్లాట్‌లను తనిఖీ చేయడానికి, మీరు ఏ వైద్యుడిని లేదా విభాగాన్ని సంప్రదించాలనుకుంటున్నారు?"
-                else:
-                    resp = f"{name_ack_slots}To check available time slots, which doctor or department would you like to consult?"
-                self._log_conversation_turn(session, text, resp, "ask_doctor_for_slots", state_before=state_before)
-                return _ret(resp)
-
-            session.state = BookingState.WAITING_FOR_TIME
-            session.last_asked_field = "time"
-            resp = self.check_doctor_availability_live(doc_to_check, session.date, session=session)
-            self._log_conversation_turn(session, text, resp, "presented_slots", state_before=state_before)
-            return _ret(resp)
-
         # DYNAMIC MISSING-INFORMATION EVALUATION WITH PERSONALIZED ACKNOWLEDGMENTS
         first_name = (session.patient_name or "").split()[0] if session.patient_name and self.is_valid_person_name(session.patient_name) else ""
         
@@ -4751,7 +4801,11 @@ class BookingStateService:
         name_ack = f"{short_ack}Thanks, {first_name}. " if first_name else f"{short_ack}"
 
         # STEP 1: Staff / Representative / Service Check — dynamically RAG-aware
-        if session.service or session.booking_data.get("product"):
+        if session.booking_type in ("SALES_DEMO", "BUSINESS_CONSULTATION") or session.business_type == "SOFTWARE":
+            # For software demo/consultation, bypass medical doctor selection
+            if not session.service:
+                session.service = "Demo" if session.booking_type == "SALES_DEMO" else "Consultation"
+        elif session.service or session.booking_data.get("product"):
             # Product or service booking does not require choosing a medical doctor
             pass
         elif not session.doctor:
@@ -4889,7 +4943,10 @@ class BookingStateService:
         if not session.date:
             session.state = BookingState.WAITING_FOR_DATE
             session.last_asked_field = "date"
-            resp = f"{name_ack}Which date would you prefer for your {target_label} appointment?"
+            if session.booking_type == "SALES_DEMO":
+                resp = f"Sure{', ' + first_name if first_name else ''}! I can help you schedule a demo. Which date would you prefer?"
+            else:
+                resp = f"{name_ack}Which date would you prefer for your {target_label} appointment?"
             if lang in ("ta", "tanglish", "ta_mix"):
                 resp = f"{'நன்றி, ' + first_name + '. ' if first_name else ''}{target_label}-க்கு எந்த நாளுக்கு appointment book பண்ணலாம்?"
             elif lang == "hi":
@@ -5075,7 +5132,8 @@ class BookingStateService:
             )
             caller_phone_avail = bool(
                 session.caller_phone
-                and session.caller_phone not in ("Unknown", "Unknown Caller", "Private Number", "09410697548", "+919410697548")
+                and session.caller_phone not in ("Unknown", "Unknown Caller", "Private Number")
+            and (not session.booking_data.get("trunk_did") or session.caller_phone.lstrip('+').lstrip('0') != session.booking_data.get("trunk_did").lstrip('+').lstrip('0'))
             )
 
             # Auto-assign caller_phone to contact_number so it does not loop
@@ -5362,7 +5420,12 @@ class BookingStateService:
 
             # Stage 2 Pre-commit date/time normalization and validation
             t_val0 = time.time()
-            doctor_name = self.validate_doctor_against_db(session.doctor or "") or session.doctor or "Representative"
+            if session.booking_type in ("SALES_DEMO", "BUSINESS_CONSULTATION") or session.business_type == "SOFTWARE":
+                doctor_name = "Representative"
+                dept_name = "Sales Team" if session.booking_type == "SALES_DEMO" else "Consultation"
+            else:
+                doctor_name = self.validate_doctor_against_db(session.doctor or "") or session.doctor or "Representative"
+                dept_name = session.booking_data.get("specialty") or session.department or "General Appointment"
             target_date_obj = calendar_verification_service.parse_date(session.date or "today")
             normalized_date_str = target_date_obj.strftime("%d %b %Y")
             time_24h = calendar_verification_service.parse_time_to_24h(session.time or "10:00 AM") or "10:00"
@@ -5392,10 +5455,27 @@ class BookingStateService:
                     session.booking_confirmed = True
                     session.state = BookingState.BOOKING_CONFIRMED
                     session.is_completed = True
-                    return (
-                        f"Your appointment is confirmed with {doctor_name} on {normalized_date_str} at {normalized_time_str}. "
-                        f"Your appointment ID is #{existing_for_customer.id}. I've sent your confirmation details."
+                    session.confirmation_count = 1
+                    b_name = session.business_name or "our team"
+                    if session.booking_type == "SALES_DEMO":
+                        resp_text = (
+                            f"Your demo appointment is confirmed for {normalized_date_str} at {normalized_time_str}. "
+                            f"Your appointment ID is #{existing_for_customer.id}. Thank you for calling {b_name}."
+                        )
+                    else:
+                        resp_text = (
+                            f"Your appointment is confirmed with {doctor_name} on {normalized_date_str} at {normalized_time_str}. "
+                            f"Your appointment ID is #{existing_for_customer.id}. Thank you for calling {b_name}."
+                        )
+                    session.confirmation_message = resp_text
+                    session.confirmed_appointment_id = existing_for_customer.id
+                    logger.info(
+                        f"\n[BOOKING_CONFIRMATION]"
+                        f"\n  confirmation_count={session.confirmation_count}"
+                        f"\n  playback_status=QUEUED"
+                        f"\n  appointment_id={existing_for_customer.id}"
                     )
+                    return resp_text
 
                 # Race condition check: slot taken by another customer right before commit
                 conflict = db.query(Appointment).filter(
@@ -5436,7 +5516,7 @@ class BookingStateService:
                         customer=session.patient_name,
                         phone=session.contact_number or "Unknown",
                         email=confirmed_email,
-                        department=session.booking_data.get("specialty") or session.department or "General Appointment",
+                        department=dept_name,
                         staff=doctor_name,
                         service=svc_val,
                         appointment_date=normalized_date_str,
@@ -5468,7 +5548,13 @@ class BookingStateService:
 
                         t_conf_start = time.time()
                         # Spoken confirmation without LLM dependency
-                        if lang in ("ta", "tanglish", "ta_mix"):
+                        b_name = session.business_name or "our team"
+                        if session.booking_type == "SALES_DEMO":
+                            resp_text = (
+                                f"Your demo appointment is confirmed for {normalized_date_str} at {normalized_time_str}. "
+                                f"Your appointment ID is #{verified_appt.id}. Thank you for calling {b_name}."
+                            )
+                        elif lang in ("ta", "tanglish", "ta_mix"):
                             resp_text = (
                                 f"உங்க appointment {doctor_name}-கூட {normalized_date_str} அன்று {normalized_time_str}-க்கு confirm ஆயிடுச்சு! "
                                 f"Appointment ID #{verified_appt.id}. விவரங்களை அனுப்பிவிட்டேன். நன்றி, {session.patient_name}!"
@@ -5481,8 +5567,19 @@ class BookingStateService:
                         else:
                             resp_text = (
                                 f"Your appointment is confirmed with {doctor_name} on {normalized_date_str} at {normalized_time_str}. "
-                                f"Your appointment ID is #{verified_appt.id}. I've sent your confirmation details."
+                                f"Your appointment ID is #{verified_appt.id}. Thank you for calling {b_name}."
                             )
+
+                        session.confirmation_count = 1
+                        session.confirmation_message = resp_text
+                        session.confirmed_appointment_id = verified_appt.id
+
+                        logger.info(
+                            f"\n[BOOKING_CONFIRMATION]"
+                            f"\n  confirmation_count={session.confirmation_count}"
+                            f"\n  playback_status=QUEUED"
+                            f"\n  appointment_id={verified_appt.id}"
+                        )
                         confirmation_text_ms = max(1, int((time.time() - t_conf_start) * 1000))
                         booking_total_ms = max(1, int((time.time() - t_booking_start) * 1000))
 

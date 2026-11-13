@@ -122,9 +122,9 @@ class Settings(BaseSettings):
     SIP_PORT: int = 5060
     SIP_DID_NUMBER: Optional[str] = None
     SIP_WEBHOOK_BASE_URL: Optional[str] = None
-    SIP_EXTENSION: Optional[str] = Field(default="1001")
-    SIP_WS_URL: Optional[str] = Field(default="wss://49.249.142.147:8089/ws")
-    STUN_SERVER: Optional[str] = Field(default="stun:stun.l.google.com:19302")
+    SIP_EXTENSION: Optional[str] = None
+    SIP_WS_URL: Optional[str] = None
+    STUN_SERVER: Optional[str] = None
     CALL_INACTIVITY_TIMEOUT_SECONDS: int = Field(default=600)
 
     # ------------------------------------------------------------------

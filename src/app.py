@@ -54,7 +54,7 @@ async def lifespan(app: FastAPI):
         logger.warning(f"Dialer worker initialization warning: {exc}")
 
 
-    # Auto-start SIP registrar(s) if credentials exist in DB or .env
+    # Auto-start SIP registrar(s) ONLY for explicitly ACTIVE configurations in database
     try:
         from src.config.database import SessionLocal
         from src.models.sip_config import SipConfig
@@ -64,25 +64,21 @@ async def lifespan(app: FastAPI):
 
         _db = SessionLocal()
         try:
-            # Query all registered configs or the primary config
-            active_configs = _db.query(SipConfig).filter(SipConfig.registration_status.in_(["registered", "connected"])).all()
-            if not active_configs:
-                first_cfg = _db.query(SipConfig).first()
-                if first_cfg:
-                    active_configs = [first_cfg]
+            # Query ONLY configurations where is_active == True
+            active_configs = _db.query(SipConfig).filter(SipConfig.is_active == True).all()
 
             if active_configs:
                 for cfg in active_configs:
                     org_id = cfg.organization_id or 1
-                    sip_host = (cfg.sip_host or cfg.domain or cfg.sip_server or (settings.SIP_HOST if org_id == 1 else None)) or ""
-                    sip_username = (cfg.sip_username or cfg.login or (settings.SIP_USERNAME if org_id == 1 else None)) or ""
-                    enc_pass = cfg.sip_password_encrypted or (settings.SIP_PASSWORD if org_id == 1 else None) or ""
+                    sip_host = (cfg.sip_host or cfg.domain or cfg.sip_proxy or cfg.sip_server or "").strip()
+                    sip_username = (cfg.sip_username or cfg.login or "").strip()
+                    enc_pass = cfg.sip_password_encrypted or ""
                     sip_password = decrypt_secret(enc_pass) if enc_pass else ""
-                    sip_port = cfg.sip_port or (settings.SIP_PORT if org_id == 1 else 5060) or 5060
-                    did_number = cfg.did_number or (settings.SIP_DID_NUMBER if org_id == 1 else None) or sip_username
+                    sip_port = cfg.sip_port or 5060
+                    did_number = cfg.did_number or sip_username
 
                     if sip_host and sip_username and sip_password:
-                        logger.info(f"[SIP] Auto-starting SIP registrar for Org {org_id}: {sip_username}@{sip_host}:{sip_port}")
+                        logger.info(f"[SIP] Auto-starting ACTIVE SIP registrar for Org {org_id}: {sip_username}@{sip_host}:{sip_port}")
                         threading.Thread(
                             target=start_registrar,
                             kwargs={
@@ -96,23 +92,8 @@ async def lifespan(app: FastAPI):
                             daemon=True,
                             name=f"sip-autostart-org{org_id}",
                         ).start()
-            elif settings.SIP_HOST and settings.SIP_USERNAME and settings.SIP_PASSWORD:
-                logger.info(f"[SIP] Auto-starting default admin SIP registrar from environment: {settings.SIP_USERNAME}@{settings.SIP_HOST}:{settings.SIP_PORT}")
-                threading.Thread(
-                    target=start_registrar,
-                    kwargs={
-                        "sip_host": settings.SIP_HOST,
-                        "sip_username": settings.SIP_USERNAME,
-                        "sip_password": settings.SIP_PASSWORD,
-                        "sip_port": int(settings.SIP_PORT or 5060),
-                        "did_number": getattr(settings, "SIP_DID_NUMBER", settings.SIP_USERNAME),
-                        "organization_id": 1,
-                    },
-                    daemon=True,
-                    name="sip-autostart-org1",
-                ).start()
             else:
-                logger.info("[SIP] No complete SIP credentials found in DB or .env — registrar not started.")
+                logger.info("[SIP] No active SIP configuration found in database — registrar not started. Please activate a SIP configuration.")
         finally:
             _db.close()
     except Exception as exc:

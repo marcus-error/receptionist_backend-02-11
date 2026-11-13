@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -39,22 +39,8 @@ router.add_api_route("/test-connection", telephony_controller.test_connection, m
 router.add_api_route("/validate-sip", telephony_controller.validate_sip, methods=["POST"], response_model=ValidateSipResponse)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SIP Trunk configuration routes
+# SIP UA Registration & Live Status (static routes MUST precede parameterized routes)
 # ──────────────────────────────────────────────────────────────────────────────
-router.add_api_route("/sip", telephony_controller.get_sip_config, methods=["GET"], response_model=SipConfigOut)
-router.add_api_route("/sip", telephony_controller.update_sip_config, methods=["POST", "PUT"], response_model=SipConfigOut)
-router.add_api_route("/sip/test", telephony_controller.test_sip_connection, methods=["POST"], response_model=SipTestResponse)
-router.add_api_route("/sip/test-e2e", telephony_controller.run_e2e_test, methods=["POST"], response_model=SipE2ETestResponse)
-
-# ──────────────────────────────────────────────────────────────────────────────
-# SIP UA Registration routes (pyVoIP — FreeSWITCH / Asterisk)
-# ──────────────────────────────────────────────────────────────────────────────
-router.add_api_route(
-    "/sip/register",
-    telephony_controller.register_sip_trunk,
-    methods=["POST"],
-    summary="Register SIP UA with FreeSWITCH / Asterisk",
-)
 router.add_api_route(
     "/sip/registration-status",
     telephony_controller.get_registration_status,
@@ -63,12 +49,39 @@ router.add_api_route(
     summary="Get live SIP UA registration status",
 )
 router.add_api_route(
+    "/sip/register",
+    telephony_controller.register_sip_trunk,
+    methods=["POST"],
+    summary="Register SIP UA with FreeSWITCH / Asterisk",
+)
+router.add_api_route(
     "/sip/unregister",
     telephony_controller.unregister_sip_trunk,
     methods=["POST"],
     response_model=SipUnregisterResponse,
     summary="Unregister SIP UA",
 )
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SIP Trunk dynamic configuration routes (static endpoints first)
+# ──────────────────────────────────────────────────────────────────────────────
+router.add_api_route("/sip/list", telephony_controller.list_sip_configs, methods=["GET"], response_model=List[SipConfigOut])
+router.add_api_route("/sip/test", telephony_controller.test_sip_connection, methods=["POST"], response_model=SipTestResponse)
+router.add_api_route("/sip/test-e2e", telephony_controller.run_e2e_test, methods=["POST"], response_model=SipE2ETestResponse)
+router.add_api_route("/sip/deactivate", telephony_controller.deactivate_sip_config, methods=["POST"], response_model=SipConfigOut)
+
+router.add_api_route("/sip", telephony_controller.get_sip_config, methods=["GET"], response_model=SipConfigOut)
+router.add_api_route("/sip", telephony_controller.create_sip_config, methods=["POST"], response_model=SipConfigOut)
+router.add_api_route("/sip", telephony_controller.update_sip_config, methods=["PUT"], response_model=SipConfigOut)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SIP Trunk parameterized configuration routes (strictly constrained to integer IDs)
+# ──────────────────────────────────────────────────────────────────────────────
+router.add_api_route("/sip/{config_id:int}", telephony_controller.get_sip_config, methods=["GET"], response_model=SipConfigOut)
+router.add_api_route("/sip/{config_id:int}", telephony_controller.update_sip_config, methods=["PUT"], response_model=SipConfigOut)
+router.add_api_route("/sip/{config_id:int}", telephony_controller.delete_sip_config, methods=["DELETE"])
+router.add_api_route("/sip/{config_id:int}/activate", telephony_controller.activate_sip_config, methods=["POST"], response_model=SipConfigOut)
+router.add_api_route("/sip/{config_id:int}/deactivate", telephony_controller.deactivate_sip_config, methods=["POST"], response_model=SipConfigOut)
 
 
 @router.get("/demo-status")
@@ -160,19 +173,33 @@ async def sip_inbound_call(
             if target_did:
                 clean_did = str(target_did).strip().lstrip('+')
                 cfg_match = db.query(SipConfig).filter(
-                    (SipConfig.did_number == target_did) |
+                    ((SipConfig.did_number == target_did) |
                     (SipConfig.did_number == clean_did) |
-                    (SipConfig.did_number == f"+{clean_did}")
+                    (SipConfig.did_number == f"+{clean_did}")),
+                    SipConfig.is_active == True
                 ).first()
                 if cfg_match and cfg_match.organization_id:
                     inbound_org_id = cfg_match.organization_id
             elif target_user:
                 cfg_match = db.query(SipConfig).filter(
-                    (SipConfig.sip_username == target_user) |
-                    (SipConfig.login == target_user)
+                    ((SipConfig.sip_username == target_user) |
+                    (SipConfig.login == target_user)),
+                    SipConfig.is_active == True
                 ).first()
                 if cfg_match and cfg_match.organization_id:
                     inbound_org_id = cfg_match.organization_id
+
+        # Verify organization has an explicitly active SIP configuration
+        from src.models.sip_config import SipConfig
+        active_sip = db.query(SipConfig).filter(
+            SipConfig.organization_id == inbound_org_id,
+            SipConfig.is_active == True
+        ).first()
+        if not active_sip:
+            return {
+                "status": "rejected",
+                "message": "No active SIP configuration. Inbound call rejected."
+            }
 
         call_service = CallService(db)
         call = call_service.create_from_twilio({

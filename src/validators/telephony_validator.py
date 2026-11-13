@@ -60,6 +60,7 @@ class SipConfigIn(BaseModel):
     sip_host: Optional[str] = None
     sip_port: Optional[int] = 5060
     did_number: Optional[str] = None
+    is_active: Optional[bool] = None
 
 
 class SipConfigOut(BaseModel):
@@ -87,9 +88,10 @@ class SipConfigOut(BaseModel):
     sip_host: Optional[str] = None
     sip_port: Optional[int] = 5060
     did_number: Optional[str] = None
-    sip_extension: Optional[str] = "1001"
-    sip_ws_url: Optional[str] = "wss://49.249.142.147:8089/ws"
-    stun_server: Optional[str] = "stun:stun.l.google.com:19302"
+    sip_extension: Optional[str] = None
+    sip_ws_url: Optional[str] = None
+    stun_server: Optional[str] = None
+    is_active: bool = False
     has_password: bool = False
     status: Optional[str] = "disconnected"
     registration_status: Optional[str] = "unregistered"

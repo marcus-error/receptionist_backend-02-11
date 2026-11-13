@@ -1542,31 +1542,38 @@ class SipRegistrar:
 
                 db = SessionLocal()
                 try:
-                    # Step A: Match Callee DID against SipConfig table
+                    # Step A: Match Callee DID against SipConfig table (ACTIVE ONLY)
                     if callee_digits:
                         d10 = callee_digits[-10:] if len(callee_digits) >= 10 else callee_digits
                         cfg_did = db.query(SipConfig).filter(
-                            (SipConfig.did_number.ilike(f"%{d10}%")) |
-                            (SipConfig.sip_username.ilike(f"%{d10}%"))
+                            ((SipConfig.did_number.ilike(f"%{d10}%")) |
+                            (SipConfig.sip_username.ilike(f"%{d10}%"))),
+                            SipConfig.is_active == True,
                         ).first()
                         if cfg_did and cfg_did.organization_id:
                             resolved_org_id = cfg_did.organization_id
                             org_resolution_source = f"SIP_CALLEE_DID_{d10}"
 
-                    # Step B: Match Trunk credentials on registrar
+                    # Step B: Match Trunk credentials on registrar (ACTIVE ONLY)
                     if not resolved_org_id and (self.sip_username or self.sip_host):
                         cfg_trunk = db.query(SipConfig).filter(
-                            (SipConfig.sip_username == self.sip_username) |
-                            (SipConfig.sip_host == self.sip_host)
+                            ((SipConfig.sip_username == self.sip_username) |
+                            (SipConfig.sip_host == self.sip_host)),
+                            SipConfig.is_active == True,
                         ).first()
                         if cfg_trunk and cfg_trunk.organization_id:
                             resolved_org_id = cfg_trunk.organization_id
                             org_resolution_source = "SIP_TRUNK_CREDENTIALS"
 
-                    # Step C: Registrar explicit organization
+                    # Step C: Registrar explicit organization (ACTIVE ONLY)
                     if not resolved_org_id and getattr(self, "organization_id", None):
-                        resolved_org_id = int(self.organization_id)
-                        org_resolution_source = "REGISTRAR_ORGANIZATION_ID"
+                        active_cfg = db.query(SipConfig).filter(
+                            SipConfig.organization_id == int(self.organization_id),
+                            SipConfig.is_active == True,
+                        ).first()
+                        if active_cfg:
+                            resolved_org_id = int(self.organization_id)
+                            org_resolution_source = "REGISTRAR_ORGANIZATION_ID"
 
                     # Reject inbound call if neither DID nor Trunk matched any organization
                     if not resolved_org_id:

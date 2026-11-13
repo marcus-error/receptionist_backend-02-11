@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, List
 from fastapi import Depends, Query, HTTPException, status
 from sqlalchemy.orm import Session
 
@@ -80,23 +80,75 @@ async def validate_sip(
     return ValidateSipResponse(**result)
 
 
+def list_sip_configs(
+    organization_id: Optional[int] = Query(None),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+) -> List[SipConfigOut]:
+    user_id, org_id = _get_ids(current_user, organization_id)
+    return TelephonyService(db, user_id=user_id, org_id=org_id).list_sip_configs()
+
+
 def get_sip_config(
+    probe: bool = Query(True),
+    config_id: Optional[int] = None,
     organization_id: Optional[int] = Query(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ) -> SipConfigOut:
     user_id, org_id = _get_ids(current_user, organization_id)
-    return TelephonyService(db, user_id=user_id, org_id=org_id).get_sip_config()
+    return TelephonyService(db, user_id=user_id, org_id=org_id).get_sip_config(probe=probe, config_id=config_id)
 
 
-def update_sip_config(
+def create_sip_config(
     payload: SipConfigIn,
     organization_id: Optional[int] = Query(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ) -> SipConfigOut:
     user_id, org_id = _get_ids(current_user, organization_id)
-    return TelephonyService(db, user_id=user_id, org_id=org_id).update_sip_config(payload)
+    return TelephonyService(db, user_id=user_id, org_id=org_id).create_sip_config(payload)
+
+
+def update_sip_config(
+    payload: SipConfigIn,
+    config_id: Optional[int] = None,
+    organization_id: Optional[int] = Query(None),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+) -> SipConfigOut:
+    user_id, org_id = _get_ids(current_user, organization_id)
+    return TelephonyService(db, user_id=user_id, org_id=org_id).update_sip_config(payload, config_id=config_id)
+
+
+def delete_sip_config(
+    config_id: int,
+    organization_id: Optional[int] = Query(None),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+) -> dict:
+    user_id, org_id = _get_ids(current_user, organization_id)
+    return TelephonyService(db, user_id=user_id, org_id=org_id).delete_sip_config(config_id)
+
+
+def activate_sip_config(
+    config_id: int,
+    organization_id: Optional[int] = Query(None),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+) -> SipConfigOut:
+    user_id, org_id = _get_ids(current_user, organization_id)
+    return TelephonyService(db, user_id=user_id, org_id=org_id).activate_sip_config(config_id)
+
+
+def deactivate_sip_config(
+    config_id: Optional[int] = None,
+    organization_id: Optional[int] = Query(None),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+) -> SipConfigOut:
+    user_id, org_id = _get_ids(current_user, organization_id)
+    return TelephonyService(db, user_id=user_id, org_id=org_id).deactivate_sip_config(config_id)
 
 
 async def test_sip_connection(
@@ -138,7 +190,7 @@ def register_sip_trunk(
 
 def get_registration_status(
     organization_id: Optional[int] = Query(None),
-    current_user: User = Depends(get_current_user),
+    current_user: Optional[User] = Depends(get_optional_current_user),
     db: Session = Depends(get_db)
 ) -> SipRegistrationStatusResponse:
     """Return live SIP UA registration state for the authenticated organization."""
