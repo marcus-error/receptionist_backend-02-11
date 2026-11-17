@@ -24,6 +24,10 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if os.getenv("APP_ENV") == "test" or "PYTEST_CURRENT_TEST" in os.environ:
+        yield
+        return
+
     logger.info("Initializing database and local open-source AI models...")
     init_db()
     

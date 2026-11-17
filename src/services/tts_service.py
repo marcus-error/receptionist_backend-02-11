@@ -336,15 +336,25 @@ class TTSService:
             return self.pcm_to_ulaw(audio_bytes[:16000])
 
     async def synthesize_speech_async(self, text: str, language: str = "en", voice_id: Optional[str] = None) -> bytes:
-        """Asynchronously synthesize speech without blocking the event loop, with hard 4.0s timeout."""
+        """Asynchronously synthesize speech without blocking the event loop, with hard 3.0s timeout and immediate fallback."""
+        t_start = time.perf_counter()
         try:
-            return await asyncio.wait_for(
+            audio = await asyncio.wait_for(
                 asyncio.to_thread(self.synthesize_speech, text, language, voice_id),
-                timeout=4.0
+                timeout=3.0
             )
+            murf_ms = (time.perf_counter() - t_start) * 1000.0
+            logger.info(f"[TTS_DIAGNOSTICS] provider=murf status=success latency_ms={murf_ms:.1f} audio_size={len(audio) if audio else 0}")
+            return audio
         except asyncio.TimeoutError:
-            logger.warning("[TTS] Total synthesis exceeded 4.0s hard timeout! Falling back to fast edge TTS.")
-            return await asyncio.to_thread(self._synthesize_gtts, text, language or "en")
+            murf_ms = (time.perf_counter() - t_start) * 1000.0
+            TTSService._murf_disabled_until = time.monotonic() + 60.0
+            logger.warning(f"[TTS_DIAGNOSTICS] provider=murf status=timeout latency_ms={murf_ms:.1f} (exceeded 3.0s threshold). Tripping circuit breaker (60s) -> invoking immediate gTTS fallback.")
+            t_fb = time.perf_counter()
+            fb_audio = await asyncio.to_thread(self._synthesize_gtts, text, language or "en")
+            fb_ms = (time.perf_counter() - t_fb) * 1000.0
+            logger.info(f"[TTS_DIAGNOSTICS] provider=gtts_fallback status=success latency_ms={fb_ms:.1f} audio_size={len(fb_audio) if fb_audio else 0}")
+            return fb_audio
 
     async def synthesize_ulaw_async(self, text: str, language: str = "en") -> bytes:
         """Asynchronously generate Twilio μ-law audio bytes."""

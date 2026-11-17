@@ -71,6 +71,36 @@ def list_docs(
     )
 
 
+def get_active_doc(
+    current_user: Optional[User] = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    org_id = _get_org_id(current_user)
+    if org_id is None and not _is_super_admin(current_user):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    doc = KnowledgeService(db).get_active_doc(organization_id=org_id)
+    if not doc:
+        return {
+            "has_active": False,
+            "document": None,
+            "message": "No active RAG document found for this organization."
+        }
+    return {
+        "has_active": True,
+        "document": {
+            "id": doc.id,
+            "title": doc.title,
+            "document_type": doc.document_type,
+            "ai_usage": doc.ai_usage,
+            "status": doc.status.value if hasattr(doc.status, "value") else str(doc.status),
+            "updated_at": doc.updated_at.isoformat() if doc.updated_at else None,
+            "chunks": doc.chunks or 0,
+        },
+        "message": "Active RAG document resolved successfully."
+    }
+
+
 def get_doc(
     doc_id: int,
     current_user: Optional[User] = Depends(get_current_user),

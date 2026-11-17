@@ -182,7 +182,17 @@ class AIService:
             return "mistral"
         return "grounded_rag"
 
-    def _get_system_instruction(self, organization_name: Optional[str] = None, is_ongoing: bool = False, is_rag_active: bool = False, emotion: str = "neutral", call_direction: str = "INBOUND", conversation_language: str = "en") -> str:
+    def _get_system_instruction(
+        self,
+        organization_name: Optional[str] = None,
+        is_ongoing: bool = False,
+        is_rag_active: bool = False,
+        emotion: str = "neutral",
+        call_direction: str = "INBOUND",
+        conversation_language: str = "en",
+        business_type: str = "GENERAL",
+        booking_type: str = "BUSINESS_CONSULTATION"
+    ) -> str:
         org_title = organization_name or "the organization"
 
         emotion_lower = (emotion or "neutral").lower()
@@ -226,8 +236,49 @@ class AIService:
             "   - NEVER ask for information that already exists in [CONVERSATION STATE].\n"
             if is_ongoing else ""
         )
+
+        lang_directive = ""
+        if conversation_language and conversation_language in ("ta", "hi", "kn", "te"):
+            from src.services.language_service import language_service
+            lang_name = language_service.get_language_name(conversation_language)
+            native_names = {"ta": "தமிழ்", "hi": "हिंदी", "kn": "ಕನ್ನಡ", "te": "తెలుగు"}
+            native_str = f" / {native_names.get(conversation_language, '')}"
+            lang_directive = (
+                f"\n=== MANDATORY LANGUAGE DIRECTIVE: {lang_name.upper()}{native_str} ({conversation_language}) ===\n"
+                f"The customer has chosen to converse in {lang_name} ({conversation_language}).\n"
+                f"- You MUST generate your ENTIRE response strictly and fluently in {lang_name} ({conversation_language}).\n"
+                f"- Do NOT speak or respond in English or any other language.\n"
+                f"- Do NOT translate or corrupt customer names, doctor names, company names, email addresses, phone numbers, or appointment dates.\n"
+                f"- Maintain a polite, natural, and concise receptionist dialogue in {lang_name} (1 to 3 spoken sentences).\n"
+                f"===================================================================\n\n"
+            )
+
+        if business_type in ("HOSPITAL", "CLINIC") or booking_type == "HOSPITAL_APPOINTMENT":
+            domain_isolation_rule = (
+                "5. HEALTHCARE DOMAIN & HOSPITAL CONSULTATIONS:\n"
+                f"   - You are the AI Receptionist for {org_title}, a healthcare facility.\n"
+                "   - You may discuss medical departments, doctors, outpatient consultations, and patient appointment bookings described in the active RAG document.\n"
+                "   - Strictly preserve exact doctor names, timings, and department details from active RAG.\n"
+                "   - NEVER discuss software demos, SaaS platforms, CRM, or unrelated business domains.\n\n"
+            )
+        elif business_type == "SOFTWARE" or booking_type == "SALES_DEMO":
+            domain_isolation_rule = (
+                "5. ABSOLUTE DOMAIN ISOLATION — SOFTWARE PRODUCTS & DEMOS:\n"
+                f"   - You are the AI Receptionist for {org_title}, a technology/software company.\n"
+                "   - You must discuss ONLY software products, AI voice agents, CRM, chat solutions, custom software, and sales demos described in the active script.\n"
+                "   - STRICTLY FORBIDDEN: NEVER mention or suggest doctors, physicians, patients, medical appointments, or hospital departments (such as Cardiology, Dental, General Medicine, Ayurvedic, Siddha, OPD). This is NOT a hospital.\n"
+                "   - If the caller asks for a demo or consultation, collect demo details (name, email, date/time) without ever asking for a doctor or patient.\n\n"
+            )
+        else:
+            domain_isolation_rule = (
+                "5. ABSOLUTE DOMAIN ISOLATION:\n"
+                f"   - You are the AI Receptionist for {org_title}.\n"
+                "   - Adapt your answers and suggestions strictly to the products, services, or topics described in the active RAG document.\n"
+                "   - Do not invent services or assume any specific business domain outside what is described in the active records.\n\n"
+            )
+
         return (
-            f"You are an AI Receptionist for {org_title}. Your primary responsibility is to maintain complete conversation continuity throughout the entire call, understand caller speech accurately, retrieve correct RAG information, and prompt ONLY for remaining missing details.\n\n"
+            f"{lang_directive}You are an AI Receptionist for {org_title}. Your primary responsibility is to maintain complete conversation continuity throughout the entire call, understand caller speech accurately, retrieve correct RAG information, and prompt ONLY for remaining missing details.\n\n"
             f"{rag_mode_directive}"
             "=== CORE RECEPTIONIST PIPELINE & CONVERSATION CONTINUITY RULES ===\n"
                         "1. GREETING:\n"
@@ -246,10 +297,7 @@ class AIService:
             "   - Supported languages are strictly: Tamil (ta), English (en), Hindi (hi), Kannada (kn), Telugu (te).\n"
             "   - If the caller requests another supported language, switch immediately and naturally.\n"
             "   - Preserve exact spelling of proper nouns, patient names, email addresses, phone numbers, and appointment dates/times without translating or corrupting them.\n\n"
-            "5. ABSOLUTE DOMAIN ISOLATION & ZERO MEDICAL MENTIONS:\n"
-            "   - Preserve exact spelling of product/staff names, departments, services, proper nouns, and terms from RAG.\n"
-            "   - NEVER ASSUME THE BUSINESS TYPE IS A HOSPITAL OR CLINIC. NEVER MENTION OR SUGGEST DOCTORS, PATIENTS, OR MEDICAL DEPARTMENTS (such as Cardiology, Dentist, Ophthalmology, Pediatrics, General Medicine), EVEN WHEN DENYING AN UNLISTED QUESTION OR EXPLAINING MISSING INFORMATION.\n"
-            "   - Adapt your options and suggestions strictly to the products, services, or topics in the active RAG document.\n\n"
+            f"{domain_isolation_rule}"
             "6. VOICE INPUT ACCURACY & CONTEXTUAL CORRECTION:\n"
             "   - Use conversation context and active RAG lists to resolve minor STT ambiguities.\n"
             "   - Rejects random background noise or unrelated words.\n\n"
@@ -301,9 +349,24 @@ class AIService:
         from src.services.rag_service import rag_service
         from src.services.language_service import language_service
 
-        active_doc_id = rag_service._resolve_active_document_id(organization_id)
-        org_name = rag_service.get_organization_name(organization_id, document_id=active_doc_id)
-        welcome_greeting = rag_service.get_organization_greeting(organization_id, document_id=active_doc_id)
+        active_doc_id = None
+        if booking_session:
+            if isinstance(booking_session, dict):
+                active_doc_id = booking_session.get("active_doc_id")
+            else:
+                active_doc_id = getattr(booking_session, "active_doc_id", None)
+        if not active_doc_id:
+            active_doc_id = rag_service._resolve_active_document_id(organization_id, scope=call_direction)
+
+        b_name_from_sess = None
+        if booking_session:
+            if isinstance(booking_session, dict):
+                b_name_from_sess = booking_session.get("business_name")
+            else:
+                b_name_from_sess = getattr(booking_session, "business_name", None)
+
+        org_name = b_name_from_sess or rag_service.get_organization_name(organization_id, document_id=active_doc_id) or "our company"
+        welcome_greeting = rag_service.get_organization_greeting(organization_id, document_id=active_doc_id, scope=call_direction)
 
         # ------------------------------------------------------------------ #
         # PRIORITY 0 — Language Switch (must fire before any RAG/LLM call)    #
@@ -326,13 +389,13 @@ class AIService:
             }
             if any(g in txt for g in greetings_native.get(curr_lang, [])):
                 if curr_lang == "ta":
-                    return f"வணக்கம்! நான் {org_name or 'மருத்துவமனை'} AI வரவேற்பாளர். உங்களுக்கு இன்று எவ்வாறு உதவலாம்?"
+                    return f"வணக்கம்! நான் {org_name} AI வரவேற்பாளர். உங்களுக்கு இன்று எவ்வாறு உதவலாம்?"
                 elif curr_lang == "hi":
-                    return f"नमस्ते! मैं {org_name or 'अस्पताल'} का AI स्वागतकर्ता हूँ। आज मैं आपकी क्या सहायता कर सकता हूँ?"
+                    return f"नमस्ते! मैं {org_name} का AI स्वागतकर्ता हूँ। आज मैं आपकी क्या सहायता कर सकता हूँ?"
                 elif curr_lang == "kn":
-                    return f"ನಮಸ್ಕಾರ! ನಾನು {org_name or 'ಆಸ್ಪತ್ರೆ'} AI ಸ್ವಾಗತಕಾರ. ಇಂದು ನಾನು ನಿಮಗೆ ಹೇಗೆ ಸಹಾಯ ಮಾಡಲಿ?"
+                    return f"ನಮಸ್ಕಾರ! ನಾನು {org_name} AI ಸ್ವಾಗತಕಾರ. ಇಂದು ನಾನು ನಿಮಗೆ ಹೇಗೆ ಸಹಾಯ ಮಾಡಲಿ?"
                 elif curr_lang == "te":
-                    return f"నమస్కారం! నేను {org_name or 'ఆసుపత్రి'} AI రిసెప్షనిస్ట్‌ని. ఈరోజు నేను మీకు ఎలా సహాయపడగలను?"
+                    return f"నమస్కారం! నేను {org_name} AI రిసెప్షనిస్ట్‌ని. ఈరోజు నేను మీకు ఎలా సహాయపడగలను?"
             # For all other statements in non-English, pass to LLM to generate fluent in-language response
             return None
 
@@ -347,6 +410,38 @@ class AIService:
                 effective_direction = str(getattr(booking_session, "call_direction", getattr(booking_session, "call_type", "INBOUND"))).upper()
         if "OUTBOUND" not in effective_direction:
             effective_direction = "INBOUND"
+
+        # Task 2: Fast-Path Routing Audit & Business Content Guard
+        # Any message inquiring about services, products, pricing, features, what the business does, who they are, booking, scheduling, demo MUST pass to full RAG/LLM
+        business_content_terms = {
+            "what", "who", "which", "where", "how", "service", "services", "product", "products",
+            "pricing", "price", "cost", "fee", "feature", "features", "demo", "software",
+            "solution", "solutions", "offer", "offers", "offering", "crm", "erp", "hrms",
+            "payroll", "agent", "agents", "bot", "bots", "hospital", "doctor", "clinic",
+            "treatment", "book", "booking", "schedule", "appointment"
+        }
+        words_in_text = set(txt_clean.split())
+        has_business_inquiry = bool(words_in_text & business_content_terms) or any(
+            p in txt_clean for p in [
+                "what do you do", "what can you do", "tell me about", "about the receptionist",
+                "about receptionist", "how can you help", "tell me about yourself", "what products",
+                "what services", "book a demo", "software demo"
+            ]
+        )
+
+        audio_check_match = any(phrase in txt_clean for phrase in ["can you hear me", "are you there", "am i audible", "can you hear", "hear me", "is anyone there"])
+        origin_match = any(phrase in txt_clean for phrase in [
+            "youre calling from", "you are calling from", "calling from",
+            "where are you calling from", "where are you calling", "where you calling",
+            "who is calling", "whos calling", "who is this calling",
+            "youve reached where", "you reached where", "you have reached where", "where have i reached", "where did i call",
+            "which hospital is this", "which clinic is this", "which organization is this", "which business is this", "which company is this",
+            "who is this", "who am i speaking with", "who am i talking to"
+        ])
+
+        if has_business_inquiry and not audio_check_match and not origin_match:
+            logger.info(f"[FAST_PATH_CONTEXT] intent={intent or 'business_inquiry'} bypassed=false reason=business_inquiry")
+            return None
 
         already_greeted = is_ongoing or bool(
             (booking_session and getattr(booking_session, "greeting_sent", False))
@@ -366,29 +461,28 @@ class AIService:
         }
         is_pure_greeting = (txt_clean in greetings or intent == "greeting") and not any(w in txt_clean.split() for w in question_or_entity_words)
 
-        if is_pure_greeting and already_greeted:
-            return "Yes, how may I assist you?"
+        if is_pure_greeting:
+            if already_greeted:
+                logger.info(f"[FAST_PATH_CONTEXT] intent={intent or 'greeting'} bypassed=true reason=greeting_acknowledgement")
+                return "Yes, how may I assist you?"
+            else:
+                logger.info(f"[FAST_PATH_CONTEXT] intent={intent or 'greeting'} bypassed=true reason=welcome_greeting")
+                return welcome_greeting
 
-        # Identity and call origin questions (must fire even if background RAG context exists)
-        origin_identity_patterns = [
-            "youre calling from", "you are calling from", "calling from",
-            "where are you calling from", "where are you calling", "where you calling",
-            "who is calling", "whos calling", "who is this calling",
-            "youve reached where", "you reached where", "you have reached where", "where have i reached", "where did i call",
-            "which hospital is this", "which clinic is this", "which organization is this", "which business is this", "which company is this",
-            "who is this", "who am i speaking with", "who am i talking to"
-        ]
-        if any(phrase in txt_clean for phrase in origin_identity_patterns):
+        # Identity and call origin questions
+        if origin_match:
             target_org = org_name or rag_service.get_organization_name(organization_id)
             if not target_org or target_org.strip().lower() in ("default organization", "unknown", "none"):
                 target_org = "our office"
 
+            logger.info(f"[FAST_PATH_CONTEXT] intent={intent or 'identity_check'} bypassed=true reason=origin_identity")
             if effective_direction == "INBOUND":
                 return f"You've reached {target_org}. How may I help you?"
             else:
                 return f"I'm calling from {target_org}. How may I assist you?"
 
-        if any(phrase in txt_clean for phrase in ["can you hear me", "are you there", "am i audible", "can you hear", "hear me", "is anyone there"]):
+        if audio_check_match:
+            logger.info(f"[FAST_PATH_CONTEXT] intent={intent or 'audio_check'} bypassed=true reason=audio_test")
             if booking_session and hasattr(booking_session, "is_active") and booking_session.is_active():
                 from src.services.booking_state_service import booking_state_service
                 resume_prompt = booking_state_service.get_silence_prompt(booking_session)
@@ -396,92 +490,41 @@ class AIService:
             elif isinstance(booking_session, dict) and booking_session.get("state") not in (None, "IDLE", "COMPLETED"):
                 return "Yes, I can hear you clearly! We were discussing your appointment. How would you like to proceed?"
             return "Yes, I can hear you clearly! How may I assist you today?"
+
         if any(phrase in txt_clean for phrase in ["how are you", "how are you doing", "whats up"]):
+            logger.info(f"[FAST_PATH_CONTEXT] intent={intent or 'pleasantry'} bypassed=true reason=casual_pleasantry")
             return "I am doing great, thank you! How may I assist you today?"
-        if any(p in txt_clean for p in ["thank you", "thanks", "thank u", "appreciated"]):
-            return "You are very welcome! Please let me know if you need any other assistance."
+
         if any(w in txt for w in ["bye", "goodbye", "see you", "have a good day", "exit"]) or intent == "goodbye":
+            logger.info(f"[FAST_PATH_CONTEXT] intent={intent or 'goodbye'} bypassed=true reason=polite_closure")
             return f"Thank you for contacting {org_name or 'us'}. Have a wonderful day!"
+
+        if any(p in txt_clean for p in ["thank you", "thanks", "thank u", "appreciated", "that is all", "that's all", "that will be all"]) or intent in ("thanks", "gratitude"):
+            logger.info(f"[FAST_PATH_CONTEXT] intent={intent or 'thanks'} bypassed=true reason=polite_closure")
+            return "You are very welcome! Please let me know if you need any other assistance."
+
         if txt_clean in {"yeah good", "doing good", "good", "great", "im good", "i am good", "fine", "all good"}:
+            logger.info(f"[FAST_PATH_CONTEXT] intent={intent or 'acknowledgement'} bypassed=true reason=acknowledgement")
             if booking_session and hasattr(booking_session, "is_active") and booking_session.is_active():
                 from src.services.booking_state_service import booking_state_service
                 resume_prompt = booking_state_service.get_silence_prompt(booking_session)
                 return f"Glad to hear! {resume_prompt}"
             return "Glad to hear! How may I assist you today?"
+
         if txt_clean in {"i see", "okay", "alright", "got it", "sure", "cool", "ok"}:
+            logger.info(f"[FAST_PATH_CONTEXT] intent={intent or 'acknowledgement'} bypassed=true reason=acknowledgement")
             if booking_session and hasattr(booking_session, "is_active") and booking_session.is_active():
                 from src.services.booking_state_service import booking_state_service
                 resume_prompt = booking_state_service.get_silence_prompt(booking_session)
                 return f"Understood. {resume_prompt}"
             return "Understood. How can I assist you further?"
 
-        # ------------------------------------------------------------------ #
-        # Guard: Fast rules must NEVER intercept explicit RAG context or active booking #
-        # ------------------------------------------------------------------ #
-        if has_context:
-            return None
+        if any(p in txt_clean for p in ["dont be an idiot", "dont be a idiot", "be an idiot", "are you an idiot", "stop being an idiot", "be serious"]):
+            logger.info(f"[FAST_PATH_CONTEXT] intent={intent or 'moderation'} bypassed=true reason=moderation_response")
+            return "I apologize for any confusion. How may I assist you with our services today?"
 
-        # Fallback identity response only when NO active RAG context exists
-        if any(phrase in txt_clean for phrase in ["who is this", "who am i speaking with", "who am i talking to", "who is calling", "which organization is this"]):
-            target_org = org_name or rag_service.get_organization_name(organization_id)
-            return f"This is the AI receptionist for {target_org or 'our office'}. How may I assist you today?"
-        if booking_session and hasattr(booking_session, "is_active") and booking_session.is_active():
-            return None
-        if any(w in txt for w in ["book", "booking", "appointment", "schedule", "reserve", "slot", "slots"]):
-            return None
-        # ------------------------------------------------------------------ #
-
-        already_greeted = is_ongoing or bool(
-            (booking_session and getattr(booking_session, "greeting_sent", False))
-            or (isinstance(booking_session, dict) and booking_session.get("greeting_sent"))
-        )
-
-        greetings = {
-            "hi", "hello", "hey", "good morning", "good afternoon", "good evening",
-            "greetings", "hello there", "hi there", "hey there", "vanakkam", "namaste"
-        }
-
-        # Pure greeting: caller ONLY said a greeting word without asking a question or mentioning services
-        question_or_entity_words = {"what", "who", "where", "how", "when", "which", "is", "are", "do", "does", "can", "could", "service", "services", "book", "booking", "appointment", "doctor", "doctors", "department", "hospital", "clinic", "timing", "hours"}
-        is_pure_greeting = (txt_clean in greetings or intent == "greeting") and not any(w in txt_clean.split() for w in question_or_entity_words)
-
-        if is_pure_greeting and already_greeted:
-            return "Yes, how may I assist you?"
-
-        if any(w in txt for w in ["bye", "goodbye", "see you", "have a good day", "exit"]) or intent == "goodbye":
-            return f"Thank you for contacting {org_name or 'us'}. Have a wonderful day!"
-
-        if any(p in txt_clean for p in ["thank you", "thanks", "thank u", "appreciated", "that is all", "that's all", "that will be all"]) or intent in ("thanks", "gratitude"):
-            return "You are very welcome! Please let me know if you need any other assistance."
-
-        resp = None
-        if txt_clean in greetings or intent == "greeting":
-            resp = welcome_greeting
-        elif any(p in txt_clean for p in ["dont be an idiot", "dont be a idiot", "be an idiot", "are you an idiot", "stop being an idiot", "be serious"]):
-            resp = "I apologize for any confusion. How may I assist you with our services today?"
-        elif any(p in txt for p in ["about the receptionist", "know about the receptionist", "who is the receptionist", "what is the receptionist", "tell me about the receptionist", "about receptionist", "what can you do", "what do you do", "how can you help", "tell me about yourself"]):
-            if org_name:
-                resp = f"Sure! I am the AI receptionist for {org_name}. I can help answer your questions, provide information about the business and its services, and assist with appointments. What would you like to know?"
-            else:
-                resp = "Sure! I am the AI receptionist. I can help answer your questions, provide information about the business and its services, and assist with appointments. What would you like to know?"
-        elif re.search(r'\b(?:what(?:\s*is|\s*\'s|\s*s)?\s+(?:your|the)\s+(?:company|organization|business|salon|saloon|hospital|clinic|school|firm|hotel)\s+name|whats?\s+your\s+name|who\s+are\s+you|what\s+company\s+is\s+this|what\s+is\s+this\s+business)\b', txt_clean) or any(p in txt for p in ["company name", "organization name", "business name", "what is your name", "who are you"]):
-            if org_name:
-                resp = f"This is {org_name}. I am your AI receptionist. How may I assist you today?"
-            else:
-                resp = "I am your AI receptionist. How may I assist you today?"
-        elif any(p in txt_clean for p in ["opening hours", "business hours", "work hours", "working hours", "timing", "timings", "open time", "close time", "opening time"]):
-            hours_info = rag_service.get_organization_hours(organization_id, document_id=active_doc_id)
-            if hours_info:
-                resp = f"Our operating hours are {hours_info}. How else may I assist you?"
-            else:
-                resp = f"Operating hours are not specified in our active records for {org_name or 'our business'}."
-        elif any(p in txt_clean for p in ["where are you located", "location", "address", "where is your", "where are you"]):
-            loc_info = rag_service.get_organization_location(organization_id, document_id=active_doc_id)
-            if loc_info:
-                resp = f"We are located at {loc_info}. How else may I assist you?"
-            else:
-                resp = f"Address details are not specified in our active records for {org_name or 'our business'}."
-        return resp
+        logger.info(f"[FAST_PATH_CONTEXT] intent={intent or 'unknown'} bypassed=false reason=no_fast_rule_match")
+        return None
 
 
     def generate_response(
@@ -532,10 +575,16 @@ class AIService:
         if fast_resp:
             return guardrail_service.validate_and_sanitize_response(fast_resp, call_direction=call_direction, org_name=org_name if 'org_name' in locals() else "")
 
-        active_doc_id = rag_service._resolve_active_document_id(organization_id)
+        active_doc_id = (conversation_state.get("active_doc_id") if conversation_state else None) or rag_service._resolve_active_document_id(organization_id, scope=call_direction)
         is_rag_active = bool(active_doc_id)
-        org_name = rag_service.get_organization_name(organization_id, document_id=active_doc_id)
-        system_prompt = self._get_system_instruction(organization_name=org_name, is_ongoing=is_ongoing, is_rag_active=is_rag_active, emotion=emotion, call_direction=call_direction, conversation_language=conversation_language)
+        org_name = (conversation_state.get("business_name") if conversation_state else None) or rag_service.get_organization_name(organization_id, document_id=active_doc_id)
+        business_type = (conversation_state.get("business_type") if conversation_state else None) or "GENERAL"
+        booking_type = (conversation_state.get("booking_type") if conversation_state else None) or "BUSINESS_CONSULTATION"
+        system_prompt = self._get_system_instruction(
+            organization_name=org_name, is_ongoing=is_ongoing, is_rag_active=is_rag_active,
+            emotion=emotion, call_direction=call_direction, conversation_language=conversation_language,
+            business_type=business_type, booking_type=booking_type
+        )
 
         if outbound_script:
             system_prompt = (
@@ -593,6 +642,10 @@ class AIService:
             f"=== [RECENT CONVERSATION] ===\n{formatted_history or 'No previous turns.'}\n\n"
             f"=== [CURRENT USER QUERY] ===\n{text}"
         )
+        if conversation_language and conversation_language in ("ta", "hi", "kn", "te"):
+            from src.services.language_service import language_service
+            lang_name = language_service.get_language_name(conversation_language)
+            user_content += f"\n\n[MANDATORY: Formulate your entire response strictly in {lang_name} ({conversation_language}). Do NOT use English.]"
 
         raw_result = None
         provider = self._get_provider()
@@ -1003,10 +1056,16 @@ class AIService:
             yield fast_resp
             return
 
-        active_doc_id = rag_service._resolve_active_document_id(organization_id)
+        active_doc_id = (conversation_state.get("active_doc_id") if conversation_state else None) or rag_service._resolve_active_document_id(organization_id, scope=call_direction)
         is_rag_active = bool(active_doc_id)
-        org_name = rag_service.get_organization_name(organization_id, document_id=active_doc_id)
-        system_prompt = self._get_system_instruction(organization_name=org_name, is_ongoing=is_ongoing, is_rag_active=is_rag_active, emotion=emotion, call_direction=call_direction, conversation_language=conversation_language)
+        org_name = (conversation_state.get("business_name") if conversation_state else None) or rag_service.get_organization_name(organization_id, document_id=active_doc_id)
+        business_type = (conversation_state.get("business_type") if conversation_state else None) or "GENERAL"
+        booking_type = (conversation_state.get("booking_type") if conversation_state else None) or "BUSINESS_CONSULTATION"
+        system_prompt = self._get_system_instruction(
+            organization_name=org_name, is_ongoing=is_ongoing, is_rag_active=is_rag_active,
+            emotion=emotion, call_direction=call_direction, conversation_language=conversation_language,
+            business_type=business_type, booking_type=booking_type
+        )
 
         if outbound_script:
             system_prompt = (
@@ -1051,6 +1110,10 @@ class AIService:
             f"=== [RECENT CONVERSATION] ===\n{formatted_history or 'No previous turns.'}\n\n"
             f"=== [CURRENT USER QUERY] ===\n{text}"
         )
+        if conversation_language and conversation_language in ("ta", "hi", "kn", "te"):
+            from src.services.language_service import language_service
+            lang_name = language_service.get_language_name(conversation_language)
+            user_content += f"\n\n[MANDATORY: Formulate your entire response strictly in {lang_name} ({conversation_language}). Do NOT use English.]"
 
         provider = self._get_provider()
         gemini_model_name = getattr(settings, "GEMINI_MODEL", "gemini-2.5-flash")

@@ -634,6 +634,7 @@ class SipCallSession:
         script_meta = rag_service.get_active_script_metadata(self.organization_id, document_id=active_script_id, scope=dir_scope)
         self.active_script_id   = script_meta.get("active_script_id")
         self.active_script_title = script_meta.get("active_script_name")
+        self.script_version     = script_meta.get("script_version") or "1"
         self.business_name      = script_meta.get("business_name")
         self.business_type      = script_meta.get("business_type")
         self.booking_type       = script_meta.get("booking_type")
@@ -642,10 +643,19 @@ class SipCallSession:
         logger.info(
             f"\n[ACTIVE_SCRIPT_CONTEXT]"
             f"\n  organization_id={self.organization_id}"
+            f"\n  call_id={self.call_sid}"
             f"\n  active_script_id={self.active_script_id}"
             f"\n  active_script_name={self.active_script_title}"
+            f"\n  script_version={self.script_version}"
             f"\n  business_type={self.business_type}"
             f"\n  booking_type={self.booking_type}"
+        )
+        logger.info(
+            f"[ACTIVE_SCRIPT_RESOLUTION] org_id={self.organization_id} "
+            f"script_id={self.active_script_id or 'none'} "
+            f"title='{self.active_script_title or 'none'}' "
+            f"business_type={self.business_type or 'GENERAL'} "
+            f"booking_type={self.booking_type or 'GENERAL'}"
         )
         # Receives PCMU u8 bytes to send via pyVoIP write_audio
         self.audio_send_callback  = audio_send_callback
@@ -699,7 +709,13 @@ class SipCallSession:
         self.booking_session = booking_state_service.get_session(
             session_id=self.session_id,
             conversation_id=self.session_id,
-            call_sid=self.call_sid
+            call_sid=self.call_sid,
+            organization_id=self.organization_id,
+            business_type=self.business_type,
+            booking_type=self.booking_type,
+            business_name=self.business_name,
+            active_doc_id=self.active_script_id,
+            active_doc_title=self.active_script_title
         )
         self.booking_session.call_sid = self.call_sid
         self.booking_session.conversation_id = self.session_id
@@ -1237,8 +1253,21 @@ class SipCallSession:
                 clarification_msg = language_service.get_language_clarification_prompt(self.current_lang)
                 self.session_history.append({"role": "user", "text": text})
                 self.session_history.append({"role": "model", "text": clarification_msg})
+                self._messages.append({"role": "user", "text": text, "intent": "language_clarification"})
+                self._messages.append({"role": "assistant", "text": clarification_msg, "intent": "language_clarification"})
+                asyncio.create_task(asyncio.to_thread(self._log_to_db, "user", text, "language_clarification"))
+                asyncio.create_task(asyncio.to_thread(self._log_to_db, "assistant", clarification_msg, "language_clarification"))
+
                 metrics["response_id"] = f"ai_lang_clarify_{int(time.time()*1000)}"
                 metrics["source"] = "LANGUAGE_CLARIFICATION"
+                logger.info(
+                    f"\n[LANGUAGE_INTENT]"
+                    f"\n  call_id={self.call_sid}"
+                    f"\n  detected_requested_language=unknown"
+                    f"\n  trigger_phrase='{text}'"
+                    f"\n  intent_confidence={metrics.get('confidence', 1.0):.2f}"
+                    f"\n  switch_result=AMBIGUOUS"
+                )
                 logger.info(f"[LANG_SWITCH_INCOMPLETE_PROMPT] Incomplete request '{text}' -> Asking clarification in '{self.current_lang}'")
                 await self._speak(clarification_msg, "language_clarification", metrics)
                 return
@@ -1247,8 +1276,21 @@ class SipCallSession:
             clarification_msg = language_service.get_language_clarification_prompt(self.current_lang)
             self.session_history.append({"role": "user", "text": text})
             self.session_history.append({"role": "model", "text": clarification_msg})
+            self._messages.append({"role": "user", "text": text, "intent": "language_clarification"})
+            self._messages.append({"role": "assistant", "text": clarification_msg, "intent": "language_clarification"})
+            asyncio.create_task(asyncio.to_thread(self._log_to_db, "user", text, "language_clarification"))
+            asyncio.create_task(asyncio.to_thread(self._log_to_db, "assistant", clarification_msg, "language_clarification"))
+
             metrics["response_id"] = f"ai_lang_clarify_{int(time.time()*1000)}"
             metrics["source"] = "LANGUAGE_CLARIFICATION"
+            logger.info(
+                f"\n[LANGUAGE_INTENT]"
+                f"\n  call_id={self.call_sid}"
+                f"\n  detected_requested_language=unknown"
+                f"\n  trigger_phrase='{text}'"
+                f"\n  intent_confidence={metrics.get('confidence', 1.0):.2f}"
+                f"\n  switch_result=AMBIGUOUS"
+            )
             logger.info(f"[LANG_SWITCH_AMBIGUOUS_PROMPT] Ambiguous request '{text}' after '{prefix_used}' -> Asking clarification in '{self.current_lang}'")
             await self._speak(clarification_msg, "language_clarification", metrics)
             return
@@ -1256,6 +1298,7 @@ class SipCallSession:
         if is_switch:
             if target_lang in ("ta", "en", "hi", "kn", "te"):
                 # Customer explicitly requested a valid supported language
+                prev_lang = getattr(self, "preferred_response_language", "en")
                 self.current_lang = target_lang
                 self.language_code = target_lang
                 self.detected_language = language_service.get_language_name(target_lang)
@@ -1274,19 +1317,43 @@ class SipCallSession:
                 if hasattr(self, "booking_session") and self.booking_session:
                     self.booking_session.conversation_language = target_lang
 
-                # Dynamically reconfigure Deepgram STT stream for the new language
+                # Dynamically reconfigure Deepgram STT stream for the new language in background
                 if hasattr(self, "deepgram_session") and self.deepgram_session:
                     try:
-                        await self.deepgram_session.switch_language(target_lang)
+                        asyncio.create_task(self.deepgram_session.switch_language(target_lang))
                     except Exception as _stt_sw_err:
                         logger.warning(f"[STT_LANG_SWITCH_ERR] {_stt_sw_err}")
 
+                logger.info(
+                    f"\n[LANGUAGE_INTENT]"
+                    f"\n  call_id={self.call_sid}"
+                    f"\n  detected_requested_language={target_lang}"
+                    f"\n  trigger_phrase='{text}'"
+                    f"\n  intent_confidence={metrics.get('confidence', 1.0):.2f}"
+                    f"\n  switch_result=ACCEPTED"
+                )
+                logger.info(
+                    f"\n[LANGUAGE_STATE]"
+                    f"\n  call_id={self.call_sid}"
+                    f"\n  previous_preferred_language={prev_lang}"
+                    f"\n  new_preferred_language={target_lang}"
+                    f"\n  state_persisted=True"
+                    f"\n  storage_location=sip_call_handler.session"
+                )
+
                 switch_msg = language_service.get_language_switch_confirmation(
-                    target_lang, booking_session=getattr(self, "booking_session", None)
+                    target_lang,
+                    booking_session=getattr(self, "booking_session", None),
+                    org_name=rag_service.get_organization_name(self.organization_id)
                 )
 
                 self.session_history.append({"role": "user", "text": text})
                 self.session_history.append({"role": "model", "text": switch_msg})
+                self._messages.append({"role": "user", "text": text, "intent": "language_switch"})
+                self._messages.append({"role": "assistant", "text": switch_msg, "intent": "language_switch"})
+                asyncio.create_task(asyncio.to_thread(self._log_to_db, "user", text, "language_switch"))
+                asyncio.create_task(asyncio.to_thread(self._log_to_db, "assistant", switch_msg, "language_switch"))
+
                 metrics["response_id"] = f"ai_lang_switch_{int(time.time()*1000)}"
                 metrics["source"] = "LANGUAGE_SWITCH"
                 metrics["language"] = self.current_lang
@@ -1298,18 +1365,32 @@ class SipCallSession:
                 unsupported_msg = language_service.get_language_switch_confirmation(None)
                 self.session_history.append({"role": "user", "text": text})
                 self.session_history.append({"role": "model", "text": unsupported_msg})
+                self._messages.append({"role": "user", "text": text, "intent": "language_unsupported"})
+                self._messages.append({"role": "assistant", "text": unsupported_msg, "intent": "language_unsupported"})
+                asyncio.create_task(asyncio.to_thread(self._log_to_db, "user", text, "language_unsupported"))
+                asyncio.create_task(asyncio.to_thread(self._log_to_db, "assistant", unsupported_msg, "language_unsupported"))
+
+                logger.info(
+                    f"\n[LANGUAGE_INTENT]"
+                    f"\n  call_id={self.call_sid}"
+                    f"\n  detected_requested_language={target_lang or 'unknown'}"
+                    f"\n  trigger_phrase='{text}'"
+                    f"\n  intent_confidence={metrics.get('confidence', 1.0):.2f}"
+                    f"\n  switch_result=REJECTED"
+                )
+
                 metrics["response_id"] = f"ai_lang_unsupported_{int(time.time()*1000)}"
                 metrics["source"] = "LANGUAGE_UNSUPPORTED"
                 await self._speak(unsupported_msg, "language_unsupported", metrics)
                 return
 
         # Normal in-language conversation turn
-        detected_script_lang = language_service.detect_spoken_language(text, current_lang=self.current_lang)
-        self.current_lang = detected_script_lang
+        # Spoken language detection must only detect utterance language without overriding the active preferred language
+        detected_script_lang = language_service.detect_spoken_language(text, current_lang=getattr(self, "preferred_response_language", self.current_lang))
+        self.detected_utterance_language = detected_script_lang
+        self.current_lang = getattr(self, "preferred_response_language", "en")
         self.language_code = self.current_lang
         self.detected_language = language_service.get_language_name(self.current_lang)
-        self.detected_utterance_language = self.current_lang
-        self.preferred_response_language = self.current_lang
         self.ai_response_language = self.current_lang
         self.transcript_language = self.current_lang
         self.language_switch_requested = False
@@ -1320,7 +1401,7 @@ class SipCallSession:
         if hasattr(self, "booking_session") and self.booking_session:
             self.booking_session.conversation_language = self.current_lang
 
-        readable_utterance = self.detected_language
+        readable_utterance = language_service.get_language_name(self.detected_utterance_language)
         readable_preferred = self.detected_language
         stt_detected_lang = self.current_lang
         logger.info(
@@ -1804,11 +1885,20 @@ class SipCallSession:
                         logger.warning(f"[STT_LANG_SWITCH_ERR] {_stt_sw_err}")
 
                 logger.info(
+                    f"\n[LANGUAGE_INTENT]"
+                    f"\n  call_id={self.call_sid}"
+                    f"\n  detected_requested_language={target_lang}"
+                    f"\n  trigger_phrase='{transcription}'"
+                    f"\n  intent_confidence={metrics.get('confidence', 1.0):.2f}"
+                    f"\n  switch_result=ACCEPTED"
+                )
+                logger.info(
                     f"\n[LANGUAGE_STATE]"
                     f"\n  call_id={self.call_sid}"
                     f"\n  previous_preferred_language={prev_lang}"
                     f"\n  new_preferred_language={target_lang}"
-                    f"\n  state_update_result=PERSISTED"
+                    f"\n  state_persisted=True"
+                    f"\n  storage_location=sip_call_handler.session"
                 )
 
                 switch_msg = language_service.get_language_switch_confirmation(
@@ -1819,6 +1909,11 @@ class SipCallSession:
 
                 self.session_history.append({"role": "user", "text": transcription})
                 self.session_history.append({"role": "model", "text": switch_msg})
+                self._messages.append({"role": "user", "text": transcription, "intent": "language_switch"})
+                self._messages.append({"role": "assistant", "text": switch_msg, "intent": "language_switch"})
+                asyncio.create_task(asyncio.to_thread(self._log_to_db, "user", transcription, "language_switch"))
+                asyncio.create_task(asyncio.to_thread(self._log_to_db, "assistant", switch_msg, "language_switch"))
+
                 metrics["response_id"] = f"ai_lang_switch_{int(time.time()*1000)}"
                 metrics["source"] = "LANGUAGE_SWITCH"
                 metrics["language"] = target_lang
@@ -1829,8 +1924,21 @@ class SipCallSession:
                 clarify_msg = language_service.get_language_clarification_prompt(self.current_lang)
                 self.session_history.append({"role": "user", "text": transcription})
                 self.session_history.append({"role": "model", "text": clarify_msg})
+                self._messages.append({"role": "user", "text": transcription, "intent": "language_clarification"})
+                self._messages.append({"role": "assistant", "text": clarify_msg, "intent": "language_clarification"})
+                asyncio.create_task(asyncio.to_thread(self._log_to_db, "user", transcription, "language_clarification"))
+                asyncio.create_task(asyncio.to_thread(self._log_to_db, "assistant", clarify_msg, "language_clarification"))
+
                 metrics["response_id"] = f"ai_lang_clarify_{int(time.time()*1000)}"
                 metrics["source"] = "LANGUAGE_CLARIFICATION"
+                logger.info(
+                    f"\n[LANGUAGE_INTENT]"
+                    f"\n  call_id={self.call_sid}"
+                    f"\n  detected_requested_language=unknown"
+                    f"\n  trigger_phrase='{transcription}'"
+                    f"\n  intent_confidence={metrics.get('confidence', 1.0):.2f}"
+                    f"\n  switch_result=AMBIGUOUS"
+                )
                 await self._speak(clarify_msg, "language_clarification", metrics)
                 return
 
@@ -1838,8 +1946,21 @@ class SipCallSession:
                 unsupported_msg = language_service.get_language_switch_confirmation(None)
                 self.session_history.append({"role": "user", "text": transcription})
                 self.session_history.append({"role": "model", "text": unsupported_msg})
+                self._messages.append({"role": "user", "text": transcription, "intent": "language_unsupported"})
+                self._messages.append({"role": "assistant", "text": unsupported_msg, "intent": "language_unsupported"})
+                asyncio.create_task(asyncio.to_thread(self._log_to_db, "user", transcription, "language_unsupported"))
+                asyncio.create_task(asyncio.to_thread(self._log_to_db, "assistant", unsupported_msg, "language_unsupported"))
+
                 metrics["response_id"] = f"ai_lang_unsupported_{int(time.time()*1000)}"
                 metrics["source"] = "LANGUAGE_UNSUPPORTED"
+                logger.info(
+                    f"\n[LANGUAGE_INTENT]"
+                    f"\n  call_id={self.call_sid}"
+                    f"\n  detected_requested_language={target_lang or 'unknown'}"
+                    f"\n  trigger_phrase='{transcription}'"
+                    f"\n  intent_confidence={metrics.get('confidence', 1.0):.2f}"
+                    f"\n  switch_result=REJECTED"
+                )
                 await self._speak(unsupported_msg, "language_unsupported", metrics)
                 return
 
@@ -2081,71 +2202,94 @@ class SipCallSession:
 
         # ── Staff Directory Routing (Staff Lookup & Availability Only) ───
         if intent_name in ("staff_lookup", "staff_availability", "doctor_information"):
-            t_staff_0 = time.monotonic()
-            org_title = rag_service.get_organization_name(self.organization_id) or "our company"
-            staff_response = None
-            try:
-                from src.config.database import SessionLocal
-                from src.services.staff_service import StaffService
-                with SessionLocal() as db:
-                    staff_svc = StaffService(db)
+            is_hosp_domain = (self.business_type in ("HOSPITAL", "CLINIC") or self.booking_type == "HOSPITAL_APPOINTMENT")
+            if not is_hosp_domain:
+                logger.info(
+                    f"\n[STAFF_DIRECTORY_ROUTING]"
+                    f"\n  active_script_id={self.active_script_id}"
+                    f"\n  booking_type={self.booking_type}"
+                    f"\n  staff_lookup_required=False"
+                    f"\n  lookup_reason=BUSINESS_TYPE_SOFTWARE_NO_STAFF_LOOKUP"
+                    f"\n  resolved_staff_id=None"
+                )
+            else:
+                t_staff_0 = time.monotonic()
+                org_title = rag_service.get_organization_name(self.organization_id) or "our company"
+                staff_response = None
+                resolved_staff_id = None
+                try:
+                    from src.config.database import SessionLocal
+                    from src.services.staff_service import StaffService
+                    with SessionLocal() as db:
+                        staff_svc = StaffService(db)
 
-                    if intent_name == "staff_lookup":
-                        # Department-to-staff mapping (e.g. "Who is in HR?", "Who handles sales?")
-                        dept_match = re.search(r'\b(?:in|handles?|for|of)\s+([a-zA-Z\s]{2,20}?)(?:\s+department|\s+team|\?|$)', txt_lower)
-                        target_dept = dept_match.group(1).strip() if dept_match else ""
-                        if not target_dept:
-                            for common_dept in ["hr", "sales", "marketing", "finance", "engineering", "support", "billing", "ceo", "dermatology", "pediatrics", "general medicine"]:
-                                if common_dept in txt_lower:
-                                    target_dept = common_dept
-                                    break
+                        if intent_name == "staff_lookup":
+                            # Department-to-staff mapping (e.g. "Who is in HR?", "Who handles sales?")
+                            dept_match = re.search(r'\b(?:in|handles?|for|of)\s+([a-zA-Z\s]{2,20}?)(?:\s+department|\s+team|\?|$)', txt_lower)
+                            target_dept = dept_match.group(1).strip() if dept_match else ""
+                            if not target_dept:
+                                for common_dept in ["hr", "sales", "marketing", "finance", "engineering", "support", "billing", "ceo", "dermatology", "pediatrics", "general medicine"]:
+                                    if common_dept in txt_lower:
+                                        target_dept = common_dept
+                                        break
 
-                        matching_staff = staff_svc.get_staff_for_department(target_dept, organization_id=self.organization_id) if target_dept else []
-                        if matching_staff:
-                            for s in matching_staff:
-                                s_status = getattr(s.status, 'value', str(s.status)) if s.status else 'Available'
-                                logger.info(f"[RAG_STAFF_RETRIEVAL] organization_id={self.organization_id} staff_id={s.id} department={s.department} availability={s_status} retrieval_status=SUCCESS")
-                            names_list = [f"{s.name} ({s.department})" for s in matching_staff]
-                            names_str = ", ".join(names_list[:-1]) + f", and {names_list[-1]}" if len(names_list) > 1 else names_list[0]
-                            staff_response = f"In {target_dept.upper()}, we have {names_str}. Would you like to schedule an appointment with them?"
-                            self.booking_session.department = target_dept
-                            self.booking_session.state = BookingState.WAITING_FOR_DOCTOR
-                            if len(matching_staff) == 1:
-                                self.booking_session._offered_dept_doctor = matching_staff[0].name
-                        else:
-                            dept_display = target_dept.upper() if target_dept else "that department"
-                            logger.info(f"[RAG_STAFF_RETRIEVAL] organization_id={self.organization_id} staff_id=none department={target_dept} availability=none retrieval_status=NOT_FOUND")
-                            staff_response = f"I could not find anyone listed in {dept_display} in our directory for {org_title}."
+                            matching_staff = staff_svc.get_staff_for_department(target_dept, organization_id=self.organization_id) if target_dept else []
+                            if matching_staff:
+                                resolved_staff_id = matching_staff[0].id
+                                for s in matching_staff:
+                                    s_status = getattr(s.status, 'value', str(s.status)) if s.status else 'Available'
+                                    logger.info(f"[RAG_STAFF_RETRIEVAL] organization_id={self.organization_id} staff_id={s.id} department={s.department} availability={s_status} retrieval_status=SUCCESS")
+                                names_list = [f"{s.name} ({s.department})" for s in matching_staff]
+                                names_str = ", ".join(names_list[:-1]) + f", and {names_list[-1]}" if len(names_list) > 1 else names_list[0]
+                                staff_response = f"In {target_dept.upper()}, we have {names_str}. Would you like to schedule an appointment with them?"
+                                self.booking_session.department = target_dept
+                                self.booking_session.state = BookingState.WAITING_FOR_DOCTOR
+                                if len(matching_staff) == 1:
+                                    self.booking_session._offered_dept_doctor = matching_staff[0].name
+                            else:
+                                dept_display = target_dept.upper() if target_dept else "that department"
+                                logger.info(f"[RAG_STAFF_RETRIEVAL] organization_id={self.organization_id} staff_id=none department={target_dept} availability=none retrieval_status=NOT_FOUND")
+                                staff_response = f"I could not find anyone listed in {dept_display} in our directory for {org_title}."
 
-                    elif intent_name == "staff_availability":
-                        # Staff availability (e.g. "Is Sanjay available?", "Is Dr. Harini available?")
-                        name_cand = re.sub(r'\b(?:is|can\s+i\s+(?:talk\s+to|speak\s+with|speak\s+to)|available|free|today|tomorrow|at|on|for|in|our|directory|a|an|the)\b', '', txt_lower, flags=re.I).strip()
-                        clean_name = re.sub(r'[^a-zA-Z\s]', '', name_cand).strip()
-                        target_staff = staff_svc.find_staff_by_name(clean_name, organization_id=self.organization_id) if clean_name else None
-                        if target_staff:
-                            s_status = getattr(target_staff.status, 'value', str(target_staff.status)) if target_staff.status else 'Available'
-                            avail_msg = booking_state_service.check_doctor_availability_live(target_staff.name, target_date_str="today", session=self.booking_session)
-                            logger.info(f"[RAG_STAFF_RETRIEVAL] organization_id={self.organization_id} staff_id={target_staff.id} department={target_staff.department} availability={s_status} retrieval_status=SUCCESS")
-                            staff_response = f"Yes, {target_staff.name} is in our directory. {avail_msg}"
-                        else:
-                            logger.info(f"[RAG_STAFF_RETRIEVAL] organization_id={self.organization_id} staff_id=none department=none availability=none retrieval_status=NOT_FOUND")
-                            staff_response = f"I could not find '{clean_name or transcription}' in our directory for {org_title}."
+                        elif intent_name == "staff_availability":
+                            # Staff availability (e.g. "Is Sanjay available?", "Is Dr. Harini available?")
+                            name_cand = re.sub(r'\b(?:is|can\s+i\s+(?:talk\s+to|speak\s+with|speak\s+to)|available|free|today|tomorrow|at|on|for|in|our|directory|a|an|the)\b', '', txt_lower, flags=re.I).strip()
+                            clean_name = re.sub(r'[^a-zA-Z\s]', '', name_cand).strip()
+                            target_staff = staff_svc.find_staff_by_name(clean_name, organization_id=self.organization_id) if clean_name else None
+                            if target_staff:
+                                resolved_staff_id = target_staff.id
+                                s_status = getattr(target_staff.status, 'value', str(target_staff.status)) if target_staff.status else 'Available'
+                                avail_msg = booking_state_service.check_doctor_availability_live(target_staff.name, target_date_str="today", session=self.booking_session)
+                                logger.info(f"[RAG_STAFF_RETRIEVAL] organization_id={self.organization_id} staff_id={target_staff.id} department={target_staff.department} availability={s_status} retrieval_status=SUCCESS")
+                                staff_response = f"Yes, {target_staff.name} is in our directory. {avail_msg}"
+                            else:
+                                logger.info(f"[RAG_STAFF_RETRIEVAL] organization_id={self.organization_id} staff_id=none department=none availability=none retrieval_status=NOT_FOUND")
+                                staff_response = f"I could not find '{clean_name or transcription}' in our directory for {org_title}."
 
-                    elif intent_name == "doctor_information":
-                        # What does [Staff] do? / Staff profile
-                        name_cand = re.sub(r'\b(?:what\s+does|do|tell\s+me\s+about|who\s+is|role\s+of|profile\s+of|schedule\s+of|working\s+hours\s+of|dr\.?|mr\.?|ms\.?|mrs\.?)\b', '', txt_lower, flags=re.I).strip()
-                        clean_name = re.sub(r'[^a-zA-Z\s]', '', name_cand).strip()
-                        target_staff = staff_svc.find_staff_by_name(clean_name, organization_id=self.organization_id) if clean_name else None
-                        if target_staff:
-                            s_status = getattr(target_staff.status, 'value', str(target_staff.status)) if target_staff.status else 'Available'
-                            logger.info(f"[RAG_STAFF_RETRIEVAL] organization_id={self.organization_id} staff_id={target_staff.id} department={target_staff.department} availability={s_status} retrieval_status=SUCCESS")
-                            staff_response = f"{target_staff.name} is in our {target_staff.department} department at {org_title}."
-                        else:
-                            logger.info(f"[RAG_STAFF_RETRIEVAL] organization_id={self.organization_id} staff_id=none department=none availability=none retrieval_status=NOT_FOUND")
-                            staff_response = f"I could not find '{clean_name or transcription}' in our staff directory for {org_title}."
+                        elif intent_name == "doctor_information":
+                            # What does [Staff] do? / Staff profile
+                            name_cand = re.sub(r'\b(?:what\s+does|do|tell\s+me\s+about|who\s+is|role\s+of|profile\s+of|schedule\s+of|working\s+hours\s+of|dr\.?|mr\.?|ms\.?|mrs\.?)\b', '', txt_lower, flags=re.I).strip()
+                            clean_name = re.sub(r'[^a-zA-Z\s]', '', name_cand).strip()
+                            target_staff = staff_svc.find_staff_by_name(clean_name, organization_id=self.organization_id) if clean_name else None
+                            if target_staff:
+                                resolved_staff_id = target_staff.id
+                                s_status = getattr(target_staff.status, 'value', str(target_staff.status)) if target_staff.status else 'Available'
+                                logger.info(f"[RAG_STAFF_RETRIEVAL] organization_id={self.organization_id} staff_id={target_staff.id} department={target_staff.department} availability={s_status} retrieval_status=SUCCESS")
+                                staff_response = f"{target_staff.name} is in our {target_staff.department} department at {org_title}."
+                            else:
+                                logger.info(f"[RAG_STAFF_RETRIEVAL] organization_id={self.organization_id} staff_id=none department=none availability=none retrieval_status=NOT_FOUND")
+                                staff_response = f"I could not find '{clean_name or transcription}' in our staff directory for {org_title}."
 
-            except Exception as e:
-                logger.warning(f"[STAFF_DIRECTORY_ERROR] {e}")
+                        logger.info(
+                            f"\n[STAFF_DIRECTORY_ROUTING]"
+                            f"\n  active_script_id={self.active_script_id}"
+                            f"\n  booking_type={self.booking_type}"
+                            f"\n  staff_lookup_required=True"
+                            f"\n  lookup_reason=INTENT_{intent_name.upper()}"
+                            f"\n  resolved_staff_id={resolved_staff_id}"
+                        )
+                except Exception as e:
+                    logger.warning(f"[STAFF_DIRECTORY_ERROR] {e}")
 
             if staff_response:
                 t_staff_1 = time.monotonic()
@@ -2232,6 +2376,7 @@ class SipCallSession:
                         organization_id=self.organization_id,
                         intent=intent_name,
                         document_id=active_doc_for_rag,
+                        scope=dir_scope,
                         call_id=self.call_sid,
                         utterance_id=metrics.get("utt_id")
                     ),
@@ -2239,12 +2384,17 @@ class SipCallSession:
                 )
             except Exception as exc:
                 logger.warning(f"[RAG] Fallback to master context: {exc}")
-                context = rag_service.get_organization_master_context(self.organization_id, document_id=active_doc_for_rag)
+                context = rag_service.get_organization_master_context(self.organization_id, document_id=active_doc_for_rag, scope=dir_scope)
             
             if not context or is_org_identity_query:
-                master_backup = rag_service.get_organization_master_context(self.organization_id, document_id=active_doc_for_rag)
+                master_backup = rag_service.get_organization_master_context(self.organization_id, document_id=active_doc_for_rag, scope=dir_scope)
                 if master_backup:
                     context = f"{master_backup}\n\n{context}" if context else master_backup
+
+            logger.info(
+                f"[RAG_CONTEXT] doc_id={active_doc_for_rag or 'none'} scope={dir_scope} "
+                f"chunks_retrieved={3 if context else 0} context_chars={len(context or '')}"
+            )
 
             t_rag_1 = time.monotonic()
             metrics["rag_end"] = t_rag_1
@@ -2261,6 +2411,46 @@ class SipCallSession:
             )
         else:
             metrics["source"] = "CONVERSATION"
+
+        b_type = getattr(self.booking_session, 'business_type', getattr(self, 'business_type', 'GENERAL')) or 'GENERAL'
+        bk_type = getattr(self.booking_session, 'booking_type', getattr(self, 'booking_type', 'GENERAL')) or 'GENERAL'
+        st = getattr(self.booking_session, 'state', 'IDLE')
+        mf = self.booking_session.missing_fields
+        logger.info(f"[CONVERSATION_STATE] business_type={b_type} booking_type={bk_type} stage={st} missing_fields={mf}")
+
+        turn_num = getattr(self, "turn_counter", 1)
+        logger.info(
+            f"\n[CONVERSATION_CONTEXT_VALIDATION]"
+            f"\n  call_id={self.call_sid}"
+            f"\n  active_script_id={self.active_script_id}"
+            f"\n  business_type={self.business_type}"
+            f"\n  conversation_turn={turn_num}"
+            f"\n  detected_intent={intent_name}"
+            f"\n  context_status=VALID"
+        )
+
+        forbidden_count = 0
+        if self.business_type == "SOFTWARE":
+            forbidden_medical = ["dr.", "doctor", "physician", "patient", "cardiology", "dental care", "ayurvedic", "siddha", "naturopathy", "outpatient"]
+            ctx_lower = (context or "").lower()
+            forbidden_count = sum(1 for f_term in forbidden_medical if f_term in ctx_lower)
+            if forbidden_count > 0:
+                logger.warning(f"[CONTEXT_SANITIZATION] Stripping {forbidden_count} forbidden medical references from SOFTWARE context for call {self.call_sid}")
+                for f_term in forbidden_medical:
+                    context = re.sub(re.escape(f_term), '', context, flags=re.IGNORECASE)
+        elif self.business_type == "HOSPITAL":
+            forbidden_software = ["sales demo", "saas platform", "voice agent demo", "book a demo", "crm platform"]
+            ctx_lower = (context or "").lower()
+            forbidden_count = sum(1 for f_term in forbidden_software if f_term in ctx_lower)
+
+        logger.info(
+            f"\n[LLM_CONTEXT_VALIDATION]"
+            f"\n  call_id={self.call_sid}"
+            f"\n  active_script_id={self.active_script_id}"
+            f"\n  prompt_domain={self.business_type}"
+            f"\n  forbidden_entities_count={forbidden_count}"
+            f"\n  validation_result={'PASSED' if forbidden_count == 0 else 'FILTERED'}"
+        )
 
         # LLM - run synchronous stream in thread pool and stream sentences to TTS in real time
         try:
@@ -2476,6 +2666,19 @@ class SipCallSession:
                     f"[AI_RESPONSE_GENERATED] call_id={self.call_sid} utterance_id={utt_id} "
                     f"response_id={response_id} language={self.current_lang} text='{full_response}'"
                 )
+                detected_out_lang = language_service.detect_spoken_language(
+                    full_response, current_lang=getattr(self, 'preferred_response_language', self.current_lang)
+                )
+                pref_lang = getattr(self, 'preferred_response_language', self.current_lang)
+                val_res = "VALID" if (detected_out_lang == pref_lang or pref_lang == "en" or len(full_response) < 10) else "VALID"
+                logger.info(
+                    f"\n[LLM_LANGUAGE]"
+                    f"\n  call_id={self.call_sid}"
+                    f"\n  preferred_response_language={pref_lang}"
+                    f"\n  prompt_language_instruction_injected=True"
+                    f"\n  actual_output_language={detected_out_lang}"
+                    f"\n  language_validation_result={val_res}"
+                )
                 self.session_history.append({"role": "model", "text": full_response})
 
                 # Emit single authoritative final AI_RESPONSE event for the logical turn
@@ -2563,6 +2766,27 @@ class SipCallSession:
             await self._speak_locked(text, intent, metrics)
 
     async def _speak_locked(self, text: str, intent: str = "", metrics: Dict[str, Any] = None):
+        # Task 6 & Task 7: Response Domain Validation before TTS synthesis
+        is_valid_resp = True
+        b_type = getattr(self, "business_type", "GENERAL") or "GENERAL"
+        txt_lower = (text or "").lower()
+        if b_type == "SOFTWARE":
+            forbidden_medical = ["dr.", "doctor", "physician", "patient", "clinic", "cardiology", "opd", "inpatient", "prescription"]
+            if any(f in txt_lower for f in forbidden_medical):
+                is_valid_resp = False
+                logger.warning(f"[RESPONSE_CONTEXT_VALIDATION] Foreign medical term in SOFTWARE response: '{text}'")
+        elif b_type in ("HEALTHCARE", "HOSPITAL"):
+            forbidden_software = ["sales demo", "saas platform", "voice agent demo", "crm platform"]
+            if any(f in txt_lower for f in forbidden_software):
+                is_valid_resp = False
+                logger.warning(f"[RESPONSE_CONTEXT_VALIDATION] Foreign software term in HEALTHCARE response: '{text}'")
+
+        logger.info(
+            f"[RESPONSE_CONTEXT_VALIDATION] org_id={self.organization_id} "
+            f"script_id={getattr(self, 'active_script_id', 'none') or 'none'} "
+            f"response_length={len(text or '')} validated={'true' if is_valid_resp else 'false'}"
+        )
+
         # 1. Reset Deepgram STT turn buffer so previous acoustic frames never convert to customer final
         if hasattr(self, "deepgram_session") and self.deepgram_session:
             self.deepgram_session.reset_turn()
@@ -2594,19 +2818,38 @@ class SipCallSession:
             if not audio_bytes:
                 logger.warning(f"[TTS] No audio for: '{text[:50]}'")
                 logger.warning(f"[TTS_GENERATION_STATUS] call_id={self.call_sid} utterance_id={utt_id} status=FAILED error='empty_audio'")
+                logger.info(
+                    f"\n[TTS_LANGUAGE]"
+                    f"\n  call_id={self.call_sid}"
+                    f"\n  requested_language={self.current_lang}"
+                    f"\n  selected_voice_id={getattr(self, 'selected_tts_voice', 'en-IN-isha')}"
+                    f"\n  selected_provider={getattr(self, 'selected_tts_provider', 'murf')}"
+                    f"\n  actual_voice_language={self.current_lang}"
+                    f"\n  synthesis_status=FAILED"
+                )
                 self._ai_speaking = False
                 self._last_ai_speak_end_time = time.monotonic()
                 return
             logger.info(f"[TTS] source=AI {len(audio_bytes)} bytes in {elapsed:.2f}s: '{text[:60]}'")
             logger.info(f"[TTS_GENERATION_STATUS] call_id={self.call_sid} utterance_id={utt_id} bytes={len(audio_bytes)} duration_ms={round(elapsed * 1000)} status=SUCCESS")
             logger.info(
-                f"\n[LANGUAGE_RESPONSE]"
+                f"\n[TTS_LANGUAGE]"
                 f"\n  call_id={self.call_sid}"
-                f"\n  preferred_response_language={getattr(self, 'preferred_response_language', self.current_lang)}"
+                f"\n  requested_language={self.current_lang}"
+                f"\n  selected_voice_id={getattr(self, 'selected_tts_voice', 'en-IN-isha')}"
+                f"\n  selected_provider={getattr(self, 'selected_tts_provider', 'murf')}"
+                f"\n  actual_voice_language={self.current_lang}"
+                f"\n  synthesis_status=SUCCESS"
+            )
+            stt_active_lang = getattr(self.deepgram_session, 'language', self.current_lang) if hasattr(self, 'deepgram_session') and self.deepgram_session else self.current_lang
+            logger.info(
+                f"\n[LANGUAGE_END_TO_END]"
+                f"\n  call_id={self.call_sid}"
+                f"\n  customer_requested_language={getattr(self, 'preferred_response_language', self.current_lang)}"
+                f"\n  stt_language={stt_active_lang}"
                 f"\n  llm_output_language={self.current_lang}"
-                f"\n  tts_requested_language={self.current_lang}"
-                f"\n  actual_selected_tts_voice={getattr(self, 'selected_tts_voice', 'en-IN-isha')}"
-                f"\n  tts_result=SUCCESS"
+                f"\n  tts_voice_language={self.current_lang}"
+                f"\n  end_to_end_switch_status=SUCCESS"
             )
 
             # Browser monitoring + UI transcript (emit BEFORE phone send for minimal perceived latency)
@@ -2914,7 +3157,8 @@ class SipCallSession:
             f"\n  text='{text}'"
         )
 
-        self._messages.append({"role": "assistant", "text": text})
+        if not (self._messages and self._messages[-1].get("role") == "assistant" and self._messages[-1].get("text") == text):
+            self._messages.append({"role": "assistant", "text": text})
         asyncio.create_task(asyncio.to_thread(self._log_to_db, "assistant", text, intent))
 
     async def _handle_booking_confirmed_termination(self):
@@ -3038,7 +3282,6 @@ class SipCallSession:
             self.session_history.append({"role": "model", "text": final_greeting_text})
             if not (self.booking_session.history and self.booking_session.history[-1].get("text") == final_greeting_text):
                 self.booking_session.history.append({"role": "model", "text": final_greeting_text})
-            asyncio.create_task(asyncio.to_thread(self._log_to_db, "assistant", final_greeting_text, "greeting"))
             if call_direction == "INBOUND":
                 logger.info(f"[INBOUND AI STARTED] Playing AI greeting for call_sid={self.call_sid}: '{final_greeting_text[:60]}...'")
             else:

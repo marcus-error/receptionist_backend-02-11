@@ -27,12 +27,9 @@ DEFAULT_SIMILARITY_THRESHOLD = 0.15
 
 NON_RAG_INTENTS = {
     "greeting",
-    "general_conversation",
     "goodbye",
     "emergency/urgent request",
-    "transfer request",
-    "appointment_booking",
-    "appointment"
+    "transfer request"
 }
 
 CONVERSATIONAL_PHRASES = {
@@ -173,15 +170,27 @@ class RagService:
     def is_rag_needed(self, intent: Optional[str] = None, text: Optional[str] = None) -> bool:
         """
         Determines whether RAG search is required for the user message.
-        Bypasses RAG for simple greetings, pure pleasantries, personal entity introductions, and goodbyes.
+        Bypasses RAG strictly for pure greetings, pure pleasantries, personal entity introductions, and goodbyes.
         """
-        if intent and intent.lower().strip() in NON_RAG_INTENTS:
-            return False
-
         if text:
             txt_clean = text.lower().strip()
             clean_words = re.sub(r'[^a-zA-Z\s]', '', txt_clean).strip()
-            if clean_words in CONVERSATIONAL_PHRASES or (len(clean_words.split()) <= 2 and clean_words in CONVERSATIONAL_PHRASES):
+            words_list = clean_words.split()
+
+            # Business / Informational keywords ALWAYS require RAG, regardless of intent!
+            business_keywords = {
+                "what", "who", "which", "where", "when", "why", "how", "tell",
+                "product", "products", "service", "services", "feature", "features",
+                "offer", "offers", "offering", "pricing", "price", "cost", "fee", "demo",
+                "booking", "book", "appointment", "schedule", "doctor", "department",
+                "hospital", "software", "solution", "solutions", "work", "do",
+                "about", "info", "information", "can you", "could you", "help",
+                "agent", "ai", "crm", "erp", "hrms", "payroll", "tracking", "survey"
+            }
+            if any(w in business_keywords for w in words_list):
+                return True
+
+            if clean_words in CONVERSATIONAL_PHRASES or (len(words_list) <= 2 and clean_words in CONVERSATIONAL_PHRASES):
                 return False
 
             # Bypass RAG for personal name declarations (e.g. "My name is Mugilan", "I'm Mugilan", "Mugilan Viswanathan")
@@ -191,10 +200,13 @@ class RagService:
 
             # Bypass RAG for raw phone numbers or spoken email responses
             digits = re.sub(r'[^\d]', '', txt_clean)
-            if len(digits) >= 7 and len(txt_clean.split()) <= 4:
+            if len(digits) >= 7 and len(words_list) <= 4:
                 return False
             if "@" in txt_clean or "dot com" in txt_clean:
                 return False
+
+        if intent and intent.lower().strip() in NON_RAG_INTENTS:
+            return False
 
         return True
 
@@ -216,6 +228,8 @@ class RagService:
             self._rag_query_cache.clear()
         if hasattr(self, "_doc_version_cache"):
             self._doc_version_cache.clear()
+        if hasattr(self, "_script_metadata_cache"):
+            self._script_metadata_cache.clear()
         logger.info("[RAG SERVICE] In-memory RAG, context, and greeting caches cleared.")
 
     def clear_organization_cache(self, organization_id: Optional[int] = None):
@@ -600,6 +614,7 @@ class RagService:
         result = {
             "active_script_id": active_doc_id,
             "active_script_name": doc_title,
+            "script_version": doc_version or "1",
             "business_name": business_name,
             "business_type": business_type,
             "booking_type": booking_type,
@@ -607,6 +622,13 @@ class RagService:
             "permitted_services": permitted_services,
             "content_length": len(doc_content),
         }
+        logger.info(
+            f"[ACTIVE_SCRIPT_RESOLUTION] org_id={organization_id or 'none'} "
+            f"script_id={active_doc_id or 'none'} "
+            f"title='{doc_title or 'none'}' "
+            f"business_type={business_type or 'GENERAL'} "
+            f"booking_type={booking_type or 'GENERAL'}"
+        )
         self._script_metadata_cache[cache_key] = result
         return result
 
@@ -1582,6 +1604,7 @@ class RagService:
                 line_clean = re.sub(r'[^\x20-\x7E]', ' ', sub_line).strip()
                 clean = re.sub(r'^(?:[-*•\d\.]+\s*)+', '', line_clean).strip()
                 clean = re.sub(r'[:\(\[\{].*$', '', clean).strip().replace('*', '').strip()
+                clean = re.sub(r'\bAi\b', 'AI', clean)
                 c_lower = clean.lower()
                 if not clean or len(clean) < 2 or len(clean) > 50 or c_lower in seen:
                     continue
@@ -1620,6 +1643,18 @@ class RagService:
         # 3. Product definition lines (e.g., "Galaxy Chat is the text-based conversational AI product")
         for m in re.finditer(r'\b([A-Z][a-zA-Z0-9]+(?:\s+[A-Z][a-zA-Z0-9]+){0,3})\s+is\s+(?:the|an|our|a)\s+[^.\n]*(?:product|software|platform|system|application|service|tool)\b', master_ctx):
             add_item(m.group(1))
+
+        # 4. Product catalog section titles
+        for m_prod in re.finditer(r'^(?:AI Voice Agents|Galaxy Chat|AI Knowledge Management Platform|Business Automation and AI Agents|Business Applications|Websites and Web Applications|Custom Software and Integrations)\b', master_ctx, re.MULTILINE | re.IGNORECASE):
+            add_item(m_prod.group(0))
+
+        # 5. Product names from script chunk indexes or greeting ("I can help with X, Y, and Z")
+        m_help = re.search(r'(?:I can help with|help with|we provide|we offer)\s+([^.\n]+?)(?:\.|\?|\!|\s+May I|\n|$)', master_ctx, re.IGNORECASE)
+        if m_help:
+            for part in re.split(r'[,;•\n]|(?:\s+and\s+)', m_help.group(1)):
+                clean_p = part.strip().title()
+                if 3 <= len(clean_p) <= 40:
+                    add_item(clean_p)
 
         return services
 
@@ -1737,6 +1772,7 @@ class RagService:
         Strict multi-tenant & active document filtering with post-retrieval metadata verification.
         """
         t_start = time.monotonic()
+        scope = scope or "inbound"
         org_id_val = int(organization_id) if organization_id is not None else None
         active_doc_id = self._resolve_active_document_id(org_id_val, document_id, scope=scope)
 
@@ -1759,6 +1795,7 @@ class RagService:
                 f"\n  context_length={len(master_ctx)}"
                 f"\n  latency_ms={elapsed_ms}"
             )
+            logger.info(f"[RAG_CONTEXT] doc_id={active_doc_id or 'none'} scope={scope} chunks_retrieved=0 context_chars={len(master_ctx)}")
             return master_ctx
 
         # STRICT ISOLATION: A tenant with no eligible active document receives NO context and never falls back
@@ -1778,6 +1815,7 @@ class RagService:
                         f"\n  context_length={len(staff_ctx)}"
                         f"\n  latency_ms={elapsed_ms}"
                     )
+                    logger.info(f"[RAG_CONTEXT] doc_id=none scope={scope} chunks_retrieved=staff_directory context_chars={len(staff_ctx)}")
                     return staff_ctx
 
             elapsed_ms = round((time.monotonic() - t_start) * 1000)
@@ -1787,6 +1825,7 @@ class RagService:
                 f"\n  context_length=0"
                 f"\n  latency_ms={elapsed_ms}"
             )
+            logger.info(f"[RAG_CONTEXT] doc_id=none scope={scope} chunks_retrieved=0 context_chars=0")
             return ""
 
         if not self.is_rag_needed(intent=intent, text=query):
@@ -1796,6 +1835,7 @@ class RagService:
                 f"\n  context_length=0"
                 f"\n  latency_ms={round((time.monotonic() - t_start) * 1000)}"
             )
+            logger.info(f"[RAG_CONTEXT] doc_id={active_doc_id or 'none'} scope={scope} chunks_retrieved=0 context_chars=0")
             return ""
 
         search_query = query.strip()
@@ -1905,6 +1945,7 @@ class RagService:
         clean_docs = []
         valid_metas = []
         valid_dists = []
+        rejected_foreign_context_count = 0
         for d, m, dist in zip(docs, metas, dists):
             if d and str(d).strip():
                 m_dict = m or {}
@@ -1912,6 +1953,7 @@ class RagService:
                 # ── POST-RETRIEVAL CHUNK METADATA VALIDATION (DEFENSE-IN-DEPTH) ──
                 # 1. Enforce active usage status
                 if str(m_dict.get("ai_usage", "Active")).strip().lower() == "inactive":
+                    rejected_foreign_context_count += 1
                     logger.debug(f"[RAG ISOLATION] Rejected inactive chunk: {m_dict.get('chunk_index')}")
                     continue
 
@@ -1919,6 +1961,7 @@ class RagService:
                 if org_id_val is not None:
                     chunk_org = str(m_dict.get("organization_id", "")).strip()
                     if chunk_org != str(org_id_val):
+                        rejected_foreign_context_count += 1
                         logger.warning(
                             f"[RAG ISOLATION LEAK PREVENTED] Rejected chunk belonging to org '{chunk_org}' for requested tenant org {org_id_val}"
                         )
@@ -1926,6 +1969,7 @@ class RagService:
                 elif scope == "superadmin_assistant":
                     chunk_org = str(m_dict.get("organization_id", "")).strip()
                     if chunk_org != "super_admin":
+                        rejected_foreign_context_count += 1
                         logger.warning(
                             f"[RAG ISOLATION LEAK PREVENTED] Rejected non-superadmin chunk from org '{chunk_org}' for superadmin assistant"
                         )
@@ -1935,6 +1979,7 @@ class RagService:
                 if active_doc_id:
                     chunk_doc = str(m_dict.get("document_id", "")).strip()
                     if chunk_doc != str(active_doc_id):
+                        rejected_foreign_context_count += 1
                         logger.warning(
                             f"[RAG ISOLATION LEAK PREVENTED] Rejected chunk from doc '{chunk_doc}' instead of active doc {active_doc_id}"
                         )
@@ -1946,8 +1991,10 @@ class RagService:
                     chunk_scope = str(m_dict.get("scope", "")).lower()
                     chunk_type = str(m_dict.get("document_type", "")).upper()
                     if "inbound" in scope_lower and (chunk_scope == "outbound" or chunk_type in ("OUTBOUND_SCRIPT", "CAMPAIGN_SCRIPT")):
+                        rejected_foreign_context_count += 1
                         continue
                     if "outbound" in scope_lower and chunk_scope == "inbound":
+                        rejected_foreign_context_count += 1
                         continue
 
                 clean_docs.append(str(d).strip())
@@ -1963,6 +2010,7 @@ class RagService:
                 f"\n  context_length={len(master_ctx)}"
                 f"\n  latency_ms={elapsed_ms}"
             )
+            logger.info(f"[RAG_CONTEXT] doc_id={active_doc_id or 'none'} scope={scope} chunks_retrieved=0 context_chars={len(master_ctx)}")
             return master_ctx
 
         # Step 1: BM25 Keyword Scoring
@@ -2003,12 +2051,25 @@ class RagService:
             "consultant", "appointment", "booking", "schedule", "timing", "hours",
             "available", "availability", "department", "departments", "who is", "who handles"
         }
-        if org_id_val is not None and (any(s in search_query.lower() for s in staff_signals) or intent in ("staff_lookup", "staff_availability", "doctor_information")):
+        script_meta = self.get_active_script_metadata(org_id_val, document_id=active_doc_id, scope=scope)
+        is_hosp_domain = (script_meta.get("business_type") in ("HOSPITAL", "CLINIC") or script_meta.get("booking_type") == "HOSPITAL_APPOINTMENT")
+
+        if is_hosp_domain and org_id_val is not None and (any(s in search_query.lower() for s in staff_signals) or intent in ("staff_lookup", "staff_availability", "doctor_information")):
             staff_ctx = self.retrieve_staff_context(query=search_query, organization_id=org_id_val)
             if staff_ctx:
                 final_ctx = f"{final_ctx}\n\n[STAFF DIRECTORY CONTEXT]\n{staff_ctx}".strip()
 
         elapsed_ms = round((time.monotonic() - t_start) * 1000)
+
+        retrieved_doc_ids = sorted(list(set([str(m.get("document_id", active_doc_id)) for m in valid_metas if m.get("document_id")] or ([str(active_doc_id)] if active_doc_id else []))))
+        logger.info(
+            f"\n[RAG_CONTEXT_VALIDATION]"
+            f"\n  organization_id={org_id_val}"
+            f"\n  active_script_id={active_doc_id}"
+            f"\n  retrieved_document_ids={retrieved_doc_ids}"
+            f"\n  retrieved_chunk_count={len(context_parts)}"
+            f"\n  rejected_foreign_context_count={rejected_foreign_context_count}"
+        )
 
         logger.info(
             f"\n[RAG_RESULT]"
@@ -2019,6 +2080,7 @@ class RagService:
         )
 
         res_to_return = final_ctx if final_ctx else (self.get_organization_master_context(org_id_val, document_id=active_doc_id, scope=scope) if active_doc_id else "")
+        logger.info(f"[RAG_CONTEXT] doc_id={active_doc_id or 'none'} scope={scope} chunks_retrieved={len(context_parts)} context_chars={len(res_to_return)}")
         if hasattr(self, "_rag_query_cache") and len(self._rag_query_cache) < 500:
             self._rag_query_cache[cache_key] = res_to_return
         return res_to_return

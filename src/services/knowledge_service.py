@@ -379,11 +379,19 @@ class KnowledgeService:
             # Markdown heading or visual divider
             if re.match(r'^(?:#{1,6}\s+|===+\s*|---+\s*|\*{3,}\s*)', s):
                 return True
-            # Key section title in ALL-CAPS (3 to 55 chars) without colons or URLs
-            if s.isupper() and 3 <= len(s) <= 55 and not s.startswith(('HTTP', 'WWW', 'COMPANY', 'AGENT', 'CUSTOMER')) and ':' not in s:
+            # Numbered headings: e.g. "1. Greeting", "3. Purpose and need", "1.1 Subtitle"
+            if re.match(r'^\d+(?:\.\d+)*\.?\s+[A-Z][a-zA-Z0-9\s,&/\-\(\)]+$', s) and len(s) <= 80:
                 return True
-            # Structural labels (SECTION, MODULE, CHAPTER, PART, DIRECTORY, RULES, FAQS, POLICY)
-            if re.match(r'^(?:SECTION\b|MODULE\b|CHAPTER\b|PART\b|OVERVIEW\b|DIRECTORY\b|RULES\b|FAQS?\b|POLICIES?\b)', s, re.IGNORECASE):
+            # Capitalized structural section title in ALL-CAPS (4 to 55 chars) without colons or URLs
+            if s.isupper() and 4 <= len(s) <= 55 and not s.startswith(('HTTP', 'WWW', 'COMPANY', 'AGENT', 'CUSTOMER')) and ':' not in s:
+                # Require at least 2 words or a known structural heading keyword to prevent single table cells (e.g. 'CUSTOM', 'YES') from splitting
+                if len(s.split()) >= 2 or s in ("OVERVIEW", "DIRECTORY", "SERVICES", "PRODUCTS", "PRICING", "RULES", "FAQS", "POLICIES", "ABOUT US", "CONTACT US", "INTRODUCTION"):
+                    return True
+            # Structural labels (SECTION, MODULE, CHAPTER, PART, DIRECTORY, RULES, FAQS, POLICY, CHUNK INDEX)
+            if re.match(r'^(?:SECTION\b|MODULE\b|CHAPTER\b|PART\b|OVERVIEW\b|DIRECTORY\b|SERVICES?\b|PRODUCTS?\b|PRICING\b|RULES\b|FAQS?\b|POLICIES?\b|CHUNK INDEX\b)', s, re.IGNORECASE):
+                return True
+            # Product / Catalog title patterns: e.g. "AI Voice Agents", "Galaxy Chat (...)", "AI Knowledge Management"
+            if re.match(r'^(?:AI Voice Agents|Galaxy Chat|AI Knowledge Management|Business Automation|Business applications|Websites and web|Custom software)', s, re.IGNORECASE):
                 return True
             return False
 
@@ -826,6 +834,27 @@ class KnowledgeService:
             if q in doc.title.lower()
             or (doc.content and q in doc.content.lower())
         ]
+
+    def get_active_doc(
+        self,
+        organization_id: Optional[int] = None,
+        scope: Optional[str] = "organization",
+        agent_id: Optional[str] = None
+    ) -> Optional[KnowledgeDocument]:
+        """Fetch the currently active, indexed RAG document for an organization."""
+        query = self.db.query(KnowledgeDocument).filter(
+            KnowledgeDocument.ai_usage == "Active",
+            KnowledgeDocument.status.in_([KnowledgeDocStatus.INDEXED, "Indexed"])
+        )
+        if organization_id is not None:
+            query = query.filter(KnowledgeDocument.organization_id == organization_id)
+        else:
+            query = query.filter(KnowledgeDocument.organization_id.is_(None))
+        if scope:
+            query = query.filter(KnowledgeDocument.scope == scope)
+        if agent_id:
+            query = query.filter(KnowledgeDocument.agent_id == agent_id)
+        return query.order_by(KnowledgeDocument.updated_at.desc(), KnowledgeDocument.id.desc()).first()
 
     def update_doc(
         self,

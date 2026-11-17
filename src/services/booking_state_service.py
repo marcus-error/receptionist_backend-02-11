@@ -65,28 +65,36 @@ class BookingSession:
     """
     def __init__(
         self,
-        session_id: str,
+        session_id: Optional[str] = None,
         conversation_id: Optional[str] = None,
         call_sid: Optional[str] = None,
         organization_id: int = 1,
-        business_type: str = "HOSPITAL",
-        booking_type: str = "HOSPITAL_APPOINTMENT",
-        business_name: str = "Sarans Hospitals"
+        business_type: str = "GENERAL",
+        booking_type: str = "BUSINESS_CONSULTATION",
+        business_name: Optional[str] = None,
+        active_doc_id: Optional[str] = None,
+        active_doc_title: Optional[str] = None
     ):
-        self.session_id = session_id
-        self.conversation_id: str = conversation_id or session_id
-        self.call_sid: str = call_sid or session_id
+        self.session_id = session_id or f"sess_{uuid.uuid4().hex[:10]}"
+        self.conversation_id: str = conversation_id or self.session_id
+        self.call_sid: str = call_sid or self.session_id
         self.stream_sid: Optional[str] = None
         self.agent_id: Optional[str] = None
         self.user_id: Optional[str] = None
         self.organization_id: int = organization_id
-        self.active_rag_id: Optional[str] = None
-        self.active_doc_id: Optional[str] = None
-        self.active_rag_title: str = "Active Knowledge Base"
-        self.active_doc_title: str = "Active Knowledge Base"
-        self.business_type: str = business_type
-        self.booking_type: str = booking_type
-        self.business_name: str = business_name
+        self.active_rag_id: Optional[str] = active_doc_id
+        self.active_doc_id: Optional[str] = active_doc_id
+        self.active_rag_title: str = active_doc_title or "Active Knowledge Base"
+        self.active_doc_title: str = active_doc_title or "Active Knowledge Base"
+        self.business_type: str = business_type or "GENERAL"
+        self.booking_type: str = booking_type or "BUSINESS_CONSULTATION"
+        self.business_name: str = business_name or "AI Receptionist"
+        if str(self.booking_type).upper() == "SALES_DEMO" or str(self.business_type).upper() == "SOFTWARE":
+            self.workflow_type: str = "SALES_DEMO"
+        elif str(self.booking_type).upper() == "HOSPITAL_APPOINTMENT" or str(self.business_type).upper() == "HEALTHCARE":
+            self.workflow_type: str = "HOSPITAL_APPOINTMENT"
+        else:
+            self.workflow_type: str = "GENERAL"
         self.confirmation_count: int = 0
         self.confirmation_message: Optional[str] = None
         self.confirmed_appointment_id: Optional[int] = None
@@ -125,7 +133,7 @@ class BookingSession:
         self._last_rejected_entity: Optional[str] = None
 
         self.booking_data: Dict[str, Any] = {
-            "intent": "appointment_booking",
+            "intent": None,
             "department": None,
             "doctor": None,
             "specialty": None,
@@ -183,7 +191,7 @@ class BookingSession:
         self._offered_dept_doctor = None
         self._last_rejected_entity = None
         self.booking_data = {
-            "intent": "appointment_booking",
+            "intent": None,
             "department": None,
             "doctor": None,
             "specialty": None,
@@ -240,7 +248,7 @@ class BookingSession:
         saved_lang = self.booking_data.get("conversation_language", "en")
 
         self.booking_data = {
-            "intent": "appointment_booking",
+            "intent": None,
             "department": None,
             "doctor": None,
             "specialty": None,
@@ -442,11 +450,11 @@ class BookingSession:
         self.state = val
 
     @property
-    def current_intent(self) -> str:
-        return self.booking_data.get("intent", "appointment_booking")
+    def current_intent(self) -> Optional[str]:
+        return self.booking_data.get("intent")
 
     @current_intent.setter
-    def current_intent(self, val: str):
+    def current_intent(self, val: Optional[str]):
         self.booking_data["intent"] = val
 
     @property
@@ -549,7 +557,29 @@ class BookingSession:
 
     @property
     def missing_fields(self) -> List[str]:
+        # Task 4: In IDLE, COMPLETED, or inactive states, no fields are missing!
+        if self.state in (BookingState.IDLE, BookingState.COMPLETED, BookingState.BOOKED, BookingState.BOOKING_CONFIRMED, BookingState.BOOKING_CANCELLED, BookingState.FAILED) or not self.is_active():
+            return []
+
         missing: List[str] = []
+        is_demo = (
+            getattr(self, "booking_type", None) in ("SALES_DEMO", "BUSINESS_CONSULTATION")
+            or getattr(self, "business_type", None) == "SOFTWARE"
+            or getattr(self, "workflow_type", None) == "SALES_DEMO"
+        )
+        if is_demo:
+            if not self.date:
+                missing.append("demo_date")
+            if not self.time:
+                missing.append("demo_time")
+            if not self.patient_name or self.patient_name in ("Unknown", "Unknown Caller", "User", "Test User", "None", ""):
+                missing.append("full_name")
+            if not self.contact_number and not getattr(self, "caller_phone", None):
+                missing.append("phone_number")
+            if not self.email and not self.booking_data.get("email_declined"):
+                missing.append("email")
+            return missing
+
         _COMM_KEYWORDS = {
             "phone", "telephone", "mobile", "cell", "cellphone", "whatsapp",
             "email", "mail", "gmail", "yahoo", "outlook", "contact", "number",
@@ -661,12 +691,21 @@ class BookingSession:
         return missing
 
     def get_state_dict(self) -> Dict[str, Any]:
+        b_type = getattr(self, "business_type", "GENERAL") or "GENERAL"
+        bk_type = getattr(self, "booking_type", "GENERAL") or "GENERAL"
+        mf = self.missing_fields
+        logger.info(f"[CONVERSATION_STATE] business_type={b_type} booking_type={bk_type} stage={self.state} missing_fields={mf}")
         return {
             "conversation_id": self.conversation_id,
             "call_sid": self.call_sid,
             "agent_id": self.agent_id,
             "organization_id": self.organization_id,
             "active_rag_id": self.active_rag_id or self.active_doc_id,
+            "active_doc_id": self.active_doc_id or self.active_rag_id,
+            "business_name": getattr(self, "business_name", None),
+            "business_type": getattr(self, "business_type", "GENERAL"),
+            "booking_type": getattr(self, "booking_type", "GENERAL"),
+            "workflow_type": getattr(self, "workflow_type", "GENERAL"),
             "call_direction": getattr(self, "call_direction", "INBOUND"),
             "call_type": str(getattr(self, "call_type", "INBOUND")),
             "conversation_started": self.conversation_started,
@@ -674,7 +713,7 @@ class BookingSession:
             "turn_id": self.turn_id,
             "turn_count": self.turn_count,
             "state_version": getattr(self, "state_version", 1),
-            "current_intent": self.current_intent,
+            "current_intent": self.booking_data.get("intent") or ("general_inquiry" if self.state == BookingState.IDLE else "appointment_booking"),
             "current_stage": self.current_stage,
             "state": self.state,
             "last_asked_field": getattr(self, "last_asked_field", None),
@@ -709,6 +748,9 @@ class BookingSession:
         )
         sess.agent_id = data.get("agent_id")
         sess.organization_id = data.get("organization_id", 1)
+        sess.business_type = data.get("business_type", "GENERAL")
+        sess.booking_type = data.get("booking_type", "GENERAL")
+        sess.workflow_type = data.get("workflow_type", "GENERAL")
         sess.active_rag_id = data.get("active_rag_id")
         sess.state = data.get("state") or data.get("current_stage") or BookingState.IDLE
         sess.conversation_started = data.get("conversation_started", False)
@@ -728,7 +770,7 @@ class BookingSession:
         sess.confirmed_facts = data.get("confirmed_facts") or {}
         sess.completed_steps = data.get("completed_steps") or []
 
-        sess.booking_data["intent"] = data.get("current_intent", "appointment_booking")
+        sess.booking_data["intent"] = data.get("current_intent")
         sess.booking_data["department"] = data.get("department")
         sess.booking_data["service"] = sess.service_name
         sess.booking_data["product"] = sess.product_name
@@ -1054,10 +1096,10 @@ def parse_spoken_email(text: str) -> Optional[str]:
 
 
     # 1. Direct standard email match in raw text first
-    email_direct = re.search(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', txt)
+    email_direct = re.search(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*\.[a-zA-Z]{2,}', txt)
     if email_direct:
         cand = email_direct.group(0).strip('.')
-        if re.match(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}$', cand):
+        if re.match(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*\.[a-zA-Z]{2,}$', cand):
             return cand
 
     # 2. Strip conversational prefixes (including email change / update requests)
@@ -1139,7 +1181,7 @@ def parse_spoken_email(text: str) -> Optional[str]:
             if valid_local_tokens:
                 local_part = ''.join(valid_local_tokens)
 
-                # Domain part reconstruction (e.g. "gmail . com" -> "gmail.com")
+                # Domain part reconstruction (e.g. "gmail . com" -> "gmail.com", "company . co . in" -> "company.co.in")
                 dom_tokens = domain_raw.split()
                 valid_dom_tokens = []
                 for tok in dom_tokens:
@@ -1153,7 +1195,7 @@ def parse_spoken_email(text: str) -> Optional[str]:
 
                 candidate = f"{local_part}@{domain_part}"
                 candidate = re.sub(r'\.{2,}', '.', candidate).strip('.')
-                if re.match(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}$', candidate):
+                if re.match(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*\.[a-zA-Z]{2,}$', candidate):
                     return candidate
 
     # 5. Continuous compaction fallback
@@ -1162,12 +1204,12 @@ def parse_spoken_email(text: str) -> Optional[str]:
         domain_tail = compact.split('@')[-1]
         if domain_tail in ("gmail", "yahoo", "hotmail", "outlook"):
             compact = f"{compact}.com"
-    m_compact = re.search(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}', compact)
+    m_compact = re.search(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*\.[a-zA-Z]{2,}', compact)
     if m_compact:
         cand = m_compact.group(0).strip('.')
         # Prevent "changemymail@..." or "myemail@..." from surviving in fallback
         cand = re.sub(r'^(?:(?:please)?(?:change|update|correct)?(?:my)?(?:email|mail|address|id))+', '', cand, flags=re.IGNORECASE)
-        if re.match(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}$', cand):
+        if re.match(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*\.[a-zA-Z]{2,}$', cand):
             return cand
 
     return None
@@ -1344,7 +1386,18 @@ class BookingStateService:
     def __init__(self):
         self._sessions: Dict[str, BookingSession] = {}
 
-    def get_session(self, session_id: str, conversation_id: Optional[str] = None, call_sid: Optional[str] = None) -> BookingSession:
+    def get_session(
+        self,
+        session_id: str,
+        conversation_id: Optional[str] = None,
+        call_sid: Optional[str] = None,
+        organization_id: Optional[int] = None,
+        business_type: Optional[str] = None,
+        booking_type: Optional[str] = None,
+        business_name: Optional[str] = None,
+        active_doc_id: Optional[str] = None,
+        active_doc_title: Optional[str] = None
+    ) -> BookingSession:
         target_keys = [k for k in [session_id, conversation_id, call_sid] if k]
         for k in target_keys:
             if k in self._sessions:
@@ -1353,6 +1406,20 @@ class BookingStateService:
                     sess.conversation_id = conversation_id
                 if call_sid and not sess.call_sid:
                     sess.call_sid = call_sid
+                if organization_id is not None:
+                    sess.organization_id = organization_id
+                if business_type:
+                    sess.business_type = business_type
+                if booking_type:
+                    sess.booking_type = booking_type
+                if business_name:
+                    sess.business_name = business_name
+                if active_doc_id:
+                    sess.active_doc_id = active_doc_id
+                    sess.active_rag_id = active_doc_id
+                if active_doc_title:
+                    sess.active_doc_title = active_doc_title
+                    sess.active_rag_title = active_doc_title
                 for alias in target_keys:
                     self._sessions[alias] = sess
                 return sess
@@ -1362,11 +1429,35 @@ class BookingStateService:
         recovered = self.load_session_state(persisted_sid)
         if recovered:
             logger.info(f"[SESSION_RECOVERY] Successfully recovered durable session for {persisted_sid}")
+            if organization_id is not None:
+                recovered.organization_id = organization_id
+            if business_type:
+                recovered.business_type = business_type
+            if booking_type:
+                recovered.booking_type = booking_type
+            if business_name:
+                recovered.business_name = business_name
+            if active_doc_id:
+                recovered.active_doc_id = active_doc_id
+                recovered.active_rag_id = active_doc_id
+            if active_doc_title:
+                recovered.active_doc_title = active_doc_title
+                recovered.active_rag_title = active_doc_title
             for k in target_keys:
                 self._sessions[k] = recovered
             return recovered
 
-        new_sess = BookingSession(session_id=session_id, conversation_id=conversation_id, call_sid=call_sid)
+        new_sess = BookingSession(
+            session_id=session_id,
+            conversation_id=conversation_id,
+            call_sid=call_sid,
+            organization_id=organization_id or 1,
+            business_type=business_type or "GENERAL",
+            booking_type=booking_type or "BUSINESS_CONSULTATION",
+            business_name=business_name or "AI Receptionist",
+            active_doc_id=active_doc_id,
+            active_doc_title=active_doc_title
+        )
         for k in target_keys:
             self._sessions[k] = new_sess
         return new_sess
@@ -2790,6 +2881,11 @@ class BookingStateService:
             except:
                 pass
                 
+        # Standalone Month (e.g. "November", "December", "in November", "month of November")
+        m_month = re.search(r'^(?:in\s+|for\s+|month\s+of\s+)?(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)$', t)
+        if m_month:
+            return m_month.group(1).title()
+
         # Days of the week (Monday - Sunday)
         days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
         for idx, day_name in enumerate(days):
@@ -2802,10 +2898,13 @@ class BookingStateService:
 
         try:
             from src.services.calendar_verification_service import calendar_verification_service
-            parsed_d = calendar_verification_service.parse_date(text_date)
-            return parsed_d.strftime("%Y-%m-%d")
+            parsed_d = calendar_verification_service.parse_date(text_date, default=None)
+            if parsed_d:
+                return parsed_d.strftime("%Y-%m-%d")
         except Exception:
-            return now.strftime("%Y-%m-%d")
+            pass
+
+        return None
 
     @staticmethod
     def _normalize_time_str(t_str: Optional[str]) -> Optional[str]:
@@ -2893,7 +2992,9 @@ class BookingStateService:
         has_doctor_keyword = any(k in txt_lower for k in ["dr", "dr.", "doctor", "physician"])
         wants_doctor_change = any(p in txt_lower for p in doctor_change_phrases)
 
-        if wants_doctor_change:
+        is_hospital_domain = (getattr(session, "business_type", "GENERAL") in ("HOSPITAL", "CLINIC") or getattr(session, "booking_type", "") == "HOSPITAL_APPOINTMENT")
+
+        if wants_doctor_change and is_hospital_domain:
             session.doctor_locked = False
             session.doctor_id = None
             session.doctor_name = None
@@ -3068,8 +3169,8 @@ class BookingStateService:
                         candidate = sk.title()
                         break
 
-            # Check active organization staff token match
-            if not candidate and not _skip_doctor_extraction:
+            # Check active organization staff token match (Gated strictly to healthcare/hospital domains)
+            if not candidate and not _skip_doctor_extraction and is_hospital_domain:
                 try:
                     from src.config.database import SessionLocal
                     from src.models.staff import Staff, StaffStatus
@@ -3786,16 +3887,24 @@ class BookingStateService:
             session.booking_data.pop("ambiguous_entity_candidate", None)
             session.booking_data.pop("pending_confirmation_entity", None)
 
-        _customer_detail_states = (
+        _active_booking_states = (
+            BookingState.BOOKING_STARTED,
+            BookingState.WAITING_FOR_DOCTOR,
+            BookingState.WAITING_FOR_DATE,
+            BookingState.WAITING_FOR_TIME,
+            BookingState.WAITING_FOR_PATIENT_NAME,
             BookingState.COLLECTING_PATIENT_NAME,
+            BookingState.WAITING_FOR_CONTACT,
             BookingState.COLLECTING_PHONE,
+            BookingState.WAITING_FOR_EMAIL,
             BookingState.COLLECTING_EMAIL,
             BookingState.WAITING_FOR_CONFIRMATION,
+            BookingState.CONFIRMATION_ACCEPTED,
         )
 
-        # In customer detail collection and confirmation states, generic intents like 'general_question' or 'general_conversation'
+        # In all active booking states, generic intents like 'general_question' or 'general_conversation'
         # must NEVER bypass the booking flow unless an explicit informational query is actually detected in the text.
-        if session.state in _customer_detail_states or getattr(session, "last_asked_field", "") in ("patient_name", "contact_number", "email", "confirmation"):
+        if session.state in _active_booking_states or getattr(session, "last_asked_field", "") in ("patient_name", "contact_number", "email", "confirmation", "date", "time", "doctor", "service"):
             if not is_info_question and current_intent not in ("emergency/urgent request", "transfer request"):
                 return False
 
@@ -3879,7 +3988,12 @@ class BookingStateService:
         norm_words = clean_norm.split()
         single_str = " ".join(norm_words)
 
-        target_str = f"with {session.doctor}" if session.doctor else f"for {session.service or 'your appointment'}"
+        is_demo = (
+            getattr(session, "booking_type", None) in ("SALES_DEMO", "BUSINESS_CONSULTATION")
+            or getattr(session, "business_type", None) == "SOFTWARE"
+            or getattr(session, "workflow_type", None) == "SALES_DEMO"
+        )
+        target_str = "for your product demo" if is_demo else (f"with {session.doctor}" if session.doctor else f"for {session.service or 'your appointment'}")
         loc_str = f", Location: {session.location}" if session.location else ""
         email_confirm_str = f", Email: {session.email}" if session.email else ""
 
@@ -4063,16 +4177,21 @@ class BookingStateService:
                 if session._consecutive_duplicate_count >= 1:
                     active_lang = getattr(session, "conversation_language", "en")
                     if getattr(session, "last_asked_field", "") == "doctor":
-                        if active_lang in ("ta", "tanglish", "ta_mix"):
-                            r = "எங்கள் மருத்துவமனையில் General Medicine, Cardiology, மற்றும் Dental Care துறைகள் உள்ளன. நீங்கள் எந்த துறையை அல்லது மருத்துவரை தேர்வு செய்ய விரும்புகிறீர்கள்?"
-                        elif active_lang == "hi":
-                            r = "Hamare paas General Medicine, Cardiology, aur Dental Care departments hain. Aap kis vibhaag ya doctor ko chunna chahenge?"
-                        elif active_lang in ("kn", "kannada"):
-                            r = "ನಮ್ಮ ಆಸ್ಪತ್ರೆಯಲ್ಲಿ ಜನರಲ್ ಮೆಡಿಸಿನ್, ಕಾರ್ಡಿಯಾಲಜಿ ಮತ್ತು ದಂತ ಚಿಕಿತ್ಸೆ ವಿಭಾಗಗಳಿವೆ. ನೀವು ಯಾರನ್ನು ಸಂಪರ್ಕಿಸಲು ಬಯಸುತ್ತೀರಿ?"
-                        elif active_lang in ("te", "telugu"):
-                            r = "మా ఆసుపత్రిలో జనరల్ మెడిసిన్, కార్డియాలజీ మరియు డెంటల్ కేర్ విభాగాలు ఉన్నాయి. మీరు ఎవరిని సంప్రదించాలనుకుంటున్నారు?"
+                        is_hosp = (getattr(session, "business_type", "GENERAL") in ("HOSPITAL", "CLINIC") or getattr(session, "booking_type", "") == "HOSPITAL_APPOINTMENT")
+                        if is_hosp:
+                            if active_lang in ("ta", "tanglish", "ta_mix"):
+                                r = "எங்கள் மருத்துவமனையில் General Medicine, Cardiology, மற்றும் Dental Care துறைகள் உள்ளன. நீங்கள் எந்த துறையை அல்லது மருத்துவரை தேர்வு செய்ய விரும்புகிறீர்கள்?"
+                            elif active_lang == "hi":
+                                r = "Hamare paas General Medicine, Cardiology, aur Dental Care departments hain. Aap kis vibhaag ya doctor ko chunna chahenge?"
+                            elif active_lang in ("kn", "kannada"):
+                                r = "ನಮ್ಮ ಆಸ್ಪತ್ರೆಯಲ್ಲಿ ಜನರಲ್ ಮೆಡಿಸಿನ್, ಕಾರ್ಡಿಯಾಲಜಿ ಮತ್ತು ದಂತ ಚಿಕಿತ್ಸೆ ವಿಭಾಗಗಳಿವೆ. ನೀವು ಯಾರನ್ನು ಸಂಪರ್ಕಿಸಲು ಬಯಸುತ್ತೀರಿ?"
+                            elif active_lang in ("te", "telugu"):
+                                r = "మా ఆసుపత్రిలో జనరల్ మెడిసిన్, కార్డియాలజీ మరియు డెంటల్ కేర్ విభాగాలు ఉన్నాయి. మీరు ఎవరిని సంప్రదించాలనుకుంటున్నారు?"
+                            else:
+                                r = "To help book your appointment, we have specialists in General Medicine, Cardiology, Dental Care, and Ayurvedic medicine. Which department or doctor would you prefer?"
                         else:
-                            r = "To help book your appointment, we have specialists in General Medicine, Cardiology, Dental Care, and Ayurvedic medicine. Which department or doctor would you prefer?"
+                            b_name = getattr(session, "business_name", None) or "our team"
+                            r = f"To help you with {b_name}, which product, service, or demo would you prefer to discuss?"
                     elif getattr(session, "last_asked_field", "") == "date":
                         r = "Could you please share which date would work best for your appointment, such as today or tomorrow?"
                     elif getattr(session, "last_asked_field", "") == "time":
@@ -4159,6 +4278,19 @@ class BookingStateService:
 
         if session.state == BookingState.IDLE:
             session.state = BookingState.BOOKING_STARTED
+            is_demo_start = (
+                getattr(session, "booking_type", None) in ("SALES_DEMO", "BUSINESS_CONSULTATION")
+                or getattr(session, "business_type", None) == "SOFTWARE"
+                or getattr(session, "workflow_type", None) == "SALES_DEMO"
+            )
+            session.booking_data["intent"] = "sales_demo_booking" if is_demo_start else "appointment_booking"
+            if is_demo_start:
+                if not session.doctor:
+                    session.doctor = "Representative"
+                if not session.department:
+                    session.department = "Sales Team"
+                if not session.service:
+                    session.service = session.booking_data.get("product") or "Demo"
 
         # 0. Check if caller is confirming a previously suggested ambiguous entity
         pending_suggested = session.booking_data.get("pending_confirmation_entity")
@@ -4486,7 +4618,8 @@ class BookingStateService:
             or (has_doctor_keyword and any(w in txt_lower for w in ["available", "free", "there", "working", "schedule", "today", "tomorrow"]))
         )
 
-        if is_asking_doctors_available or is_asking_specific_doctor:
+        is_hosp_domain = (getattr(session, "business_type", "GENERAL") in ("HOSPITAL", "CLINIC") or getattr(session, "booking_type", "") == "HOSPITAL_APPOINTMENT")
+        if is_hosp_domain and (is_asking_doctors_available or is_asking_specific_doctor):
             session.booking_data.pop("unverified_entity_requested", None)
             session.booking_data.pop("unknown_doctor_requested", None)
             session.booking_data.pop("ambiguous_entity_candidate", None)
@@ -4727,38 +4860,57 @@ class BookingStateService:
                 logger.warning(f"Error retrieving RAG context for FAQ: {e}")
 
             faq_text = ""
-            if rag_ans and "sarans" in rag_ans.lower():
+            if rag_ans:
                 lines = [l.strip() for l in rag_ans.split("\n") if l.strip() and not l.strip().startswith("#")]
                 for line in lines:
-                    if any(term in line.lower() for term in ["location", "located", "address", "visiting", "hours", "timing", "insurance", "facility", "facilities", "emergency"]):
+                    if any(term in line.lower() for term in ["location", "located", "address", "visiting", "hours", "timing", "insurance", "facility", "facilities", "emergency", "service", "product"]):
                         faq_text = line
                         break
             if not faq_text:
+                b_name = getattr(session, "business_name", None) or "Our team"
+                is_hosp_faq = (getattr(session, "business_type", "GENERAL") in ("HOSPITAL", "CLINIC") or getattr(session, "booking_type", "") == "HOSPITAL_APPOINTMENT")
                 if any(w in txt_lower for w in ["where", "location", "address"]):
-                    faq_text = "Sarans Hospitals is located at Tirunelveli, Tamil Nadu."
+                    loc = rag_service.get_organization_location(org_id, document_id=getattr(session, "active_doc_id", None))
+                    faq_text = f"{b_name} is located at {loc}." if loc else f"{b_name} is available to assist you."
                 elif any(w in txt_lower for w in ["hours", "timing", "visiting"]):
-                    faq_text = "Our outpatient department is open from 8:30 AM to 6:00 PM, and emergency services are available 24/7."
-                elif any(w in txt_lower for w in ["insurance", "cashless"]):
+                    hrs = rag_service.get_organization_hours(org_id, document_id=getattr(session, "active_doc_id", None))
+                    faq_text = f"Our hours are {hrs}." if hrs else f"{b_name} is open during standard business hours."
+                elif is_hosp_faq and any(w in txt_lower for w in ["insurance", "cashless"]):
                     faq_text = "Yes, we accept major insurance policies and offer cashless claims."
+                elif is_hosp_faq:
+                    faq_text = f"We provide comprehensive medical facilities at {b_name}."
                 else:
-                    faq_text = "We provide comprehensive medical facilities including 24/7 emergency and pharmacy services."
+                    faq_text = f"We are pleased to assist you with all {b_name} products and services."
 
-            if not session.doctor:
-                bridge = "Now, to continue with your appointment booking, which doctor or department would you like to consult?"
-                if lang in ("ta", "tanglish", "ta_mix"):
-                    bridge = "இப்போது உங்கள் முன்பதிவைத் தொடர, எந்த மருத்துவரை அல்லது துறையை நீங்கள் பார்க்க விரும்புகிறீர்கள்?"
-                elif lang == "hi":
-                    bridge = "Ab aapke appointment booking ke liye, aap kis doctor ya vibhaag se milna chahte hain?"
-                elif lang in ("kn", "kannada"):
-                    bridge = "ಈಗ ನಿಮ್ಮ ಅಪಾಯಿಂಟ್‌ಮೆಂಟ್ ಬುಕಿಂಗ್ ಮುಂದುವರಿಸಲು, ನೀವು ಯಾವ ವೈದ್ಯರನ್ನು ಅಥವಾ ವಿಭಾಗವನ್ನು ಸಂಪರ್ಕಿಸಲು ಬಯಸುತ್ತೀರಿ?"
-                elif lang in ("te", "telugu"):
-                    bridge = "ఇప్పుడు మీ అపాయింట్‌మెంట్ బుకింగ్‌ను కొనసాగించడానికి, మీరు ఏ వైద్యుడిని లేదా విభాగాన్ని సంప్రదించాలనుకుంటున్నారు?"
-            elif session.doctor and not session.date:
-                bridge = f"Now, to schedule your appointment with {session.doctor}, which date would you prefer?"
-            elif session.doctor and session.date and not session.time:
-                bridge = f"Now, for your appointment with {session.doctor} on {session.date}, which time would you prefer?"
+            is_hosp_bridge = (getattr(session, "business_type", "GENERAL") in ("HOSPITAL", "CLINIC") or getattr(session, "booking_type", "") == "HOSPITAL_APPOINTMENT")
+            if is_hosp_bridge:
+                if not session.doctor:
+                    bridge = "Now, to continue with your appointment booking, which doctor or department would you like to consult?"
+                    if lang in ("ta", "tanglish", "ta_mix"):
+                        bridge = "இப்போது உங்கள் முன்பதிவைத் தொடர, எந்த மருத்துவரை அல்லது துறையை நீங்கள் பார்க்க விரும்புகிறீர்கள்?"
+                    elif lang == "hi":
+                        bridge = "Ab aapke appointment booking ke liye, aap kis doctor ya vibhaag se milna chahte hain?"
+                    elif lang in ("kn", "kannada"):
+                        bridge = "ಈಗ ನಿಮ್ಮ ಅಪಾಯಿಂಟ್‌ಮೆಂಟ್ ಬುಕಿಂಗ್ ಮುಂದುವರಿಸಲು, ನೀವು ಯಾವ ವೈದ್ಯರನ್ನು ಅಥವಾ ವಿಭಾಗವನ್ನು ಸಂಪರ್ಕಿಸಲು ಬಯಸುತ್ತೀರಿ?"
+                    elif lang in ("te", "telugu"):
+                        bridge = "ఇప్పుడు మీ అపాయింట్‌మెంట్ బుకింగ్‌ను కొనసాగించడానికి, మీరు ఏ వైద్యుడిని లేదా విభాగాన్ని సంప్రదించాలనుకుంటున్నారు?"
+                elif session.doctor and not session.date:
+                    bridge = f"Now, to schedule your appointment with {session.doctor}, which date would you prefer?"
+                elif session.doctor and session.date and not session.time:
+                    bridge = f"Now, for your appointment with {session.doctor} on {session.date}, which time would you prefer?"
+                else:
+                    bridge = "Now, shall we proceed with your appointment booking?"
             else:
-                bridge = "Now, shall we proceed with your appointment booking?"
+                if not session.service and not session.product:
+                    bridge = "Now, would you like to schedule a demo or consultation for our products?"
+                    if lang in ("ta", "tanglish", "ta_mix"):
+                        bridge = "இப்போது எங்கள் சேவைகளுக்கான demo அல்லது ஆலோசனையை முன்பதிவு செய்ய விரும்புகிறீர்களா?"
+                    elif lang == "hi":
+                        bridge = "Kya aap hamare products ke demo ke liye aage badhna chahenge?"
+                elif not session.date:
+                    bridge = "Which date would you prefer for the demo or consultation?"
+                else:
+                    bridge = "Now, shall we proceed with scheduling your session?"
 
             resp = f"{faq_text} {bridge}"
             self._log_conversation_turn(session, text, resp, "hospital_faq_answered", state_before=state_before)
@@ -4943,7 +5095,12 @@ class BookingStateService:
         if not session.date:
             session.state = BookingState.WAITING_FOR_DATE
             session.last_asked_field = "date"
-            if session.booking_type == "SALES_DEMO":
+            is_demo_date = (
+                getattr(session, "booking_type", None) in ("SALES_DEMO", "BUSINESS_CONSULTATION")
+                or getattr(session, "business_type", None) == "SOFTWARE"
+                or getattr(session, "workflow_type", None) == "SALES_DEMO"
+            )
+            if is_demo_date:
                 resp = f"Sure{', ' + first_name if first_name else ''}! I can help you schedule a demo. Which date would you prefer?"
             else:
                 resp = f"{name_ack}Which date would you prefer for your {target_label} appointment?"
@@ -5090,7 +5247,12 @@ class BookingStateService:
             session.last_asked_field = "patient_name"
             rel = session.patient_relationship or "relative"
             for_other = getattr(session, "is_booking_for_other", False)
-            target_str = f"with {session.doctor}" if session.doctor else f"for {session.service or 'your appointment'}"
+            is_demo = (
+                getattr(session, "booking_type", None) in ("SALES_DEMO", "BUSINESS_CONSULTATION")
+                or getattr(session, "business_type", None) == "SOFTWARE"
+                or getattr(session, "workflow_type", None) == "SALES_DEMO"
+            )
+            target_str = "for your product demo" if is_demo else (f"with {session.doctor}" if session.doctor else f"for {session.service or 'your appointment'}")
 
             if any(w in txt_lower for w in ["my name", "name", "who", "what", "pardon", "sorry", "pardon me"]):
                 if for_other:
@@ -5237,7 +5399,12 @@ class BookingStateService:
             session.state = BookingState.WAITING_FOR_CONFIRMATION
             session.last_asked_field = "confirmation"
 
-            target_str = f"with {session.doctor}" if session.doctor else f"for {session.service or 'your appointment'}"
+            is_demo = (
+                getattr(session, "booking_type", None) in ("SALES_DEMO", "BUSINESS_CONSULTATION")
+                or getattr(session, "business_type", None) == "SOFTWARE"
+                or getattr(session, "workflow_type", None) == "SALES_DEMO"
+            )
+            target_str = "for your product demo" if is_demo else (f"with {session.doctor}" if session.doctor else f"for {session.service or 'your appointment'}")
             loc_str = f", Location: {session.location}" if session.location else ""
             email_part = f", Email: {session.email}" if session.email else ""
             email_ta = f", மின்னஞ்சல்: {session.email}" if session.email else ""

@@ -90,7 +90,7 @@ class DeepgramStreamingSession:
         self._last_final_time = 0.0
         self._processed_final_utt_ids: set = set()
 
-    def reset_turn(self):
+    def reset_turn(self, clear_audio_queue: bool = True):
         """Reset turn buffers and debounce timer cleanly when AI speaks or between turns."""
         if self._debounce_task and not self._debounce_task.done():
             self._debounce_task.cancel()
@@ -101,11 +101,12 @@ class DeepgramStreamingSession:
         self._current_turn_transcript = ""
         self._accumulated_finals = []
         self._turn_finalized = False
-        while not self._audio_queue.empty():
-            try:
-                self._audio_queue.get_nowait()
-            except Exception:
-                break
+        if clear_audio_queue:
+            while not self._audio_queue.empty():
+                try:
+                    self._audio_queue.get_nowait()
+                except Exception:
+                    break
 
     def _build_ws_url(self) -> str:
         """Build the Deepgram WebSocket URL with numerals, smart format, and dynamic org keywords."""
@@ -274,25 +275,43 @@ class DeepgramStreamingSession:
         """
         target_lang = str(new_lang or "en").lower().strip()
         if getattr(self, "language", None) == target_lang and self._connected:
+            logger.info(
+                f"\n[STT_LANGUAGE]"
+                f"\n  call_id={self.call_id}"
+                f"\n  provider=deepgram"
+                f"\n  model={self.model}"
+                f"\n  requested_language={target_lang}"
+                f"\n  actual_session_language_configuration={self.language}"
+                f"\n  reconnect_count={self._reconnect_count}"
+                f"\n  switch_success=True"
+            )
             return True
 
-        logger.info(f"[DEEPGRAM_LANG_SWITCH] call_id={self.call_id} switching language: '{getattr(self, 'language', 'en')}' -> '{target_lang}'")
+        prev_lang = getattr(self, "language", "en")
+        logger.info(f"[DEEPGRAM_LANG_SWITCH] call_id={self.call_id} switching language: '{prev_lang}' -> '{target_lang}'")
         self.language = target_lang
 
         async with self._reconnect_lock:
             if not self._running:
+                logger.info(
+                    f"\n[STT_LANGUAGE]"
+                    f"\n  call_id={self.call_id}"
+                    f"\n  provider=deepgram"
+                    f"\n  model={self.model}"
+                    f"\n  requested_language={target_lang}"
+                    f"\n  actual_session_language_configuration={self.language}"
+                    f"\n  reconnect_count={self._reconnect_count}"
+                    f"\n  switch_success=False"
+                )
                 return False
 
             self._connected = False
 
-            # Cancel existing send/recv tasks
+            # Cancel existing send/recv tasks safely (never cancel the current executing task)
+            current_task = asyncio.current_task()
             for task in list(self._tasks):
-                if not task.done():
+                if task is not current_task and not task.done():
                     task.cancel()
-                    try:
-                        await asyncio.wait_for(asyncio.shield(task), timeout=0.3)
-                    except Exception:
-                        pass
             self._tasks.clear()
 
             # Close old WebSocket cleanly
@@ -303,8 +322,8 @@ class DeepgramStreamingSession:
                     pass
                 self._ws = None
 
-            # Preserve audio queue and reset turn state safely (do not drop incoming audio)
-            self.reset_turn()
+            # Preserve audio queue and reset turn state safely (do not drop incoming customer speech)
+            self.reset_turn(clear_audio_queue=False)
 
             # Immediate reconnect with new language parameter
             self._reconnect_count = 0
@@ -313,9 +332,29 @@ class DeepgramStreamingSession:
                 recv_task = asyncio.create_task(self._recv_loop(), name=f"dg_recv_{self.call_id}")
                 self._tasks = [send_task, recv_task]
                 logger.info(f"[DEEPGRAM_LANG_SWITCH_SUCCESS] call_id={self.call_id} now streaming STT in language='{target_lang}'")
+                logger.info(
+                    f"\n[STT_LANGUAGE]"
+                    f"\n  call_id={self.call_id}"
+                    f"\n  provider=deepgram"
+                    f"\n  model={self.model}"
+                    f"\n  requested_language={target_lang}"
+                    f"\n  actual_session_language_configuration={self.language}"
+                    f"\n  reconnect_count={self._reconnect_count}"
+                    f"\n  switch_success=True"
+                )
                 return True
 
             logger.error(f"[DEEPGRAM_LANG_SWITCH_FAIL] call_id={self.call_id} failed to connect with language='{target_lang}'")
+            logger.info(
+                f"\n[STT_LANGUAGE]"
+                f"\n  call_id={self.call_id}"
+                f"\n  provider=deepgram"
+                f"\n  model={self.model}"
+                f"\n  requested_language={target_lang}"
+                f"\n  actual_session_language_configuration={self.language}"
+                f"\n  reconnect_count={self._reconnect_count}"
+                f"\n  switch_success=False"
+            )
             return False
 
     async def start(self):

@@ -155,6 +155,295 @@ def _normalize_speech(text: str) -> str:
     return re.sub(r'[^a-zA-Z0-9\s]', '', (text or "").lower()).strip()
 
 
+def _authenticate_ws_token(token: Optional[str], query_org_id: Optional[str] = None) -> Optional[int]:
+    """Decodes JWT access token and resolves authenticated organization ID."""
+    if not token:
+        return None
+    try:
+        clean_token = token.strip().strip('"\'')
+        if clean_token.lower().startswith("bearer "):
+            clean_token = clean_token[7:].strip()
+
+        from src.config.jwt import decode_access_token
+        payload = decode_access_token(clean_token)
+        if payload and "sub" in payload:
+            user_id = payload.get("sub")
+            db_auth = SessionLocal()
+            try:
+                user = db_auth.query(User).filter(User.id == int(user_id), User.is_active == 1).first()
+                if user:
+                    if user.role == "super_admin":
+                        if query_org_id:
+                            try:
+                                return int(query_org_id)
+                            except (ValueError, TypeError):
+                                return None
+                        return user.organization_id
+                    return user.organization_id
+            finally:
+                db_auth.close()
+        elif payload and "organization_id" in payload:
+            return payload.get("organization_id")
+    except Exception as auth_err:
+        logger.warning(f"[VOICE WS AUTH] Token validation failed: {auth_err}")
+    return None
+
+
+def _resolve_and_validate_active_doc(org_id: Optional[int]) -> tuple[Optional[KnowledgeDocument], Optional[dict]]:
+    """
+    Fetches the currently active, indexed RAG document for an organization from the database.
+    Returns (KnowledgeDocument, script_meta) or (None, None).
+    """
+    if org_id is None:
+        return None, None
+    db = SessionLocal()
+    try:
+        doc = db.query(KnowledgeDocument).filter(
+            KnowledgeDocument.organization_id == org_id,
+            KnowledgeDocument.ai_usage == "Active",
+            KnowledgeDocument.status.in_([KnowledgeDocStatus.INDEXED, "Indexed"])
+        ).order_by(KnowledgeDocument.updated_at.desc(), KnowledgeDocument.id.desc()).first()
+        if not doc:
+            return None, None
+        script_meta = rag_service.get_active_script_metadata(org_id, document_id=str(doc.id), scope="inbound")
+        return doc, script_meta
+    except Exception as e:
+        logger.error(f"[VOICE WS] Error resolving active document for org {org_id}: {e}")
+        return None, None
+    finally:
+        db.close()
+
+
+
+def _is_acoustic_echo(transcription: str, recent_ai_utterances: List[str], time_since_speech: float) -> tuple[bool, str]:
+    """
+    Evaluates whether an incoming transcript is an acoustic echo / reverberation of recent AI speech.
+    Protects against microphone feedback and acoustic reverberation while preserving genuine speech.
+    Returns (is_echo, reason).
+    """
+    if not transcription or not recent_ai_utterances:
+        return False, "empty"
+
+    norm_user = _normalize_speech(transcription)
+    if not norm_user:
+        return False, "empty_norm"
+
+    user_words = norm_user.split()
+    user_word_count = len(user_words)
+    user_word_set = set(user_words)
+
+    # Echoes typically occur within 4 seconds of speech completing or while audio is playing
+    if time_since_speech > 4.5:
+        return False, "outside_window"
+
+    for recent_utt in recent_ai_utterances[-4:]:
+        recent_words = recent_utt.split()
+        ai_word_set = set(recent_words)
+
+        # 1. Exact match
+        if norm_user == recent_utt:
+            return True, "exact"
+
+        # 2. Substring match (user transcript is a phrase contained inside recent AI speech)
+        if user_word_count >= 3 and norm_user in recent_utt:
+            return True, "substring"
+
+        # 3. N-gram phrase match with word containment (e.g. "Hi may I know your full name")
+        if user_word_count >= 3:
+            has_ngram_match = False
+            for i in range(len(user_words) - 2):
+                tri = f"{user_words[i]} {user_words[i+1]} {user_words[i+2]}"
+                if tri in recent_utt:
+                    has_ngram_match = True
+                    break
+
+            if has_ngram_match:
+                overlap = len(user_word_set & ai_word_set) / float(len(user_word_set))
+                if overlap >= 0.65:
+                    return True, f"ngram_overlap_{overlap:.2f}"
+
+        # 4. Tail match (user transcript matches the trailing words of the AI utterance)
+        if user_word_count >= 3 and len(recent_words) >= user_word_count:
+            tail_phrase = " ".join(recent_words[-user_word_count:])
+            if norm_user == tail_phrase:
+                return True, "exact_tail"
+            tail_word_set = set(recent_words[-max(user_word_count, 8):])
+            tail_overlap = len(user_word_set & tail_word_set) / float(len(user_word_set))
+            if tail_overlap >= 0.70 and user_word_count >= 3:
+                return True, f"tail_overlap_{tail_overlap:.2f}"
+
+        # 5. Whole utterance Jaccard similarity
+        if user_word_count >= 4 and len(recent_words) >= 4:
+            jaccard = len(user_word_set & ai_word_set) / float(len(user_word_set | ai_word_set))
+            if jaccard > 0.65:
+                return True, f"jaccard_{jaccard:.2f}"
+
+    return False, "no_echo"
+
+
+def _contextualize_voice_query(query: str, session_history: List[dict], org_id: Optional[int], active_doc_id: Optional[str]) -> str:
+    """
+    Enriches anaphoric or vague multi-turn queries with specific product or service names
+    resolved from the conversation history and active document metadata.
+    """
+    q_clean = query.strip()
+    q_low = q_clean.lower()
+
+    # Discover known products / services for this active document
+    known_products = []
+    try:
+        known_products = rag_service.get_organization_services(org_id, document_id=active_doc_id)
+    except Exception:
+        pass
+
+    if not known_products:
+        known_products = [
+            "AI Voice Agents",
+            "Galaxy Chat",
+            "AI Knowledge Management Platform",
+            "Business Automation and AI Agents",
+            "Business Applications",
+            "Websites and Web Applications",
+            "Custom Software and Integrations"
+        ]
+
+    # 1. Ordinal references: "first product", "second one", "3rd product", "explain the first"
+    ordinals = [
+        (r'\b(?:first|1st|number\s*1|product\s*1)\b', 0),
+        (r'\b(?:second|2nd|number\s*2|product\s*2)\b', 1),
+        (r'\b(?:third|3rd|number\s*3|product\s*3)\b', 2),
+        (r'\b(?:fourth|4th|number\s*4|product\s*4)\b', 3),
+        (r'\b(?:fifth|5th|number\s*5|product\s*5)\b', 4),
+        (r'\b(?:sixth|6th|number\s*6|product\s*6)\b', 5),
+        (r'\b(?:seventh|7th|number\s*7|product\s*7)\b', 6),
+    ]
+    for pattern, idx in ordinals:
+        if re.search(pattern, q_low):
+            if idx < len(known_products):
+                target = known_products[idx]
+                return f"{target} {q_clean}"
+
+    # 2. Pronoun reference: "it", "its", "that product", "that software"
+    if re.search(r'\b(?:it|its|that product|that service|this product|this service|the software)\b', q_low) and session_history:
+        for item in reversed(session_history):
+            text_val = item.get("text", "")
+            for p in known_products:
+                if p.lower() in text_val.lower():
+                    return f"{p} {q_clean}"
+
+    # 3. High-level catalog queries: "what products", "what services", "offerings", "what do you do"
+    if any(phrase in q_low for phrase in ["what product", "what software", "what service", "what do you offer", "what do you provide", "product catalog", "all products", "list products"]):
+        return f"{q_clean} products catalog services software suite overview"
+
+    return q_clean
+
+
+def _filter_procedural_chunks(context: str, query: str) -> str:
+    """
+    Removes internal procedural instructions (e.g. closure rules, step instructions, lead qualification rules)
+    when the caller is asking informational product or service questions.
+    """
+    if not context:
+        return ""
+
+    q_low = query.lower()
+    is_info_query = any(w in q_low for w in ["product", "service", "feature", "explain", "benefit", "what is", "how does", "pricing", "cost", "software", "catalog"])
+    if not is_info_query:
+        return context
+
+    chunks = context.split("\n\n")
+    kept = []
+    procedural_patterns = [
+        r'\bclosure-rule\b',
+        r'\boutbound-call-rule\b',
+        r'To summarise, you\'re interested in',
+        r'MURI\'s goal',
+        r'Chunks retrieved',
+        r'Lead qualification & booking flow',
+        r'Ask only after the user shows interest',
+        r'Ask for contact details before closing',
+        r'Customer Identity Verification'
+    ]
+
+    for chk in chunks:
+        if any(re.search(pat, chk, re.IGNORECASE) for pat in procedural_patterns):
+            continue
+        kept.append(chk)
+
+    if not kept:
+        return context
+    return "\n\n".join(kept)
+
+
+def _extract_complete_sentences(buffer: str) -> tuple[List[str], str]:
+    """
+    Extracts completed sentences from streaming text buffer based on sentence delimiters (. ? ! \n).
+    Protects abbreviations (Dr., Mr., Mrs., AI., e.g., i.e., vs.) from premature splitting.
+    Returns (completed_sentences, remaining_buffer).
+    """
+    completed = []
+    remaining = buffer
+
+    while remaining:
+        match = re.search(r'([.?!]+(?:\s+|\n+)|(?:\n\n+))', remaining)
+        if not match:
+            break
+        end_pos = match.end()
+        candidate = remaining[:end_pos].strip()
+
+        is_abbrev = re.search(r'\b(?:Dr|Mr|Mrs|Ms|Prof|vs|eg|ie|AI|Inc|Ltd|Co|No)\.$', candidate, re.IGNORECASE)
+        if is_abbrev:
+            next_search_start = end_pos
+            match2 = re.search(r'([.?!]+(?:\s+|\n+)|(?:\n\n+))', remaining[next_search_start:])
+            if not match2:
+                break
+            end_pos = next_search_start + match2.end()
+            candidate = remaining[:end_pos].strip()
+
+        if len(candidate) > 2:
+            completed.append(candidate)
+            remaining = remaining[end_pos:]
+        else:
+            break
+
+    return completed, remaining
+
+
+def _extract_direct_sqlite_section(doc_id: str, query: str, org_id: Optional[int]) -> str:
+    """
+    Directly extracts relevant sections or catalog information from SQLite KnowledgeDocument.content
+    as a high-reliability fallback if vector search returns empty.
+    """
+    try:
+        from src.config.database import SessionLocal
+        from src.models.knowledge_doc import KnowledgeDocument
+        db = SessionLocal()
+        try:
+            doc = db.query(KnowledgeDocument).filter(KnowledgeDocument.id == int(doc_id)).first()
+            if not doc or not doc.content:
+                return ""
+            content = doc.content
+            q_words = [w.lower() for w in re.findall(r'\b[a-zA-Z]{3,}\b', query) if w.lower() not in ("what", "your", "does", "offer", "tell", "about", "have", "with", "this", "that")]
+
+            sections = re.split(r'\n(?=[#A-Z0-9\s/&\-\'\"]+\n)', content)
+            matched_sections = []
+            for sec in sections:
+                sec_lower = sec.lower()
+                matches = sum(1 for w in q_words if w in sec_lower)
+                if matches > 0:
+                    matched_sections.append((matches, sec.strip()))
+
+            if matched_sections:
+                matched_sections.sort(key=lambda x: x[0], reverse=True)
+                return "\n\n".join(s for _, s in matched_sections[:3])
+            return content[:3500]
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning(f"Error in _extract_direct_sqlite_section: {e}")
+        return ""
+
+
 @router.websocket("/ws/voice")
 @router.websocket("/ws/voice-stream")
 @router.websocket("/api/v1/ws/voice")
@@ -172,109 +461,51 @@ async def voice_endpoint(websocket: WebSocket):
     # Resolve tenant organization from token query parameter or explicit organization_id
     token = websocket.query_params.get("token")
     query_org_id = websocket.query_params.get("organization_id")
-    resolved_org_id: Optional[int] = None
+    resolved_org_id: Optional[int] = _authenticate_ws_token(token, query_org_id)
+    org_id: Optional[int] = resolved_org_id or 1  # Default to 1 for unauthenticated dev/test connections
 
-    if token:
-        try:
-            clean_token = token.strip().strip('"\'')
-            if clean_token.lower().startswith("bearer "):
-                clean_token = clean_token[7:].strip()
+    # Resolve Active RAG snapshot for this connection
+    active_doc, script_meta = _resolve_and_validate_active_doc(org_id)
+    active_doc_id: Optional[str] = str(active_doc.id) if active_doc else None
+    active_doc_title: str = active_doc.title if active_doc else "No Active Document"
+    b_type = script_meta.get("business_type", "GENERAL") if script_meta else "GENERAL"
+    book_type = script_meta.get("booking_type", "BUSINESS_CONSULTATION") if script_meta else "BUSINESS_CONSULTATION"
+    b_name = script_meta.get("business_name") if script_meta else None
 
-            from src.config.jwt import decode_access_token
-            payload = decode_access_token(clean_token)
-            if payload and "sub" in payload:
-                user_id = payload.get("sub")
-                db_auth = SessionLocal()
-                try:
-                    user = db_auth.query(User).filter(User.id == int(user_id), User.is_active == 1).first()
-                    if user:
-                        if user.role == "super_admin":
-                            if query_org_id:
-                                try:
-                                    resolved_org_id = int(query_org_id)
-                                except (ValueError, TypeError):
-                                    resolved_org_id = None
-                            else:
-                                resolved_org_id = user.organization_id
-                        else:
-                            resolved_org_id = user.organization_id
-                finally:
-                    db_auth.close()
-            elif payload and "organization_id" in payload:
-                resolved_org_id = payload.get("organization_id")
-        except Exception as auth_err:
-            logger.warning(f"[VOICE WS AUTH] Token validation failed: {auth_err}")
-
-    # Session-bound Active RAG snapshot
-    booking_session = booking_state_service.get_session(session_id)
-    org_id = resolved_org_id or getattr(booking_session, "organization_id", None)
+    # Session initialization
+    booking_session = booking_state_service.get_session(
+        session_id=session_id,
+        organization_id=org_id,
+        business_type=b_type,
+        booking_type=book_type,
+        business_name=b_name,
+        active_doc_id=active_doc_id,
+        active_doc_title=active_doc_title
+    )
     booking_session.organization_id = org_id
+    booking_session.active_doc_id = active_doc_id
+    booking_session.active_rag_id = active_doc_id
 
-    active_doc_id: Optional[str] = rag_service._resolve_active_document_id(org_id) if org_id is not None else None
-    active_doc_title: str = "No Active Document"
-
-    if active_doc_id and org_id is not None:
-        db = SessionLocal()
-        try:
-            active_doc = db.query(KnowledgeDocument).filter(
-                KnowledgeDocument.id == int(active_doc_id),
-                KnowledgeDocument.organization_id == org_id,
-                KnowledgeDocument.ai_usage == "Active",
-                KnowledgeDocument.status.in_([KnowledgeDocStatus.INDEXED, "Indexed"])
-            ).first()
-            if active_doc:
-                active_doc_title = active_doc.title
-            else:
-                active_doc_id = None
-                active_doc_title = "No Active Document"
-        except Exception as db_err:
-            logger.warning(f"Active RAG lookup warning: {db_err}")
-            active_doc_id = None
-            active_doc_title = "No Active Document"
-        finally:
-            db.close()
-
-    # Inform client of session-bound active RAG
+    # Inform client of session-bound active RAG on connection
     await websocket.send_json({
         "type": "rag_bound",
-        "title": active_doc_title if (active_doc_id and active_doc_title != "None") else "No Active Document",
-        "document_id": active_doc_id
+        "title": active_doc_title,
+        "document_id": active_doc_id,
+        "has_active": bool(active_doc),
+        "business_type": b_type,
+        "booking_type": book_type
     })
+
+    logger.info(
+        f"[TEST_VOICE_SESSION] session_id={session_id} org_id={org_id} "
+        f"active_doc_id={active_doc_id} title='{active_doc_title}' "
+        f"business_type={b_type} booking_type={book_type}"
+    )
 
     # Server-Side Acoustic Echo Tracker
     recent_ai_utterances: List[str] = []
     last_ai_speech_time: float = 0.0
-
-    # Send automatic opening greeting from active script immediately on connection
-    try:
-        opening_greeting = rag_service.get_organization_greeting(org_id, document_id=active_doc_id)
-        if opening_greeting:
-            booking_session.greeting_sent = True
-            booking_session.conversation_started = True
-            clean_norm = _normalize_speech(opening_greeting)
-            if clean_norm:
-                recent_ai_utterances.append(clean_norm)
-            last_ai_speech_time = time.time()
-
-            await websocket.send_json({
-                "type": "response",
-                "text": opening_greeting
-            })
-            audio_response = await tts_service.synthesize_stream_chunk_async(opening_greeting, language="en")
-            if audio_response and len(audio_response) > 100:
-                audio_base64 = base64.b64encode(audio_response).decode('utf-8')
-                await websocket.send_json({
-                    "type": "audio",
-                    "audio": audio_base64
-                })
-            _log_turn(session_id, "[CALL_START]", opening_greeting, "greeting", booking_session)
-            await _handle_post_response_state(websocket, booking_session, session_id, "en", recent_ai_utterances)
-    except (asyncio.CancelledError, WebSocketDisconnect):
-        logger.info(f"Opening greeting cancelled or disconnected for session {session_id}")
-        return
-    except Exception as exc:
-        logger.warning(f"Opening greeting warning: {exc}")
-
+    is_ai_playing: bool = False
     is_on_hold = False
     last_processed_utterance_id = None
     last_processed_hash = None
@@ -283,6 +514,9 @@ async def voice_endpoint(websocket: WebSocket):
     try:
         while True:
             data = await websocket.receive()
+            if data.get("type") in ("websocket.disconnect", "disconnect"):
+                logger.info(f"[TEST_WEBSOCKET] Client disconnected: session_id={session_id}")
+                break
 
             async with socket_lock:
                 tracker = LatencyTracker(call_sid=session_id)
@@ -329,39 +563,158 @@ async def voice_endpoint(websocket: WebSocket):
                         text_data = json.loads(data['text'])
                         msg_type = text_data.get('type')
 
-                        if msg_type == 'auth':
+                        if msg_type in ('auth', 'init'):
                             auth_tok = text_data.get('token')
                             if auth_tok:
-                                clean_tok = auth_tok.strip().strip('"\'')
-                                if clean_tok.lower().startswith('bearer '):
-                                    clean_tok = clean_tok[7:].strip()
-                                from src.config.jwt import decode_access_token
-                                payload = decode_access_token(clean_tok)
-                                if payload and "sub" in payload:
-                                    db_auth = SessionLocal()
-                                    try:
-                                        u = db_auth.query(User).filter(User.id == int(payload["sub"]), User.is_active == 1).first()
-                                        if u and u.role != "super_admin":
-                                            org_id = u.organization_id
-                                            booking_session.organization_id = org_id
-                                            active_doc_id = rag_service._resolve_active_document_id(org_id)
-                                            active_doc_title = "No Active Document"
-                                            if active_doc_id:
-                                                active_doc = db_auth.query(KnowledgeDocument).filter(
-                                                    KnowledgeDocument.id == int(active_doc_id),
-                                                    KnowledgeDocument.organization_id == org_id,
-                                                    KnowledgeDocument.ai_usage == "Active",
-                                                    KnowledgeDocument.status.in_([KnowledgeDocStatus.INDEXED, "Indexed"])
-                                                ).first()
-                                                if active_doc:
-                                                    active_doc_title = active_doc.title
-                                            await websocket.send_json({
-                                                "type": "rag_bound",
-                                                "title": active_doc_title if (active_doc_id and active_doc_title != "None") else "No Active Document",
-                                                "document_id": active_doc_id
-                                            })
-                                    finally:
-                                        db_auth.close()
+                                tok_org = _authenticate_ws_token(auth_tok, text_data.get('organization_id'))
+                                if tok_org is not None:
+                                    org_id = tok_org
+                                    resolved_org_id = tok_org
+
+                            active_doc, script_meta = _resolve_and_validate_active_doc(org_id)
+                            active_doc_id = str(active_doc.id) if active_doc else None
+                            active_doc_title = active_doc.title if active_doc else "No Active Document"
+                            b_type = script_meta.get("business_type", "GENERAL") if script_meta else "GENERAL"
+                            book_type = script_meta.get("booking_type", "BUSINESS_CONSULTATION") if script_meta else "BUSINESS_CONSULTATION"
+                            b_name = script_meta.get("business_name") if script_meta else None
+
+                            booking_session.organization_id = org_id
+                            booking_session.active_doc_id = active_doc_id
+                            booking_session.active_rag_id = active_doc_id
+                            booking_session.business_type = b_type
+                            booking_session.booking_type = book_type
+                            booking_session.business_name = b_name
+
+                            await websocket.send_json({
+                                "type": "rag_bound",
+                                "title": active_doc_title,
+                                "document_id": active_doc_id,
+                                "has_active": bool(active_doc),
+                                "business_type": b_type,
+                                "booking_type": book_type
+                            })
+                            continue
+
+                        if msg_type == 'start_call':
+                            logger.info(f"[VOICE WS] Received start_call command for session {session_id}")
+                            start_tok = text_data.get('token')
+                            if start_tok:
+                                tok_org = _authenticate_ws_token(start_tok, text_data.get('organization_id'))
+                                if tok_org is not None:
+                                    org_id = tok_org
+                                    resolved_org_id = tok_org
+
+                            # Fetch currently active RAG document from DB to guarantee fresh state
+                            active_doc, script_meta = _resolve_and_validate_active_doc(org_id)
+                            if not active_doc:
+                                logger.warning(f"[VOICE WS] start_call rejected: No active RAG document for org {org_id}")
+                                await websocket.send_json({
+                                    "type": "call_error",
+                                    "message": "Cannot start call: No active RAG document found for your organization. Please upload and activate a document in Knowledge Base first."
+                                })
+                                continue
+
+                            active_doc_id = str(active_doc.id)
+                            active_doc_title = active_doc.title
+                            b_type = script_meta.get("business_type", "GENERAL") if script_meta else "GENERAL"
+                            book_type = script_meta.get("booking_type", "BUSINESS_CONSULTATION") if script_meta else "BUSINESS_CONSULTATION"
+                            b_name = script_meta.get("business_name") if script_meta else None
+
+                            # Initialize completely new voice conversation session
+                            booking_state_service.remove_session(session_id)
+                            booking_session = booking_state_service.get_session(
+                                session_id=session_id,
+                                organization_id=org_id,
+                                business_type=b_type,
+                                booking_type=book_type,
+                                business_name=b_name,
+                                active_doc_id=active_doc_id,
+                                active_doc_title=active_doc_title
+                            )
+                            booking_session.greeting_sent = True
+                            booking_session.conversation_started = True
+                            booking_session.turn_count = 0
+                            session_history.clear()
+                            recent_ai_utterances.clear()
+                            is_on_hold = False
+
+                            logger.info(
+                                f"\n[VOICE_CALL_INITIALIZED]"
+                                f"\n  session_id={session_id}"
+                                f"\n  organization_id={org_id}"
+                                f"\n  active_doc_id={active_doc_id}"
+                                f"\n  active_doc_title='{active_doc_title}'"
+                                f"\n  business_type={b_type}"
+                                f"\n  booking_type={book_type}"
+                            )
+
+                            await websocket.send_json({
+                                "type": "call_started",
+                                "session_id": session_id,
+                                "document_id": active_doc.id,
+                                "title": active_doc_title,
+                                "business_type": b_type,
+                                "booking_type": book_type
+                            })
+
+                            await websocket.send_json({
+                                "type": "rag_bound",
+                                "title": active_doc_title,
+                                "document_id": active_doc_id,
+                                "has_active": True
+                            })
+
+                            # Start opening greeting from the active document
+                            try:
+                                opening_greeting = rag_service.get_organization_greeting(org_id, document_id=active_doc_id)
+                                if not opening_greeting:
+                                    opening_greeting = f"Good morning! Thank you for calling {b_name or 'our office'}. How may I assist you?"
+
+                                clean_norm = _normalize_speech(opening_greeting)
+                                if clean_norm:
+                                    recent_ai_utterances.append(clean_norm)
+                                last_ai_speech_time = time.time()
+
+                                await websocket.send_json({
+                                    "type": "state",
+                                    "state": "AI_SPEAKING"
+                                })
+                                await websocket.send_json({
+                                    "type": "response",
+                                    "text": opening_greeting
+                                })
+                                audio_response = await tts_service.synthesize_speech_async(clean_markdown_for_voice(opening_greeting), language="en")
+                                if audio_response and len(audio_response) > 100:
+                                    audio_base64 = base64.b64encode(audio_response).decode('utf-8')
+                                    await websocket.send_json({
+                                        "type": "audio",
+                                        "audio": audio_base64,
+                                        "text": opening_greeting
+                                    })
+                                _log_turn(session_id, "[CALL_START]", opening_greeting, "greeting", booking_session)
+                                await _handle_post_response_state(websocket, booking_session, session_id, "en", recent_ai_utterances)
+                            except Exception as exc:
+                                logger.error(f"[VOICE WS] Opening greeting error: {exc}")
+                            continue
+
+                        if msg_type == 'stop_call':
+                            logger.info(f"[VOICE WS] Received stop_call command for session {session_id}")
+                            try:
+                                if org_id is not None:
+                                    asyncio.create_task(asyncio.to_thread(agent_engine.generate_session_summary, session_id, org_id))
+                            except Exception as _e:
+                                logger.warning(f"Could not trigger post-call summary: {_e}")
+                            booking_state_service.remove_session(session_id)
+                            session_history.clear()
+                            recent_ai_utterances.clear()
+                            await websocket.send_json({
+                                "type": "call_ended",
+                                "status": "idle"
+                            })
+                            await websocket.send_json({
+                                "type": "state",
+                                "state": "IDLE"
+                            })
                             continue
 
                         if msg_type == 'interrupt':
@@ -380,6 +733,18 @@ async def voice_endpoint(websocket: WebSocket):
                             booking_session.state = "LISTENING"
                             logger.info(f"[RECEPTIONIST_SESSION] session_id={session_id} RESUMED.")
                             await websocket.send_json({"type": "state", "state": "LISTENING"})
+                            continue
+
+                        if msg_type == 'playback_started':
+                            is_ai_playing = True
+                            last_ai_speech_time = time.time()
+                            logger.info(f"[TEST_TTS_PLAYBACK] session_id={session_id} browser playback started")
+                            continue
+
+                        if msg_type == 'playback_completed':
+                            is_ai_playing = False
+                            last_ai_speech_time = time.time()
+                            logger.info(f"[TEST_TTS_PLAYBACK] session_id={session_id} browser playback completed")
                             continue
 
                         if msg_type in ('reschedule', 'cancellation', 'callback', 'handoff', 'human_handoff'):
@@ -401,8 +766,10 @@ async def voice_endpoint(websocket: WebSocket):
 
                         transcription = text_data.get('text', '').strip()
                         utterance_id = text_data.get('utterance_id')
+                        confidence = text_data.get('confidence', 1.0)
                     except Exception:
                         transcription = ""
+                        confidence = 1.0
 
                     if not transcription:
                         continue
@@ -425,38 +792,32 @@ async def voice_endpoint(websocket: WebSocket):
                     continue
 
                 # PRECISE SERVER-SIDE ACOUSTIC ECHO REJECTION
-                norm_user = _normalize_speech(transcription)
-                if norm_user:
-                    is_echo = False
-                    time_since_speech = time.time() - last_ai_speech_time
+                time_since_speech = time.time() - last_ai_speech_time
+                if is_ai_playing and time_since_speech < 15.0:
+                    logger.info(
+                        f"[TEST_WEBSOCKET] [SPEECH DURING AI PLAYBACK DROPPED] session_id={session_id} "
+                        f"Ignored transcript captured while browser audio was playing ({time_since_speech:.2f}s): '{transcription}'"
+                    )
+                    continue
 
-                    if time_since_speech < 2.0:
-                        for recent_utt in recent_ai_utterances[-3:]:
-                            if norm_user == recent_utt:
-                                is_echo = True
-                                break
-                            user_words = set(norm_user.split())
-                            ai_words = set(recent_utt.split())
-                            if len(user_words) >= 4 and len(ai_words) >= 4:
-                                jaccard = len(user_words & ai_words) / float(len(user_words | ai_words))
-                                if jaccard > 0.85:
-                                    is_echo = True
-                                    break
-
-                    if is_echo:
-                        logger.warning(
-                            f"[SERVER ACOUSTIC ECHO SUPPRESSED] Dropped incoming transcript matching recent AI output ({time_since_speech:.2f}s ago): '{transcription}'"
-                        )
-                        continue
+                is_echo, echo_reason = _is_acoustic_echo(transcription, recent_ai_utterances, time_since_speech)
+                if is_echo:
+                    logger.warning(
+                        f"[TEST_WEBSOCKET] [ACOUSTIC ECHO SUPPRESSED] session_id={session_id} "
+                        f"Dropped incoming transcript matching recent AI speech ({echo_reason}, {time_since_speech:.2f}s ago): '{transcription}'"
+                    )
+                    continue
 
                 logger.info(
-                    f"[STT_FINAL]\n"
-                    f"session_id={session_id}\n"
-                    f"call_sid={booking_session.call_sid}\n"
-                    f"utterance_id={utterance_id}\n"
-                    f"transcript='{transcription}' (len={len(transcription)})\n"
-                    f"language={booking_session.conversation_language}\n"
-                    f"stage={booking_session.state}"
+                    f"\n[VOICE_TURN_START]"
+                    f"\n  session_id={session_id}"
+                    f"\n  call_sid={booking_session.call_sid}"
+                    f"\n  utterance_id={utterance_id}"
+                    f"\n  transcript='{transcription}'"
+                    f"\n  confidence={confidence}"
+                    f"\n  language={booking_session.conversation_language}"
+                    f"\n  state_before={booking_session.state}"
+                    f"\n  extracted_fields={json.dumps({k: v for k, v in booking_session.booking_data.items() if v is not None and k != 'idempotency_key'})}"
                 )
                 await websocket.send_json({
                     "type": "transcription",
@@ -669,8 +1030,12 @@ async def voice_endpoint(websocket: WebSocket):
                 is_intent_switched = booking_state_service.check_and_handle_intent_switch(booking_session, intent_name, transcription)
 
                 # 3. BOOKING STATE MACHINE ROUTING
-                if not is_intent_switched and (booking_session.is_active() or intent_name in ("appointment_booking", "appointment_availability")):
-                    if intent_name == "appointment_booking" and booking_session.is_completed:
+                is_booking_intent = (
+                    intent_name in ("appointment_booking", "appointment_availability", "sales_demo_booking", "demo_booking", "schedule_demo")
+                    or any(w in transcription.lower() for w in ["book", "appointment", "schedule", "demo", "reserve"])
+                )
+                if not is_intent_switched and (booking_session.is_active() or is_booking_intent):
+                    if intent_name in ("appointment_booking", "sales_demo_booking") and booking_session.is_completed:
                         booking_session.reset()
 
                     response_text = booking_state_service.process_booking_turn(transcription, booking_session)
@@ -699,9 +1064,19 @@ async def voice_endpoint(websocket: WebSocket):
                     except Exception as e:
                         logger.error(f"Booking state TTS generation failed: {e}")
 
-                    tracker.record("tts_total", (time.perf_counter() - t_tts) * 1000.0)
+                    tts_dur_ms = (time.perf_counter() - t_tts) * 1000.0
+                    tracker.record("tts_total", tts_dur_ms)
                     tracker.mark("tts_completed_at")
                     telemetry = tracker.log_summary()
+                    logger.info(
+                        f"\n[VOICE_TURN_COMPLETE]"
+                        f"\n  session_id={session_id}"
+                        f"\n  utterance_id={utterance_id}"
+                        f"\n  intent={intent_name}"
+                        f"\n  state_after={booking_session.state}"
+                        f"\n  extracted_fields={json.dumps({k: v for k, v in booking_session.booking_data.items() if v is not None and k != 'idempotency_key'})}"
+                        f"\n  tts_latency_ms={tts_dur_ms:.1f}"
+                    )
                     await websocket.send_json({"type": "telemetry", "data": telemetry})
                     _log_turn(session_id, transcription, response_text, intent_name, booking_session)
                     session_history.append({"role": "user", "text": transcription})
@@ -719,35 +1094,53 @@ async def voice_endpoint(websocket: WebSocket):
                     t_rag = time.perf_counter()
                     tracker.mark("retrieval_started_at")
                     try:
-                        current_doc_id = rag_service._resolve_active_document_id(org_id)
+                        current_doc_id = str(booking_session.active_doc_id) if getattr(booking_session, "active_doc_id", None) else rag_service._resolve_active_document_id(org_id)
+                        contextualized_query = _contextualize_voice_query(transcription, session_history, org_id, current_doc_id)
+
                         rag_task = asyncio.create_task(
                             asyncio.to_thread(
                                 rag_service.retrieve_context,
-                                transcription, 5, org_id, intent_name, current_doc_id
+                                query=contextualized_query,
+                                n_results=5,
+                                organization_id=org_id,
+                                intent=intent_name,
+                                document_id=current_doc_id,
+                                scope="inbound"
                             )
                         )
-                        context = await rag_task
+                        raw_context = await rag_task
+                        context = _filter_procedural_chunks(raw_context, transcription)
 
-                        if context:
-                            doc_title_to_send = active_doc_title
-                            if current_doc_id and org_id is not None:
-                                try:
-                                    _d = SessionLocal()
-                                    doc_obj = _d.query(KnowledgeDocument).filter(
-                                        KnowledgeDocument.id == int(current_doc_id),
-                                        KnowledgeDocument.organization_id == org_id
-                                    ).first()
-                                    if doc_obj:
-                                        doc_title_to_send = doc_obj.title
-                                    _d.close()
-                                except Exception:
-                                    pass
-                            await websocket.send_json({
-                                "type": "rag",
-                                "source": f"{doc_title_to_send} (ID: {current_doc_id})" if (current_doc_id and doc_title_to_send not in ("None", "No Active Document")) else "Active Knowledge Base"
-                            })
+                        # SQLite section direct extraction fallback
+                        if not context and current_doc_id:
+                            context = _extract_direct_sqlite_section(current_doc_id, contextualized_query, org_id)
+
+                        doc_title_to_send = active_doc_title
+                        if current_doc_id and org_id is not None:
+                            try:
+                                _d = SessionLocal()
+                                doc_obj = _d.query(KnowledgeDocument).filter(
+                                    KnowledgeDocument.id == int(current_doc_id),
+                                    KnowledgeDocument.organization_id == org_id
+                                ).first()
+                                if doc_obj:
+                                    doc_title_to_send = doc_obj.title
+                                _d.close()
+                            except Exception:
+                                pass
+
+                        logger.info(
+                            f"[TEST_RAG_RETRIEVAL] session_id={session_id} doc_id={current_doc_id} "
+                            f"query='{transcription}' contextualized='{contextualized_query}' "
+                            f"context_length={len(context)} latency_ms={round((time.perf_counter() - t_rag) * 1000)}"
+                        )
+
+                        await websocket.send_json({
+                            "type": "rag",
+                            "source": f"{doc_title_to_send} (ID: {current_doc_id})" if (current_doc_id and doc_title_to_send not in ("None", "No Active Document")) else "Active Knowledge Base"
+                        })
                     except Exception as e:
-                        logger.error(f"RAG retrieval error: {e}")
+                        logger.error(f"[TEST_RAG_RETRIEVAL] RAG retrieval error: {e}")
                         context = ""
                     tracker.record("retrieval_ms", (time.perf_counter() - t_rag) * 1000.0)
                     tracker.mark("retrieval_completed_at")
@@ -770,11 +1163,13 @@ async def voice_endpoint(websocket: WebSocket):
                     except Exception as e:
                         logger.warning(f"Voice WS calendar verification error: {e}")
 
-                # 5. STREAMING LLM & STREAMING TTS PIPELINE
+                # 5. STREAMING LLM & STREAMING TTS PIPELINE (< 1.5s time to first audio chunk)
                 t_llm_start = time.perf_counter()
                 tracker.mark("llm_started_at")
                 session_history.append({"role": "user", "text": transcription})
                 full_response_text = ""
+                sentence_buffer = ""
+                chunk_index = 0
 
                 first_token_recorded = False
                 first_audio_recorded = False
@@ -802,21 +1197,99 @@ async def voice_endpoint(websocket: WebSocket):
                             first_token_recorded = True
 
                         full_response_text += token_chunk
+                        sentence_buffer += token_chunk
+
                         # Stream text chunk to UI so user sees real-time visual transcription/typing
                         await websocket.send_json({
                             "type": "text_chunk",
                             "text": token_chunk
                         })
 
+                        # Extract completed sentences to synthesize immediate TTS chunk
+                        sentences, remaining = _extract_complete_sentences(sentence_buffer)
+                        if sentences:
+                            sentence_buffer = remaining
+                            for sentence in sentences:
+                                clean_voice_sent = clean_markdown_for_voice(sentence)
+                                if clean_voice_sent and len(clean_voice_sent) >= 3:
+                                    t_tts_c_start = time.perf_counter()
+                                    try:
+                                        audio_chunk = await tts_service.synthesize_speech_async(clean_voice_sent, language=current_lang)
+                                        if audio_chunk and len(audio_chunk) > 100:
+                                            chunk_b64 = base64.b64encode(audio_chunk).decode('utf-8')
+                                            first_audio_ms = (time.perf_counter() - t_llm_start) * 1000.0
+                                            if not first_audio_recorded:
+                                                tracker.record("tts_first_audio_ms", first_audio_ms)
+                                                tracker.mark("first_audio_at")
+                                                first_audio_recorded = True
+
+                                            logger.info(
+                                                f"[TEST_TTS_PLAYBACK] session_id={session_id} chunk_index={chunk_index} "
+                                                f"first_audio_ms={first_audio_ms:.1f} tts_ms={(time.perf_counter() - t_tts_c_start)*1000:.1f} "
+                                                f"audio_bytes={len(audio_chunk)} text='{clean_voice_sent[:50]}...'"
+                                            )
+
+                                            await websocket.send_json({"type": "state", "state": "AI_SPEAKING"})
+                                            await websocket.send_json({
+                                                "type": "audio_chunk",
+                                                "audio": chunk_b64,
+                                                "text": sentence,
+                                                "chunk_index": chunk_index,
+                                                "is_first": (chunk_index == 0)
+                                            })
+                                            chunk_index += 1
+                                    except Exception as tts_err:
+                                        logger.warning(f"[VOICE STREAMING TTS] Chunk {chunk_index} synthesis failed: {tts_err}")
+
+                    # Flush any remaining text in sentence buffer
+                    remaining_clean = clean_markdown_for_voice(sentence_buffer.strip())
+                    if remaining_clean and len(remaining_clean) >= 3:
+                        t_tts_c_start = time.perf_counter()
+                        try:
+                            audio_chunk = await tts_service.synthesize_speech_async(remaining_clean, language=current_lang)
+                            if audio_chunk and len(audio_chunk) > 100:
+                                chunk_b64 = base64.b64encode(audio_chunk).decode('utf-8')
+                                first_audio_ms = (time.perf_counter() - t_llm_start) * 1000.0
+                                if not first_audio_recorded:
+                                    tracker.record("tts_first_audio_ms", first_audio_ms)
+                                    tracker.mark("first_audio_at")
+                                    first_audio_recorded = True
+
+                                logger.info(
+                                    f"[TEST_TTS_PLAYBACK] session_id={session_id} chunk_index={chunk_index} (final) "
+                                    f"first_audio_ms={first_audio_ms:.1f} tts_ms={(time.perf_counter() - t_tts_c_start)*1000:.1f} "
+                                    f"audio_bytes={len(audio_chunk)} text='{remaining_clean[:50]}...'"
+                                )
+
+                                await websocket.send_json({"type": "state", "state": "AI_SPEAKING"})
+                                await websocket.send_json({
+                                    "type": "audio_chunk",
+                                    "audio": chunk_b64,
+                                    "text": sentence_buffer.strip(),
+                                    "chunk_index": chunk_index,
+                                    "is_first": (chunk_index == 0)
+                                })
+                                chunk_index += 1
+                        except Exception as tts_err:
+                            logger.warning(f"[VOICE STREAMING TTS] Final chunk synthesis failed: {tts_err}")
+
                     response_text = full_response_text.strip()
                     session_history.append({"role": "model", "text": response_text})
 
                 except Exception as e:
-                    logger.error(f"LLM streaming pipeline failed: {e}")
+                    logger.error(f"[TEST_LLM_RESPONSE] LLM streaming pipeline failed: {e}")
                     response_text = "Thank you for contacting our reception desk. How may I assist you?"
 
-                tracker.record("llm_total_ms", (time.perf_counter() - t_llm_start) * 1000.0)
+                total_llm_ms = (time.perf_counter() - t_llm_start) * 1000.0
+                tracker.record("llm_total_ms", total_llm_ms)
                 tracker.mark("llm_completed_at")
+
+                logger.info(
+                    f"[TEST_LLM_RESPONSE] session_id={session_id} "
+                    f"first_token_ms={tracker.get_metric('llm_first_token_ms') or 0:.1f} "
+                    f"total_ms={total_llm_ms:.1f} chunks_synthesized={chunk_index} "
+                    f"text='{response_text[:80].replace(chr(10), ' ')}...'"
+                )
 
                 norm_full = _normalize_speech(response_text)
                 if norm_full:
@@ -831,36 +1304,40 @@ async def voice_endpoint(websocket: WebSocket):
                     "text": response_text
                 })
 
-                # Synthesize the complete response as ONE continuous natural audio response via Murf TTS
-                t_tts_start = time.perf_counter()
-                tracker.mark("tts_started_at")
-                clean_voice_text = clean_markdown_for_voice(response_text)
-                if clean_voice_text:
-                    try:
-                        audio_resp = await tts_service.synthesize_speech_async(clean_voice_text, language=current_lang)
-                        if audio_resp and len(audio_resp) > 100:
-                            tracker.record("tts_total", (time.perf_counter() - t_tts_start) * 1000.0)
-                            tracker.record("tts_first_audio_ms", (time.perf_counter() - t_llm_start) * 1000.0)
-                            tracker.mark("first_audio_at")
-                            tracker.mark("tts_completed_at")
-                            audio_b64 = base64.b64encode(audio_resp).decode('utf-8')
-                            await websocket.send_json({
-                                "type": "audio",
-                                "audio": audio_b64,
-                                "text": response_text
-                            })
-                    except Exception as e:
-                        logger.error(f"Voice continuous TTS synthesis failed: {e}")
+                # If no chunks were successfully synthesized (e.g. streaming fallback), synthesize whole response
+                if chunk_index == 0:
+                    clean_voice_text = clean_markdown_for_voice(response_text)
+                    if clean_voice_text:
+                        try:
+                            audio_resp = await tts_service.synthesize_speech_async(clean_voice_text, language=current_lang)
+                            if audio_resp and len(audio_resp) > 100:
+                                audio_b64 = base64.b64encode(audio_resp).decode('utf-8')
+                                await websocket.send_json({"type": "state", "state": "AI_SPEAKING"})
+                                await websocket.send_json({
+                                    "type": "audio",
+                                    "audio": audio_b64,
+                                    "text": response_text
+                                })
+                        except Exception as e:
+                            logger.error(f"Voice fallback TTS synthesis failed: {e}")
 
                 telemetry = tracker.log_summary()
                 await websocket.send_json({"type": "telemetry", "data": telemetry})
+                logger.info(
+                    f"\n[VOICE_TURN_COMPLETE]"
+                    f"\n  session_id={session_id}"
+                    f"\n  utterance_id={utterance_id}"
+                    f"\n  intent={intent_name}"
+                    f"\n  state_after={booking_session.state}"
+                    f"\n  llm_ms={total_llm_ms:.1f}"
+                )
                 _log_turn(session_id, transcription, response_text, intent_name, booking_session, emotion=emotion)
                 await _handle_post_response_state(websocket, booking_session, session_id, current_lang, recent_ai_utterances)
 
     except (WebSocketDisconnect, RuntimeError, asyncio.CancelledError) as e:
-        logger.info(f"Voice WebSocket disconnected ({e})")
+        logger.info(f"[TEST_WEBSOCKET] Voice WebSocket disconnected ({e}): session_id={session_id}")
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        logger.error(f"[TEST_WEBSOCKET] WebSocket error: {e}")
     finally:
         try:
             org_id = getattr(booking_session, "organization_id", None) if 'booking_session' in locals() and booking_session else None

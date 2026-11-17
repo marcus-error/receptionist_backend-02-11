@@ -261,7 +261,7 @@ class MurfTTSService:
             req_data = json.dumps(payload_dict).encode("utf-8")
             req = urllib.request.Request(url, data=req_data, headers=headers, method="POST")
 
-            with urllib.request.urlopen(req, timeout=3.5) as resp:
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
                 resp_body = resp.read()
                 data = json.loads(resp_body.decode("utf-8"))
 
@@ -287,7 +287,7 @@ class MurfTTSService:
                 # Check for downloadable audio file URL
                 audio_url = data.get("audioFile") or data.get("audio_url")
                 if audio_url:
-                    with urllib.request.urlopen(audio_url, timeout=3.5) as audio_resp:
+                    with urllib.request.urlopen(audio_url, timeout=1.5) as audio_resp:
                         audio_bytes = audio_resp.read()
                         if audio_bytes and len(audio_bytes) > 50:
                             try:

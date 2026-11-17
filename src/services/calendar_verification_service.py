@@ -77,7 +77,7 @@ class CalendarVerificationService:
         except Exception:
             return time_24h
 
-    def parse_date(self, text: str) -> date:
+    def parse_date(self, text: str, default: Any = "DEFAULT_TODAY") -> Optional[date]:
         """Parse date string into datetime.date object using timezone-aware real server clock."""
         txt = (text or "").lower().strip()
         from datetime import timezone
@@ -89,6 +89,11 @@ class CalendarVerificationService:
         except Exception:
             today = datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
 
+        fallback_date = today if default == "DEFAULT_TODAY" else default
+
+        if not txt:
+            return fallback_date
+
         if "day after tomorrow" in txt:
             return today + timedelta(days=2)
         if any(w in txt for w in ["tomorrow", "naalai", "nalai", "kal"]):
@@ -97,6 +102,8 @@ class CalendarVerificationService:
             return today
         if "next week" in txt:
             return today + timedelta(days=7)
+        if "next month" in txt:
+            return today + timedelta(days=30)
 
         # 1. Check standard date string formats directly
         for fmt in ("%d %b %Y", "%d %B %Y", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d"):
@@ -105,9 +112,21 @@ class CalendarVerificationService:
             except ValueError:
                 pass
 
-        # 2. Check Day + Month format (e.g., "22 Sep 2026", "22 Sep", "22 September")
+        # 1b. Check numeric date patterns: DD-MM-YYYY, DD/MM/YYYY, DD-MM-YY, DD/MM/YY
+        num_date_match = re.search(r'\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b', txt)
+        if num_date_match:
+            d_val, m_val, y_val = int(num_date_match.group(1)), int(num_date_match.group(2)), int(num_date_match.group(3))
+            full_year = (2000 + y_val) if y_val < 100 else y_val
+            for d_c, m_c in [(d_val, m_val), (m_val, d_val)]:
+                if 1 <= m_c <= 12 and 1 <= d_c <= 31:
+                    try:
+                        return date(full_year, m_c, d_c)
+                    except ValueError:
+                        pass
+
+        # 2. Check Day + Month format (e.g., "22 Sep 2026", "22nd of September", "22 September 2026")
         day_month_match = re.search(
-            r'\b(\d{1,2})(?:st|nd|rd|th)?\s+(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:\s+(\d{4}))?\b',
+            r'\b(\d{1,2})(?:st|nd|rd|th)?[,\s]+(?:of\s+)?(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:[,\s]+(\d{4}))?\b',
             txt
         )
         if day_month_match:
@@ -124,9 +143,9 @@ class CalendarVerificationService:
             except Exception:
                 pass
 
-        # 3. Check Month + Day format (e.g., "Sep 19", "September 19", "Sep 19 2026")
+        # 3. Check Month + Day format (e.g., "Sep 19", "September 19", "Sep 19 2026", "November 15, 2026")
         month_day_match = re.search(
-            r'\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s+(\d{4}))?\b',
+            r'\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)[,\s]+(\d{1,2})(?:st|nd|rd|th)?(?:[,\s]+(\d{4}))?\b',
             txt
         )
         if month_day_match:
@@ -158,7 +177,7 @@ class CalendarVerificationService:
             except ValueError:
                 pass
 
-        return today
+        return fallback_date
 
     def extract_doctor(self, text: str, known_staff: List[str] = None) -> Optional[str]:
         """Extract doctor/staff name dynamically from DB or text."""
