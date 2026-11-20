@@ -37,6 +37,7 @@ from src.services.language_service import language_service
 from src.services.receptionist_tools import cancel_appointment, reschedule_appointment
 from src.services.calendar_verification_service import calendar_verification_service
 from src.utils.latency_tracker import LatencyTracker
+from src.utils.text_sanitizer import clean_markdown_for_voice, deduplicate_repeated_sentences
 
 logger = logging.getLogger(__name__)
 
@@ -397,7 +398,8 @@ class AgentEngine:
             user_text, intent_name,
             organization_id=organization_id,
             is_ongoing=is_ongoing_turn,
-            booking_session=booking_session
+            booking_session=booking_session,
+            conversation_language=current_lang
         )
 
         if fast_rule_answer:
@@ -482,7 +484,10 @@ class AgentEngine:
                 cal_v = calendar_verification_service.verify_availability(user_text, history)
                 if cal_v and cal_v.is_checked and not cal_v.is_available:
                     alt_slots = ", ".join(cal_v.alternative_slots) if cal_v.alternative_slots else "another date"
-                    context += f"\n[CALENDAR AVAILABILITY NOTE: Requested slot is full. Available slots: {alt_slots}]"
+                    if getattr(cal_v, "is_past_time", False):
+                        context += f"\n[CALENDAR AVAILABILITY NOTE: Requested time has already passed. State clearly that the time has passed and offer these available slots: {alt_slots}]"
+                    else:
+                        context += f"\n[CALENDAR AVAILABILITY NOTE: Requested slot is full. Available slots: {alt_slots}]"
             except Exception as e:
                 logger.warning(f"[AGENT] Calendar verification error: {e}")
 
@@ -505,8 +510,12 @@ class AgentEngine:
             )
         except Exception as e:
             logger.error(f"[AGENT] LLM generation error: {e}")
-            response_text = "I apologize, but I am having trouble processing that right now. How else may I assist you?"
+            if current_lang == "ta":
+                response_text = "எங்கள் வரவேற்பாளர் பிரிவை தொடர்பு கொண்டதற்கு நன்றி. உங்களுக்கு எவ்வாறு உதவலாம்?"
+            else:
+                response_text = "I apologize, but I am having trouble processing that right now. How else may I assist you?"
 
+        response_text = deduplicate_repeated_sentences(clean_markdown_for_voice(response_text))
         history.append({"role": "assistant", "text": response_text})
         tracker.record("llm_total_ms", (time.perf_counter() - t_llm) * 1000.0)
         tracker.mark("llm_completed_at")

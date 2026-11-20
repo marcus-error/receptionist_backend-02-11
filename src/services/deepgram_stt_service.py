@@ -30,6 +30,24 @@ def get_deepgram_api_key() -> str:
     return str(key).strip()
 
 
+def normalize_deepgram_language(lang: Optional[str]) -> str:
+    """Normalize language code to ISO 639-1 code accepted by Deepgram Nova-3."""
+    if not lang:
+        return "en"
+    raw = str(lang).lower().strip()
+    if raw.startswith("ta") or raw.startswith("tam"):
+        return "ta"
+    elif raw.startswith("hi") or raw.startswith("hin"):
+        return "hi"
+    elif raw.startswith("te") or raw.startswith("tel"):
+        return "te"
+    elif raw.startswith("kn") or raw.startswith("kan"):
+        return "kn"
+    elif raw.startswith("en") or raw.startswith("eng"):
+        return "en"
+    return raw
+
+
 class DeepgramStreamingSession:
     """
     Per-call Deepgram WebSocket real-time streaming STT session.
@@ -60,7 +78,7 @@ class DeepgramStreamingSession:
         self.organization_id = organization_id
         self.keywords = keywords or []
         self.model = model or getattr(settings, "DEEPGRAM_MODEL", "nova-3") or "nova-3"
-        self.language = language or getattr(settings, "DEEPGRAM_LANGUAGE", "en") or "en"
+        self.language = normalize_deepgram_language(language or getattr(settings, "DEEPGRAM_LANGUAGE", "en") or "en")
         raw_endpointing = endpointing_ms or getattr(settings, "DEEPGRAM_ENDPOINTING_MS", 300) or 300
         self.endpointing_ms = max(250, min(1000, int(raw_endpointing)))
         raw_u_end = utterance_end_ms or getattr(settings, "DEEPGRAM_UTTERANCE_END_MS", 1000) or 1000
@@ -74,12 +92,14 @@ class DeepgramStreamingSession:
         self._reconnect_count = 0
         self._max_reconnects = 5
         # Mutex: only one _reconnect() may run at a time to prevent concurrent recv() race
-        self._reconnect_lock: asyncio.Lock = asyncio.Lock()
+        self._reconnect_lock: Optional[asyncio.Lock] = None
 
+        # Turn and utterance lifecycle state
         self._utterance_counter = 100
         self._current_utt_id = f"utt_{self._utterance_counter}"
         self._utterance_start_time: Optional[float] = None
         self._first_partial_time: Optional[float] = None
+        self._speech_endpoint_time: Optional[float] = None
         self._audio_bytes_sent_in_utterance = 0
         self._current_turn_transcript = ""
         self._accumulated_finals: list = []
@@ -89,34 +109,53 @@ class DeepgramStreamingSession:
         self._last_final_text = ""
         self._last_final_time = 0.0
         self._processed_final_utt_ids: set = set()
+        self._last_detected_language = self.language
+        self._last_turn_confidence = 1.0
+
+        logger.info(
+            f"[DEEPGRAM_SESSION_INITIALIZED] call_id={self.call_id} model={self.model} "
+            f"language={self.language} sample_rate={self.sample_rate} endpointing={self.endpointing_ms}ms"
+        )
+
+    def _get_reconnect_lock(self) -> asyncio.Lock:
+        if self._reconnect_lock is None:
+            self._reconnect_lock = asyncio.Lock()
+        return self._reconnect_lock
 
     def reset_turn(self, clear_audio_queue: bool = True):
         """Reset turn buffers and debounce timer cleanly when AI speaks or between turns."""
-        if self._debounce_task and not self._debounce_task.done():
-            self._debounce_task.cancel()
-            self._debounce_task = None
+        debounce = getattr(self, "_debounce_task", None)
+        if debounce and not debounce.done():
+            debounce.cancel()
+        self._debounce_task = None
         self._first_partial_time = None
         self._utterance_start_time = None
+        self._speech_endpoint_time = None
         self._audio_bytes_sent_in_utterance = 0
         self._current_turn_transcript = ""
         self._accumulated_finals = []
+        self._last_partial_text = ""
         self._turn_finalized = False
         if clear_audio_queue:
-            while not self._audio_queue.empty():
-                try:
-                    self._audio_queue.get_nowait()
-                except Exception:
-                    break
+            q = getattr(self, "_audio_queue", None)
+            if q is not None:
+                while not q.empty():
+                    try:
+                        q.get_nowait()
+                    except Exception:
+                        break
+        logger.info(f"[DEEPGRAM_SESSION_RESET] call_id={self.call_id} clear_audio_queue={clear_audio_queue}")
 
     def _build_ws_url(self) -> str:
         """Build the Deepgram WebSocket URL with numerals, smart format, and dynamic org keywords."""
+        lang_code = normalize_deepgram_language(getattr(self, 'language', 'en'))
         base_url = (
             f"wss://api.deepgram.com/v1/listen"
             f"?encoding=linear16"
             f"&sample_rate={self.sample_rate}"
             f"&channels=1"
             f"&model={self.model}"
-            f"&language={getattr(self, 'language', 'en')}"
+            f"&language={lang_code}"
             f"&interim_results=true"
             f"&endpointing={self.endpointing_ms}"
             f"&utterance_end_ms={max(1000, self.utterance_end_ms)}"
@@ -203,24 +242,31 @@ class DeepgramStreamingSession:
             return False
 
         # Guard: if reconnect already running, skip — the existing one will restart the loops
-        if self._reconnect_lock.locked():
+        if self._reconnect_lock is not None and self._reconnect_lock.locked():
             logger.debug(f"[DEEPGRAM_RECONNECT_SKIP] call_id={self.call_id} reconnect already in progress")
             return False
 
-        async with self._reconnect_lock:
+        logger.info(f"[DEEPGRAM_RECONNECT_STARTED] call_id={self.call_id} attempt={self._reconnect_count + 1}/{self._max_reconnects}")
+
+        async with self._get_reconnect_lock():
             if not self._running:
                 return False
 
             self._connected = False
 
             # Cancel all existing tasks cleanly before touching the WebSocket
-            for task in list(self._tasks):
-                if not task.done():
-                    task.cancel()
-                    try:
-                        await asyncio.wait_for(asyncio.shield(task), timeout=0.5)
-                    except Exception:
-                        pass
+            try:
+                current = asyncio.current_task()
+            except RuntimeError:
+                current = None
+            pending = [t for t in self._tasks if t is not current and not t.done()]
+            for t in pending:
+                t.cancel()
+            if pending:
+                try:
+                    await asyncio.wait(pending, timeout=0.5)
+                except Exception:
+                    pass
             self._tasks.clear()
 
             # Close old WebSocket cleanly
@@ -258,9 +304,14 @@ class DeepgramStreamingSession:
                     send_task = asyncio.create_task(self._send_loop(), name=f"dg_send_{self.call_id}")
                     recv_task = asyncio.create_task(self._recv_loop(), name=f"dg_recv_{self.call_id}")
                     self._tasks = [send_task, recv_task]
+                    logger.info(f"[DEEPGRAM_RECONNECT_SUCCEEDED] call_id={self.call_id} attempt={self._reconnect_count}")
                     logger.info(f"[DEEPGRAM_RECONNECTED] call_id={self.call_id} attempt={self._reconnect_count}")
                     return True
 
+            logger.error(
+                f"[DEEPGRAM_RECONNECT_FAILED] call_id={self.call_id} "
+                f"max_reconnects={self._max_reconnects} reached — STT unavailable for this call"
+            )
             logger.error(
                 f"[DEEPGRAM_RECONNECT_EXHAUSTED] call_id={self.call_id} "
                 f"max_reconnects={self._max_reconnects} reached — STT unavailable for this call"
@@ -273,14 +324,14 @@ class DeepgramStreamingSession:
         Re-establishes the Deepgram WebSocket stream with the new language query parameter
         without losing active call state.
         """
-        target_lang = str(new_lang or "en").lower().strip()
+        target_lang = normalize_deepgram_language(new_lang)
         if getattr(self, "language", None) == target_lang and self._connected:
             logger.info(
                 f"\n[STT_LANGUAGE]"
                 f"\n  call_id={self.call_id}"
                 f"\n  provider=deepgram"
                 f"\n  model={self.model}"
-                f"\n  requested_language={target_lang}"
+                f"\n  requested_language={new_lang}"
                 f"\n  actual_session_language_configuration={self.language}"
                 f"\n  reconnect_count={self._reconnect_count}"
                 f"\n  switch_success=True"
@@ -291,7 +342,7 @@ class DeepgramStreamingSession:
         logger.info(f"[DEEPGRAM_LANG_SWITCH] call_id={self.call_id} switching language: '{prev_lang}' -> '{target_lang}'")
         self.language = target_lang
 
-        async with self._reconnect_lock:
+        async with self._get_reconnect_lock():
             if not self._running:
                 logger.info(
                     f"\n[STT_LANGUAGE]"
@@ -308,10 +359,18 @@ class DeepgramStreamingSession:
             self._connected = False
 
             # Cancel existing send/recv tasks safely (never cancel the current executing task)
-            current_task = asyncio.current_task()
-            for task in list(self._tasks):
-                if task is not current_task and not task.done():
-                    task.cancel()
+            try:
+                current_task = asyncio.current_task()
+            except RuntimeError:
+                current_task = None
+            pending = [t for t in self._tasks if t is not current_task and not t.done()]
+            for t in pending:
+                t.cancel()
+            if pending:
+                try:
+                    await asyncio.wait(pending, timeout=0.5)
+                except Exception:
+                    pass
             self._tasks.clear()
 
             # Close old WebSocket cleanly
@@ -402,6 +461,8 @@ class DeepgramStreamingSession:
                 try:
                     chunk = await asyncio.wait_for(self._audio_queue.get(), timeout=2.0)
                     if chunk and self._ws:
+                        if not hasattr(self, "_audio_bytes_sent_in_utterance"):
+                            self._audio_bytes_sent_in_utterance = 0
                         self._audio_bytes_sent_in_utterance += len(chunk)
                         await self._ws.send(chunk)
                         now_t = time.time()
@@ -416,6 +477,10 @@ class DeepgramStreamingSession:
                             logger.info(
                                 f"[STT_AUDIO_FRAME_SENT] call_id={self.call_id} chunk_bytes={len(chunk)} "
                                 f"total_chunks={chunks_sent} total_bytes={self._audio_bytes_sent_in_utterance}"
+                            )
+                            logger.info(
+                                f"[DEEPGRAM_AUDIO_BYTES_SENT] call_id={self.call_id} chunk_bytes={len(chunk)} "
+                                f"total_bytes={self._audio_bytes_sent_in_utterance} chunks_sent={chunks_sent}"
                             )
                         logger.debug(
                             f"[DEEPGRAM_AUDIO_SENT] call_id={self.call_id} chunk_bytes={len(chunk)} timestamp={now_t:.4f}"
@@ -435,7 +500,7 @@ class DeepgramStreamingSession:
 
         # _send_loop exited: only trigger reconnect if _recv_loop hasn't already
         # (checked via lock — if lock is already held, _recv_loop owns reconnect)
-        if self._running and not self._connected and not self._reconnect_lock.locked():
+        if self._running and not self._connected and not (self._reconnect_lock is not None and self._reconnect_lock.locked()):
             asyncio.create_task(self._reconnect())
 
     async def _recv_loop(self):
@@ -549,6 +614,14 @@ class DeepgramStreamingSession:
             if interim_full and interim_full != self._last_partial_text:
                 self._last_partial_text = interim_full
                 logger.info(
+                    f"[DEEPGRAM_AUDIO_RECEIVED] call_id={self.call_id} utterance_id={self._current_utt_id} "
+                    f"duration_s={duration_s:.2f}"
+                )
+                logger.info(
+                    f"[DEEPGRAM_AUDIO_TRANSCRIBED] call_id={self.call_id} utterance_id={self._current_utt_id} "
+                    f"text='{interim_full}' is_final=False speech_final=False"
+                )
+                logger.info(
                     f"[DEEPGRAM_PARTIAL] call_id={self.call_id} utterance_id={self._current_utt_id} "
                     f"text='{interim_full}' timestamp={time.time():.4f}"
                 )
@@ -578,6 +651,14 @@ class DeepgramStreamingSession:
             if accumulated_text:
                 if accumulated_text != self._last_partial_text:
                     self._last_partial_text = accumulated_text
+                    logger.info(
+                        f"[DEEPGRAM_AUDIO_RECEIVED] call_id={self.call_id} utterance_id={self._current_utt_id} "
+                        f"duration_s={duration_s:.2f}"
+                    )
+                    logger.info(
+                        f"[DEEPGRAM_AUDIO_TRANSCRIBED] call_id={self.call_id} utterance_id={self._current_utt_id} "
+                        f"text='{accumulated_text}' is_final=True speech_final=False"
+                    )
                     logger.info(
                         f"[DEEPGRAM_PARTIAL] call_id={self.call_id} utterance_id={self._current_utt_id} "
                         f"text='{accumulated_text}' timestamp={time.time():.4f}"
@@ -691,6 +772,14 @@ class DeepgramStreamingSession:
         finalization_latency_ms = max(40, round((now - t_speech_endpoint) * 1000))
         real_conf = float(confidence if (confidence is not None and confidence > 0.0) else getattr(self, "_last_turn_confidence", 1.0) or 1.0)
 
+        logger.info(
+            f"[DEEPGRAM_AUDIO_RECEIVED] call_id={self.call_id} utterance_id={utt_id} "
+            f"duration_s={actual_dur_s:.2f}"
+        )
+        logger.info(
+            f"[DEEPGRAM_AUDIO_TRANSCRIBED] call_id={self.call_id} utterance_id={utt_id} "
+            f"text='{text}' is_final=True speech_final=True"
+        )
         logger.info(
             f"[DEEPGRAM_FINAL] call_id={self.call_id} utterance_id={utt_id} "
             f"text='{text}' speech_dur={customer_speech_duration_ms}ms "
@@ -806,9 +895,15 @@ class DeepgramStreamingSession:
         self._running = False
         self._connected = False
 
-        if self._debounce_task and not self._debounce_task.done():
-            self._debounce_task.cancel()
-            self._debounce_task = None
+        debounce = getattr(self, "_debounce_task", None)
+        if debounce and not debounce.done():
+            debounce.cancel()
+            if hasattr(debounce, "__await__"):
+                try:
+                    await debounce
+                except (asyncio.CancelledError, Exception):
+                    pass
+        self._debounce_task = None
 
         try:
             if self._ws:
@@ -820,9 +915,19 @@ class DeepgramStreamingSession:
         finally:
             self._ws = None
 
-        for task in self._tasks:
-            if not task.done():
-                task.cancel()
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:
+            current = None
+        pending_tasks = [t for t in list(self._tasks) if t is not current and not t.done()]
+        for task in pending_tasks:
+            task.cancel()
+
+        if pending_tasks:
+            try:
+                await asyncio.wait(pending_tasks, timeout=0.5)
+            except Exception:
+                pass
         self._tasks.clear()
 
         # Drain audio queue
@@ -832,4 +937,5 @@ class DeepgramStreamingSession:
             except Exception:
                 break
 
+        logger.info(f"[DEEPGRAM_TASK_CLEANUP] call_id={self.call_id} cleaned_tasks={len(pending_tasks)}")
         logger.info(f"[DEEPGRAM_STREAM_STOPPED] call_id={self.call_id}")

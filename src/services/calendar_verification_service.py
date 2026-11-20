@@ -13,8 +13,11 @@ class CalendarVerificationResult(BaseModel):
     requested_date: Optional[str] = None
     requested_time: Optional[str] = None
     is_available: Optional[bool] = None
+    is_past_time: bool = False
     reason: str = ""
     alternative_slots: List[str] = []
+    next_available_date: Optional[str] = None
+    next_available_slots: List[str] = []
     prompt_summary: str = ""
 
 
@@ -29,14 +32,35 @@ class CalendarVerificationService:
 
     @staticmethod
     def parse_time_to_24h(time_str: str) -> Optional[str]:
-        """Convert various time formats (9:30 PM, 9:30 p.m., 21:30, 9.30pm, 10am) to HH:MM (24-hour)."""
+        """Convert various time formats (9:30 PM, 9:30 p.m., 21:30, 9.30pm, 10am, 3 o'clock, after lunch) to HH:MM (24-hour)."""
         if not time_str:
             return None
 
         clean = time_str.strip().lower()
         clean = re.sub(r'\bp\.?m\.?\b', 'pm', clean)
         clean = re.sub(r'\ba\.?m\.?\b', 'am', clean)
+        clean = re.sub(r"\bo\s*'?\s*clock\b", "", clean)
         clean = clean.replace(".", ":")
+
+        # Check for natural relative phrases without explicit digits
+        if any(ph in clean for ph in ["after lunch", "post lunch"]):
+            return "14:00"
+        if any(ph in clean for ph in ["this afternoon", "afternoon"]) and not re.search(r'\d', clean):
+            return "14:00"
+        if any(ph in clean for ph in ["this evening", "evening"]) and not re.search(r'\d', clean):
+            return "17:00"
+        if any(ph in clean for ph in ["this morning", "morning"]) and not re.search(r'\d', clean):
+            return "10:00"
+        if any(ph in clean for ph in ["at noon", "noon"]) and not re.search(r'\d', clean):
+            return "12:00"
+
+        # If natural time of day is combined with numbers (e.g. "3 in the afternoon", "4 evening", "10 in the morning")
+        if any(w in clean for w in ["afternoon", "evening", "post lunch", "after lunch"]):
+            if not re.search(r'\b(am|pm)\b', clean):
+                clean += " pm"
+        elif "morning" in clean:
+            if not re.search(r'\b(am|pm)\b', clean):
+                clean += " am"
 
         # Check for range expressions like "9 to 9:30 am", "9 - 9:30 am", "2 to 3 pm"
         range_match = re.search(r'(\d{1,2})(?::(\d{2}))?\s*(?:to|-|–)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?', clean)
@@ -77,16 +101,14 @@ class CalendarVerificationService:
         except Exception:
             return time_24h
 
-    def parse_date(self, text: str, default: Any = "DEFAULT_TODAY") -> Optional[date]:
+    def parse_date(self, text: str, default: Any = "DEFAULT_TODAY", reference_now: Optional[datetime] = None) -> Optional[date]:
         """Parse date string into datetime.date object using timezone-aware real server clock."""
         txt = (text or "").lower().strip()
-        from datetime import timezone
+        from src.routes.availability_routes import get_current_business_datetime
         try:
-            from zoneinfo import ZoneInfo
-            from src.config.env import settings
-            tz_str = getattr(settings, "BUSINESS_TIMEZONE", None) or getattr(settings, "TIMEZONE", "Asia/Kolkata")
-            today = datetime.now(ZoneInfo(tz_str)).date()
+            today = get_current_business_datetime(reference_now=reference_now).date()
         except Exception:
+            from datetime import timezone
             today = datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
 
         fallback_date = today if default == "DEFAULT_TODAY" else default
@@ -211,11 +233,12 @@ class CalendarVerificationService:
 
         return None
 
-    def verify_availability(self, text: str, session_history: List[dict] = None, intent: Optional[str] = None) -> CalendarVerificationResult:
+    def verify_availability(self, text: str, session_history: List[dict] = None, intent: Optional[str] = None, reference_now: Optional[datetime] = None) -> CalendarVerificationResult:
         """
         Main entry point: Inspects user text and context for doctor/date/time requests,
         queries the live database via `get_available_slots`, and returns verified status.
         Only runs when the current user request is an appointment availability or booking query.
+        Includes real-time past-time checking and dynamic next-available-date discovery.
         """
         if intent and intent not in ("appointment_availability", "appointment_booking", "BOOK_APPOINTMENT", "CHECK_AVAILABILITY", "appointment_cancellation", "appointment_rescheduling"):
             return CalendarVerificationResult(is_checked=False)
@@ -233,7 +256,7 @@ class CalendarVerificationService:
 
         from src.config.database import SessionLocal
         from src.models.staff import Staff
-        from src.routes.availability_routes import get_available_slots
+        from src.routes.availability_routes import get_available_slots, get_current_business_datetime, find_next_available_slots
 
         db = SessionLocal()
         try:
@@ -243,7 +266,22 @@ class CalendarVerificationService:
             staff_names = [s.name for s in all_staff]
 
             doctor_name = self.extract_doctor(combined_text, known_staff=staff_names)
-            target_date = self.parse_date(combined_text)
+            target_date = self.parse_date(combined_text, reference_now=reference_now)
+
+            time_regex = r'\b(\d{1,2}(?::\d{2})?\s*(?:to|-|–)\s*\d{1,2}(?::\d{2})?\s*(?:[ap]\.?m\.?))\b|\b(\d{1,2}(?::\d{2})?\s*(?:[ap]\.?m\.?))\b|\b(\d{1,2}:\d{2})\b|\b(\d{1,2}\s*(?:[ap]\.?m\.?))\b|\b(after lunch|post lunch|this afternoon|afternoon|this evening|evening|this morning|morning|noon)\b'
+            time_match = re.search(time_regex, text.lower())
+            if not time_match and session_history:
+                for m in reversed(session_history):
+                    if m.get("role") == "user":
+                        t_m = re.search(time_regex, m.get("text", "").lower())
+                        if t_m:
+                            time_match = t_m
+                            break
+
+            raw_time_str = (time_match.group(1) or time_match.group(2) or time_match.group(3) or (time_match.group(4) if len(time_match.groups()) >= 4 else None) or (time_match.group(5) if len(time_match.groups()) >= 5 else None)) if time_match else None
+            if raw_time_str:
+                raw_time_str = raw_time_str.upper()
+            target_time_24h = self.parse_time_to_24h(raw_time_str) if raw_time_str else None
 
             staff = None
             if doctor_name:
@@ -273,8 +311,8 @@ class CalendarVerificationService:
                         is_checked=True,
                         is_available=True,
                         doctor_name=doctor_name or "Representative",
-                        target_date=target_date,
-                        target_time=raw_time_str or "11:30 AM",
+                        requested_date=target_date.strftime("%A, %b %d, %Y"),
+                        requested_time=raw_time_str or "11:30 AM",
                         prompt_summary=f"[LIVE CALENDAR VERIFICATION: Available for {doctor_name}]"
                     )
 
@@ -292,20 +330,15 @@ class CalendarVerificationService:
 
             staff_id = staff.id
 
-            time_regex = r'\b(\d{1,2}(?::\d{2})?\s*(?:to|-|–)\s*\d{1,2}(?::\d{2})?\s*(?:[ap]\.?m\.?))\b|\b(\d{1,2}(?::\d{2})?\s*(?:[ap]\.?m\.?))\b|\b(\d{1,2}:\d{2})\b|\b(\d{1,2}\s*(?:[ap]\.?m\.?))\b'
-            time_match = re.search(time_regex, text.lower())
-            if not time_match and session_history:
-                for m in reversed(session_history):
-                    if m.get("role") == "user":
-                        t_m = re.search(time_regex, m.get("text", "").lower())
-                        if t_m:
-                            time_match = t_m
-                            break
+            now_dt = get_current_business_datetime(
+                org_id=org_id,
+                db=db,
+                reference_now=reference_now,
+            )
+            current_date = now_dt.date()
+            naive_now = now_dt.replace(tzinfo=None) if now_dt.tzinfo else now_dt
 
-            raw_time_str = (time_match.group(1) or time_match.group(2) or time_match.group(3)).upper() if time_match else None
-            target_time_24h = self.parse_time_to_24h(raw_time_str) if raw_time_str else None
-
-            slots_res = get_available_slots(staff_id=staff_id, selected_date=target_date, db=db)
+            slots_res = get_available_slots(staff_id=staff_id, selected_date=target_date, db=db, reference_now=reference_now)
             available_slots_list = slots_res.get("available_slots", [])
             avail_times_24h = [s["start"] for s in available_slots_list]
             avail_times_12h = [self.format_time_12h(t) for t in avail_times_24h]
@@ -314,9 +347,68 @@ class CalendarVerificationService:
             entity_label = f"with {matched_doctor_name}" if matched_doctor_name else "for your request"
 
             if target_time_24h and raw_time_str:
-                is_free = target_time_24h in avail_times_24h
                 freq_12h = self.format_time_12h(target_time_24h)
 
+                # Determine whether requested slot has already passed
+                is_past = False
+                try:
+                    target_time_obj = datetime.strptime(target_time_24h, "%H:%M").time()
+                    target_slot_dt = datetime.combine(target_date, target_time_obj)
+                    if target_date < current_date or (target_date == current_date and target_slot_dt <= naive_now):
+                        is_past = True
+                except Exception:
+                    pass
+
+                if is_past:
+                    if avail_times_12h:
+                        alt_slots = avail_times_12h[:4]
+                        alt_str = ", ".join(alt_slots)
+                        reason = f"Slot {freq_12h} is no longer available because that time has passed. Today's available slots are {alt_str}."
+                        summary = (
+                            f"[LIVE CALENDAR VERIFICATION: Slot {freq_12h} {entity_label} on {formatted_date_str} has ALREADY PASSED. "
+                            f"CRITICAL GROUNDING INSTRUCTION: You MUST inform the user that {freq_12h} is no longer available because that time has passed. "
+                            f"Offer these verified available remaining slots for today: {alt_str}.]"
+                        )
+                        return CalendarVerificationResult(
+                            is_checked=True,
+                            doctor_name=matched_doctor_name,
+                            requested_date=formatted_date_str,
+                            requested_time=freq_12h,
+                            is_available=False,
+                            is_past_time=True,
+                            reason=reason,
+                            alternative_slots=alt_slots,
+                            prompt_summary=summary
+                        )
+                    else:
+                        # All slots for today have passed or are booked! Find next available date
+                        next_date, next_slots = find_next_available_slots(staff_id=staff_id, from_date=target_date, db=db, reference_now=reference_now)
+                        next_date_str = next_date.strftime("%A, %b %d") if next_date else None
+                        next_slots_12h = [self.format_time_12h(s["start"]) for s in next_slots[:4]] if next_slots else []
+                        next_slots_str = ", ".join(next_slots_12h) if next_slots_12h else ""
+                        reason = f"Slot {freq_12h} is no longer available because that time has passed, and there are no remaining slots available today."
+                        if next_date_str and next_slots_12h:
+                            summary = (
+                                f"[LIVE CALENDAR VERIFICATION: Slot {freq_12h} {entity_label} on {formatted_date_str} has ALREADY PASSED and there are no remaining slots today. "
+                                f"The next available date is {next_date_str} with slots: {next_slots_str}.]"
+                            )
+                        else:
+                            summary = f"[LIVE CALENDAR VERIFICATION: Slot {freq_12h} {entity_label} on {formatted_date_str} has ALREADY PASSED and there are no remaining slots today.]"
+                        return CalendarVerificationResult(
+                            is_checked=True,
+                            doctor_name=matched_doctor_name,
+                            requested_date=formatted_date_str,
+                            requested_time=freq_12h,
+                            is_available=False,
+                            is_past_time=True,
+                            reason=reason,
+                            alternative_slots=[],
+                            next_available_date=next_date_str,
+                            next_available_slots=next_slots_12h,
+                            prompt_summary=summary
+                        )
+
+                is_free = target_time_24h in avail_times_24h
                 if is_free:
                     summary = (
                         f"[LIVE CALENDAR VERIFICATION: Slot {freq_12h} {entity_label} on {formatted_date_str} is AVAILABLE. "
@@ -328,44 +420,95 @@ class CalendarVerificationService:
                         requested_date=formatted_date_str,
                         requested_time=freq_12h,
                         is_available=True,
+                        is_past_time=False,
                         reason=f"Slot {freq_12h} is available.",
                         alternative_slots=avail_times_12h[:4],
                         prompt_summary=summary
                     )
                 else:
                     alternatives = avail_times_12h[:4]
-                    alt_str = ", ".join(alternatives) if alternatives else "No remaining open slots on this date."
-                    summary = (
-                        f"[LIVE CALENDAR VERIFICATION: Slot {freq_12h} {entity_label} on {formatted_date_str} is NOT AVAILABLE (ALREADY BOOKED / CONFLICT). "
-                        f"CRITICAL GROUNDING INSTRUCTION: You MUST inform the user that {freq_12h} is unavailable. "
-                        f"Offer these verified available alternative slots: {alt_str}.]"
-                    )
-                    return CalendarVerificationResult(
-                        is_checked=True,
-                        doctor_name=matched_doctor_name,
-                        requested_date=formatted_date_str,
-                        requested_time=freq_12h,
-                        is_available=False,
-                        reason=f"Slot {freq_12h} is already booked or unavailable.",
-                        alternative_slots=alternatives,
-                        prompt_summary=summary
-                    )
+                    if alternatives:
+                        alt_str = ", ".join(alternatives)
+                        summary = (
+                            f"[LIVE CALENDAR VERIFICATION: Slot {freq_12h} {entity_label} on {formatted_date_str} is NOT AVAILABLE (ALREADY BOOKED / CONFLICT). "
+                            f"CRITICAL GROUNDING INSTRUCTION: You MUST inform the user that {freq_12h} is unavailable. "
+                            f"Offer these verified available alternative slots: {alt_str}.]"
+                        )
+                        return CalendarVerificationResult(
+                            is_checked=True,
+                            doctor_name=matched_doctor_name,
+                            requested_date=formatted_date_str,
+                            requested_time=freq_12h,
+                            is_available=False,
+                            is_past_time=False,
+                            reason=f"Slot {freq_12h} is already booked or unavailable.",
+                            alternative_slots=alternatives,
+                            prompt_summary=summary
+                        )
+                    else:
+                        next_date, next_slots = find_next_available_slots(staff_id=staff_id, from_date=target_date, db=db, reference_now=reference_now)
+                        next_date_str = next_date.strftime("%A, %b %d") if next_date else None
+                        next_slots_12h = [self.format_time_12h(s["start"]) for s in next_slots[:4]] if next_slots else []
+                        summary = (
+                            f"[LIVE CALENDAR VERIFICATION: Slot {freq_12h} {entity_label} on {formatted_date_str} is NOT AVAILABLE (ALREADY BOOKED / CONFLICT) and there are no other slots on this date. "
+                            f"The next available date is {next_date_str} with slots: {', '.join(next_slots_12h)}.]"
+                            if next_date_str and next_slots_12h else
+                            f"[LIVE CALENDAR VERIFICATION: Slot {freq_12h} {entity_label} on {formatted_date_str} is NOT AVAILABLE and no more slots on this date.]"
+                        )
+                        return CalendarVerificationResult(
+                            is_checked=True,
+                            doctor_name=matched_doctor_name,
+                            requested_date=formatted_date_str,
+                            requested_time=freq_12h,
+                            is_available=False,
+                            is_past_time=False,
+                            reason=f"Slot {freq_12h} is already booked or unavailable, and no other slots remaining on {formatted_date_str}.",
+                            alternative_slots=[],
+                            next_available_date=next_date_str,
+                            next_available_slots=next_slots_12h,
+                            prompt_summary=summary
+                        )
 
             alternatives = avail_times_12h[:4]
-            alt_str = ", ".join(alternatives) if alternatives else "No available slots."
-            summary = (
-                f"[LIVE CALENDAR VERIFICATION: Available slots {entity_label} on {formatted_date_str}: {alt_str}.]"
-            )
-            return CalendarVerificationResult(
-                is_checked=True,
-                doctor_name=matched_doctor_name,
-                requested_date=formatted_date_str,
-                requested_time=None,
-                is_available=len(available_slots_list) > 0,
-                reason=f"Checked general availability.",
-                alternative_slots=alternatives,
-                prompt_summary=summary
-            )
+            if alternatives:
+                alt_str = ", ".join(alternatives)
+                summary = (
+                    f"[LIVE CALENDAR VERIFICATION: Available slots {entity_label} on {formatted_date_str}: {alt_str}.]"
+                )
+                return CalendarVerificationResult(
+                    is_checked=True,
+                    doctor_name=matched_doctor_name,
+                    requested_date=formatted_date_str,
+                    requested_time=None,
+                    is_available=len(available_slots_list) > 0,
+                    is_past_time=False,
+                    reason=f"Checked general availability.",
+                    alternative_slots=alternatives,
+                    prompt_summary=summary
+                )
+            else:
+                next_date, next_slots = find_next_available_slots(staff_id=staff_id, from_date=target_date, db=db, reference_now=reference_now)
+                next_date_str = next_date.strftime("%A, %b %d") if next_date else None
+                next_slots_12h = [self.format_time_12h(s["start"]) for s in next_slots[:4]] if next_slots else []
+                summary = (
+                    f"[LIVE CALENDAR VERIFICATION: No open slots remaining {entity_label} on {formatted_date_str}. "
+                    f"The next available date is {next_date_str} with slots: {', '.join(next_slots_12h)}.]"
+                    if next_date_str and next_slots_12h else
+                    f"[LIVE CALENDAR VERIFICATION: No open slots remaining {entity_label} on {formatted_date_str}.]"
+                )
+                return CalendarVerificationResult(
+                    is_checked=True,
+                    doctor_name=matched_doctor_name,
+                    requested_date=formatted_date_str,
+                    requested_time=None,
+                    is_available=False,
+                    is_past_time=False,
+                    reason=f"No available slots on {formatted_date_str}.",
+                    alternative_slots=[],
+                    next_available_date=next_date_str,
+                    next_available_slots=next_slots_12h,
+                    prompt_summary=summary
+                )
 
         except Exception as e:
             logger.error(f"Calendar verification error: {e}")

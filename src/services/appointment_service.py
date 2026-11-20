@@ -291,6 +291,24 @@ class AppointmentService:
             return duplicate
 
         data = payload.model_dump()
+        loc = data.pop("location", None)
+        if loc:
+            loc_clean = loc.strip().lower()
+            cust_clean = (data.get("customer") or "").strip().lower()
+            em_clean = (data.get("email") or "").strip().lower()
+            if "@" in loc_clean:
+                raise HTTPException(status_code=400, detail="Invalid location: Location cannot be an email address.")
+            if cust_clean and (loc_clean == cust_clean or loc_clean in [w for w in cust_clean.split() if len(w) > 2]):
+                raise HTTPException(status_code=400, detail="Invalid location: Location cannot be the customer's name.")
+            if em_clean and "@" in em_clean:
+                if loc_clean == em_clean.split("@")[0].lower():
+                    raise HTTPException(status_code=400, detail="Invalid location: Location cannot be an email username.")
+                if loc_clean == em_clean.split("@")[1].lower():
+                    raise HTTPException(status_code=400, detail="Invalid location: Location cannot be an email domain.")
+            curr_notes = data.get("notes") or ""
+            if "[Location:" not in curr_notes:
+                data["notes"] = f"{curr_notes} [Location: {loc.strip()}]".strip()
+
         if organization_id is not None:
             data["organization_id"] = organization_id
 

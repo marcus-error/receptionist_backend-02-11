@@ -20,6 +20,24 @@ logger = logging.getLogger(__name__)
 _model_instance = None
 
 
+def normalize_stt_language(language: Optional[str]) -> str:
+    """Normalize language code to ISO code supported by Deepgram Nova-3 / local STT."""
+    if not language:
+        return "en"
+    norm = str(language).lower().strip()
+    if norm.startswith("ta") or norm.startswith("tam"):
+        return "ta"
+    elif norm.startswith("hi") or norm.startswith("hin"):
+        return "hi"
+    elif norm.startswith("te") or norm.startswith("tel"):
+        return "te"
+    elif norm.startswith("kn") or norm.startswith("kan"):
+        return "kn"
+    elif norm.startswith("en") or norm.startswith("eng"):
+        return "en"
+    return norm
+
+
 class STTService:
     def __init__(self):
         self.model = None
@@ -54,18 +72,44 @@ class STTService:
             logger.warning(f"faster-whisper offline load failed: {exc}")
             self.model = None
 
-    def transcribe_audio_bytes(self, audio_bytes: bytes, filename_hint: str = "audio.wav") -> str:
+    def transcribe_audio_bytes(
+        self,
+        audio_bytes: bytes,
+        filename_hint: str = "audio.wav",
+        language: Optional[str] = None
+    ) -> str:
         """
         Synchronously transcribe audio bytes.
         Uses Deepgram if configured, otherwise falls back to local whisper.
+        Supports Tamil (ta), English (en), Hindi (hi), Telugu (te), and Kannada (kn).
         """
         if not audio_bytes:
             return ""
 
+        target_lang = normalize_stt_language(language or getattr(settings, "DEEPGRAM_LANGUAGE", "en") or "en")
+
         if self.model == "mock_stt":
+            if target_lang == "ta":
+                return "வணக்கம் எனக்கு ஒரு appointment book பண்ண வேண்டும்"
+            elif target_lang == "hi":
+                return "नमस्ते मुझे एक अपॉइंटमेंट बुक करना है"
+            elif target_lang == "te":
+                return "నమస్కారం నాకు ఒక అపాయింట్‌మెంట్ బుక్ చేయాలి"
             return "Hello I want to book an appointment with Dr Smith tomorrow"
 
         api_key = getattr(settings, "DEEPGRAM_API_KEY", None) or os.getenv("DEEPGRAM_API_KEY", "")
+        model_name = getattr(settings, "DEEPGRAM_MODEL", "nova-3") or "nova-3"
+        t0 = time.perf_counter()
+
+        logger.info(
+            f"\n[STT_TRANSCRIBE_REQUEST]"
+            f"\n  engine={'deepgram' if api_key else 'faster-whisper'}"
+            f"\n  model={model_name}"
+            f"\n  requested_language={language}"
+            f"\n  target_language={target_lang}"
+            f"\n  audio_bytes={len(audio_bytes)}"
+        )
+
         if api_key:
             # Use Deepgram REST API for one-shot transcription
             try:
@@ -75,8 +119,8 @@ class STTService:
                     "Content-Type": "audio/wav" if audio_bytes[:4] == b"RIFF" else "audio/raw"
                 }
                 params = {
-                    "model": getattr(settings, "DEEPGRAM_MODEL", "nova-3") or "nova-3",
-                    "language": getattr(settings, "DEEPGRAM_LANGUAGE", "en") or "en",
+                    "model": model_name,
+                    "language": target_lang,
                     "smart_format": "true",
                     "punctuate": "true",
                 }
@@ -85,13 +129,24 @@ class STTService:
                     headers=headers,
                     params=params,
                     data=audio_bytes,
-                    timeout=4.0
+                    timeout=5.0
                 )
+                dur_ms = (time.perf_counter() - t0) * 1000.0
                 if res.status_code == 200:
                     data = res.json()
                     alts = data.get("results", {}).get("channels", [{}])[0].get("alternatives", [])
                     if alts:
-                        return (alts[0].get("transcript") or "").strip()
+                        raw_transcript = (alts[0].get("transcript") or "").strip()
+                        confidence = float(alts[0].get("confidence", 1.0) or 1.0)
+                        logger.info(
+                            f"\n[DEEPGRAM_REST_STT_SUCCESS]"
+                            f"\n  model={model_name}"
+                            f"\n  language={target_lang}"
+                            f"\n  latency_ms={dur_ms:.1f}"
+                            f"\n  confidence={confidence:.2f}"
+                            f"\n  raw_transcript='{raw_transcript}'"
+                        )
+                        return raw_transcript
                 else:
                     logger.warning(f"[DEEPGRAM REST STT] status={res.status_code} body={res.text[:100]}")
             except Exception as e:
@@ -110,23 +165,37 @@ class STTService:
                 if audio_input is None:
                     audio_input = io.BytesIO(audio_bytes)
 
+                whisper_lang = target_lang if target_lang in ("en", "ta", "hi", "te", "kn") else None
                 segments, _ = self.model.transcribe(
                     audio_input,
                     beam_size=1,
-                    language="en",
+                    language=whisper_lang,
                     temperature=0.0,
                     vad_filter=False,
                     condition_on_previous_text=False
                 )
                 text_parts = [segment.text for segment in segments if segment.text]
-                return " ".join(text_parts).strip()
+                clean_text = " ".join(text_parts).strip()
+                dur_ms = (time.perf_counter() - t0) * 1000.0
+                logger.info(
+                    f"\n[LOCAL_WHISPER_STT_SUCCESS]"
+                    f"\n  language={whisper_lang}"
+                    f"\n  latency_ms={dur_ms:.1f}"
+                    f"\n  clean_transcript='{clean_text}'"
+                )
+                return clean_text
             except Exception as exc:
                 logger.error(f"[LOCAL STT ERROR] {exc}")
 
         return ""
 
-    async def transcribe_async(self, audio_bytes: bytes, filename_hint: str = "audio.wav") -> str:
-        return await asyncio.to_thread(self.transcribe_audio_bytes, audio_bytes, filename_hint)
+    async def transcribe_async(
+        self,
+        audio_bytes: bytes,
+        filename_hint: str = "audio.wav",
+        language: Optional[str] = None
+    ) -> str:
+        return await asyncio.to_thread(self.transcribe_audio_bytes, audio_bytes, filename_hint, language)
 
 
 stt_service = STTService()

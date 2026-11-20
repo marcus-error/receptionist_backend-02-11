@@ -15,6 +15,34 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/availability", tags=["Availability"])
 
 
+def get_current_business_datetime(
+    org_id: Optional[int] = None,
+    db: Optional[Session] = None,
+    reference_now: Optional[datetime] = None,
+) -> datetime:
+    """
+    Get current datetime in the configured business timezone.
+    If reference_now is passed, converts/treats it as business timezone.
+    Never hardcodes dates or times.
+    """
+    from zoneinfo import ZoneInfo
+    from src.config.env import settings
+
+    tz_str = getattr(settings, "BUSINESS_TIMEZONE", None) or getattr(settings, "TIMEZONE", "Asia/Kolkata") or "Asia/Kolkata"
+    try:
+        tz = ZoneInfo(tz_str)
+    except Exception:
+        from datetime import timezone
+        tz = timezone(timedelta(hours=5, minutes=30))
+
+    if reference_now is not None:
+        if reference_now.tzinfo is not None:
+            return reference_now.astimezone(tz)
+        return reference_now.replace(tzinfo=tz)
+
+    return datetime.now(tz)
+
+
 def _parse_working_hours(value: str):
     match = re.match(r"^\s*(\d{1,2}:\d{2})\s*[-–]\s*(\d{1,2}:\d{2})\s*$", value or "")
     if not match:
@@ -135,22 +163,44 @@ def get_available_slots(
     google_calendar_id: str = "primary",
     microsoft_calendar_id: str = "default",
     db: Session = Depends(get_db),
+    reference_now: Optional[datetime] = None,
 ):
     """
     Return only appointment slots that are genuinely free.
 
     Sources checked:
+      - Real-time past-time validation (slots <= now on today's date are excluded)
       - Staff working days/hours/breaks/leave/blocked holidays
-      - Existing DB appointments
+      - Existing DB appointments (excluding Cancelled)
       - Google Calendar events
       - Microsoft Calendar events
       - Service compatibility
-      - Appointment duration
+      - Appointment duration & slot interval
       - Overlap/conflict detection
     """
     staff = db.query(Staff).filter(Staff.id == staff_id).first()
     if not staff:
         raise HTTPException(404, "Staff not found")
+
+    now_dt = get_current_business_datetime(
+        org_id=staff.organization_id if staff else None,
+        db=db,
+        reference_now=reference_now,
+    )
+    today_date = now_dt.date()
+    is_today = (selected_date == today_date)
+    is_past_date = (selected_date < today_date)
+
+    if is_past_date:
+        return {
+            "staff_id": staff.id,
+            "staff_name": staff.name,
+            "date": selected_date.isoformat(),
+            "available_slots": [],
+            "reason": "Requested date is in the past",
+            "is_past_date": True,
+            "conflict_checked": True,
+        }
 
     # Works with both the enhanced Staff model and the original model.
     working_days = getattr(staff, "working_days", None)
@@ -272,8 +322,17 @@ def get_available_slots(
 
     slots = []
     cursor = day_start
+    naive_now = now_dt.replace(tzinfo=None) if now_dt.tzinfo else now_dt
+
     while cursor + timedelta(minutes=duration) <= day_end:
         slot_end = cursor + timedelta(minutes=duration)
+
+        # PAST TIME CHECK ON TODAY'S DATE:
+        # If selected_date is today, any slot whose start time has already passed
+        # (cursor <= naive_now) MUST be excluded from available slots!
+        if is_today and cursor <= naive_now:
+            cursor += timedelta(minutes=interval)
+            continue
 
         # Never return overlapping slots or slots that touch a break/event.
         if not _is_overlapping(cursor, slot_end, blocked):
@@ -312,6 +371,7 @@ def staff_slots(
     selected_date: date,
     service: Optional[str] = None,
     db: Session = Depends(get_db),
+    reference_now: Optional[datetime] = None,
 ):
     """Convenience endpoint for the frontend calendar."""
     return get_available_slots(
@@ -319,7 +379,40 @@ def staff_slots(
         selected_date=selected_date,
         service=service,
         db=db,
+        reference_now=reference_now,
     )
+
+
+def find_next_available_slots(
+    staff_id: int,
+    from_date: date,
+    db: Session,
+    max_days_ahead: int = 7,
+    service: Optional[str] = None,
+    duration_minutes: Optional[int] = None,
+    slot_interval_minutes: Optional[int] = None,
+    reference_now: Optional[datetime] = None,
+) -> tuple[Optional[date], List[dict]]:
+    """
+    Scans forward starting from from_date + 1 day up to max_days_ahead days
+    to find the next date with available slots.
+    Returns (next_date, available_slots) or (None, []).
+    """
+    for offset in range(1, max_days_ahead + 1):
+        candidate_date = from_date + timedelta(days=offset)
+        res = get_available_slots(
+            staff_id=staff_id,
+            selected_date=candidate_date,
+            service=service,
+            duration_minutes=duration_minutes,
+            slot_interval_minutes=slot_interval_minutes,
+            db=db,
+            reference_now=reference_now,
+        )
+        candidate_slots = res.get("available_slots", [])
+        if candidate_slots:
+            return candidate_date, candidate_slots
+    return None, []
 
 
 from pydantic import BaseModel
@@ -334,9 +427,14 @@ class SlotCheckRequest(BaseModel):
 
 
 @router.post("/check-slot")
-def check_slot_availability(payload: SlotCheckRequest, db: Session = Depends(get_db)):
+def check_slot_availability(
+    payload: SlotCheckRequest,
+    db: Session = Depends(get_db),
+    reference_now: Optional[datetime] = None,
+):
     """
     Live real-time Google Calendar and Database availability check for manual admin bookings.
+    Includes past-time validation on current date.
     """
     staff = None
     if payload.staff_id:
@@ -346,20 +444,29 @@ def check_slot_availability(payload: SlotCheckRequest, db: Session = Depends(get
     if not staff:
         staff = db.query(Staff).first()
     if not staff:
-        return {"is_available": False, "reason": "No staff found in records.", "available_slots": []}
+        return {"is_available": False, "is_past_time": False, "reason": "No staff found in records.", "available_slots": []}
 
     from src.services.calendar_verification_service import calendar_verification_service
-    target_date = calendar_verification_service.parse_date(payload.date)
+    target_date = calendar_verification_service.parse_date(payload.date, reference_now=reference_now)
     time_24h = calendar_verification_service.parse_time_to_24h(payload.time) or "10:00"
 
     duration_mins = _duration_minutes(payload.duration)
+
+    now_dt = get_current_business_datetime(
+        org_id=staff.organization_id if staff else None,
+        db=db,
+        reference_now=reference_now,
+    )
+    today_date = now_dt.date()
+    naive_now = now_dt.replace(tzinfo=None) if now_dt.tzinfo else now_dt
 
     slots_data = get_available_slots(
         staff_id=staff.id,
         selected_date=target_date,
         service=payload.department,
         duration_minutes=duration_mins,
-        db=db
+        db=db,
+        reference_now=reference_now,
     )
 
     available_slots = slots_data.get("available_slots", [])
@@ -370,7 +477,23 @@ def check_slot_availability(payload: SlotCheckRequest, db: Session = Depends(get
     formatted_date = target_date.strftime("%d %b %Y")
     alt_slots = [calendar_verification_service.format_time_12h(s["start"]) for s in available_slots[:6]]
 
-    if not is_available:
+    # Check if requested time is in the past
+    is_past = False
+    try:
+        req_time_obj = datetime.strptime(time_24h, "%H:%M").time()
+        req_dt = datetime.combine(target_date, req_time_obj)
+        if target_date < today_date or (target_date == today_date and req_dt <= naive_now):
+            is_past = True
+    except Exception:
+        pass
+
+    if is_past:
+        is_available = False
+        if alt_slots:
+            reason = f"Slot {formatted_time} on {formatted_date} is no longer available because that time has passed. Today's available slots are: {', '.join(alt_slots)}."
+        else:
+            reason = f"Slot {formatted_time} on {formatted_date} is no longer available because that time has passed, and there are no remaining slots available today."
+    elif not is_available:
         if alt_slots:
             reason = f"Slot {formatted_time} on {formatted_date} is already booked on Google Calendar or database. Suggested slots: {', '.join(alt_slots)}"
         else:
@@ -380,6 +503,7 @@ def check_slot_availability(payload: SlotCheckRequest, db: Session = Depends(get
 
     return {
         "is_available": is_available,
+        "is_past_time": is_past,
         "staff_id": staff.id,
         "staff_name": staff.name,
         "date": formatted_date,

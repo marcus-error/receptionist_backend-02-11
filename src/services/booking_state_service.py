@@ -9,6 +9,11 @@ import src.models
 logger = logging.getLogger(__name__)
 
 
+class SessionWorkflowMode:
+    APPOINTMENT_BOOKING = "APPOINTMENT_BOOKING"
+    LEAD_COLLECTION = "LEAD_COLLECTION"
+
+
 class BookingState:
     IDLE = "IDLE"
     GENERAL_CONVERSATION = "GENERAL_CONVERSATION"
@@ -25,6 +30,12 @@ class BookingState:
     CHECKING_AVAILABILITY = "CHECKING_AVAILABILITY"
     WAITING_FOR_CONFIRMATION = "WAITING_FOR_CONFIRMATION"
     CONFIRMATION_ACCEPTED = "CONFIRMATION_ACCEPTED"
+    CORRECTION_REQUESTED = "CORRECTION_REQUESTED"
+    WAITING_FOR_CORRECTION_FIELD = "WAITING_FOR_CORRECTION_FIELD"
+    WAITING_FOR_CORRECTION_VALUE = "WAITING_FOR_CORRECTION_VALUE"
+    VALIDATING_CORRECTION = "VALIDATING_CORRECTION"
+    REVIEWING_UPDATED_DETAILS = "REVIEWING_UPDATED_DETAILS"
+    WAITING_FOR_FINAL_CONFIRMATION = "WAITING_FOR_FINAL_CONFIRMATION"
     BOOKING_PROCESSING = "BOOKING_PROCESSING"
     BOOKING_CONFIRMED = "BOOKING_CONFIRMED"
     BOOKING_CANCELLED = "BOOKING_CANCELLED"
@@ -36,12 +47,31 @@ class BookingState:
     COLLECTING_PHONE = "COLLECTING_PHONE"
     WAITING_FOR_CONTACT = "COLLECTING_PHONE"
     WAITING_FOR_PHONE = "COLLECTING_PHONE"
+    COLLECTING_LOCATION = "COLLECTING_LOCATION"
+    WAITING_FOR_LOCATION = "COLLECTING_LOCATION"
+    COLLECTING_BUSINESS = "COLLECTING_BUSINESS"
+    WAITING_FOR_BUSINESS = "COLLECTING_BUSINESS"
+    COLLECTING_REQUIREMENT = "COLLECTING_REQUIREMENT"
+    WAITING_FOR_REQUIREMENT = "COLLECTING_REQUIREMENT"
+    LEAD_COLLECTED = "LEAD_COLLECTED"
     BOOKING = "BOOKING"
     BOOKED = "BOOKED"
     FAILED = "FAILED"
     COMPLETED = "COMPLETED"
     CALL_TERMINATING = "CALL_TERMINATING"
     CALL_COMPLETED = "CALL_COMPLETED"
+
+
+CORRECTION_AND_CONFIRMATION_STATES = (
+    BookingState.WAITING_FOR_CONFIRMATION,
+    BookingState.CONFIRMATION_ACCEPTED,
+    BookingState.CORRECTION_REQUESTED,
+    BookingState.WAITING_FOR_CORRECTION_FIELD,
+    BookingState.WAITING_FOR_CORRECTION_VALUE,
+    BookingState.VALIDATING_CORRECTION,
+    BookingState.REVIEWING_UPDATED_DETAILS,
+    BookingState.WAITING_FOR_FINAL_CONFIRMATION,
+)
 
 
 class FieldState:
@@ -95,6 +125,7 @@ class BookingSession:
             self.workflow_type: str = "HOSPITAL_APPOINTMENT"
         else:
             self.workflow_type: str = "GENERAL"
+        self.workflow_mode: str = SessionWorkflowMode.APPOINTMENT_BOOKING
         self.confirmation_count: int = 0
         self.confirmation_message: Optional[str] = None
         self.confirmed_appointment_id: Optional[int] = None
@@ -112,6 +143,9 @@ class BookingSession:
         self.department_name: Optional[str] = None
         self.service_name: Optional[str] = None
         self.product_name: Optional[str] = None
+        self.industry: Optional[str] = None
+        self.requirement: Optional[str] = None
+        self.interested_area: Optional[str] = None
         self.offered_slots: List[str] = []
         self.last_question_field: Optional[str] = None
 
@@ -139,6 +173,9 @@ class BookingSession:
             "specialty": None,
             "service": None,
             "product": None,
+            "industry": None,
+            "requirement": None,
+            "interested_area": None,
             "date": None,
             "date_obj": None,
             "time": None,
@@ -170,12 +207,15 @@ class BookingSession:
 
     def reset(self):
         self.state = BookingState.IDLE
+        self.workflow_mode = SessionWorkflowMode.APPOINTMENT_BOOKING
         self.doctor_id = None
         self.doctor_name = None
         self.doctor_locked = False
         self.department_name = None
         self.service_name = None
         self.product_name = None
+        self.industry = None
+        self.requirement = None
         self.offered_slots = []
         self.last_question_field = None
         self.caller_name = None
@@ -197,6 +237,9 @@ class BookingSession:
             "specialty": None,
             "service": None,
             "product": None,
+            "industry": None,
+            "requirement": None,
+            "interested_area": None,
             "date": None,
             "date_obj": None,
             "time": None,
@@ -245,6 +288,8 @@ class BookingSession:
         saved_email = self.booking_data.get("email")
         saved_contact = self.booking_data.get("contact_number")
         saved_location = self.booking_data.get("location")
+        saved_industry = self.industry or self.booking_data.get("industry")
+        saved_requirement = self.requirement or self.booking_data.get("requirement")
         saved_lang = self.booking_data.get("conversation_language", "en")
 
         self.booking_data = {
@@ -254,6 +299,9 @@ class BookingSession:
             "specialty": None,
             "service": None,
             "product": None,
+            "industry": saved_industry,
+            "requirement": saved_requirement,
+            "interested_area": None,
             "date": None,
             "date_obj": None,
             "time": None,
@@ -437,9 +485,11 @@ class BookingSession:
     @doctor.setter
     def doctor(self, val: Optional[str]):
         if val != self.booking_data.get("doctor"):
+            prev = self.booking_data.get("doctor")
             self.booking_data["doctor"] = val
             self.doctor_name = val
-            self.booking_data["availability_verified"] = False
+            if prev is not None:
+                self.booking_data["availability_verified"] = False
 
     @property
     def current_stage(self) -> str:
@@ -498,6 +548,14 @@ class BookingSession:
             fields["contact_number"] = self.contact_number
         if self.email:
             fields["email"] = self.email
+        if getattr(self, "industry", None) or self.booking_data.get("industry"):
+            fields["industry"] = self.industry or self.booking_data.get("industry")
+        if getattr(self, "requirement", None) or self.booking_data.get("requirement"):
+            fields["requirement"] = self.requirement or self.booking_data.get("requirement")
+        if getattr(self, "interested_area", None) or self.booking_data.get("interested_area"):
+            area = self.interested_area or self.booking_data.get("interested_area")
+            fields["interested_area"] = area
+            fields["team"] = area
         if self.booking_data.get("specialty"):
             fields["specialty"] = self.booking_data["specialty"]
         return fields
@@ -555,11 +613,37 @@ class BookingSession:
 
         return states
 
+    def get_missing_lead_fields(self) -> List[str]:
+        missing: List[str] = []
+        # 1. Full name
+        if not self.patient_name or self.patient_name in ("Unknown", "Unknown Caller", "User", "Test User", "None", ""):
+            missing.append("patient_name")
+        # 2. Email address
+        if not self.email or "@" not in self.email or "." not in self.email:
+            if not self.booking_data.get("email_declined"):
+                missing.append("email")
+        # 3. Phone number
+        phone = self.contact_number or getattr(self, "caller_phone", None)
+        if not phone or phone in ("Unknown", "Unknown Caller", "Private Number"):
+            missing.append("contact_number")
+        # 4. Business / Industry
+        ind = self.industry or self.booking_data.get("industry") or self.booking_data.get("business_description")
+        if not ind or ind in ("Unknown", "None", ""):
+            missing.append("industry")
+        # 5. Requirement / Interested service
+        req = self.requirement or self.service or self.booking_data.get("requirement") or self.booking_data.get("product")
+        if not req or req in ("Unknown", "None", "", "AI Receptionist Booking", "Consultation", "Demo"):
+            missing.append("requirement")
+        return missing
+
     @property
     def missing_fields(self) -> List[str]:
         # Task 4: In IDLE, COMPLETED, or inactive states, no fields are missing!
         if self.state in (BookingState.IDLE, BookingState.COMPLETED, BookingState.BOOKED, BookingState.BOOKING_CONFIRMED, BookingState.BOOKING_CANCELLED, BookingState.FAILED) or not self.is_active():
             return []
+
+        if getattr(self, "workflow_mode", None) == SessionWorkflowMode.LEAD_COLLECTION:
+            return self.get_missing_lead_fields()
 
         missing: List[str] = []
         is_demo = (
@@ -720,6 +804,9 @@ class BookingSession:
             "department": self.department,
             "service": self.service,
             "product": self.product,
+            "industry": getattr(self, "industry", None),
+            "requirement": getattr(self, "requirement", None),
+            "interested_area": getattr(self, "interested_area", None),
             "doctor": self.doctor,
             "doctor_id": self.doctor_id,
             "date": self.date,
@@ -766,6 +853,9 @@ class BookingSession:
         sess.department_name = data.get("department")
         sess.service_name = data.get("service") or data.get("product")
         sess.product_name = sess.service_name
+        sess.industry = data.get("industry")
+        sess.requirement = data.get("requirement")
+        sess.interested_area = data.get("interested_area")
 
         sess.confirmed_facts = data.get("confirmed_facts") or {}
         sess.completed_steps = data.get("completed_steps") or []
@@ -774,6 +864,9 @@ class BookingSession:
         sess.booking_data["department"] = data.get("department")
         sess.booking_data["service"] = sess.service_name
         sess.booking_data["product"] = sess.product_name
+        sess.booking_data["industry"] = sess.industry
+        sess.booking_data["requirement"] = sess.requirement
+        sess.booking_data["interested_area"] = sess.interested_area
         sess.booking_data["doctor"] = data.get("doctor")
         sess.booking_data["specialty"] = data.get("department") or data.get("specialty") or sess.service_name
         sess.booking_data["date"] = data.get("date")
@@ -891,16 +984,127 @@ class BookingSession:
     def location(self, val: Optional[str]):
         self.booking_data["location"] = val
 
+    @property
+    def business_description(self) -> Optional[str]:
+        return self.booking_data.get("business_description")
 
-def parse_spoken_location(text: str) -> Optional[str]:
+    @business_description.setter
+    def business_description(self, val: Optional[str]):
+        self.booking_data["business_description"] = val
+
+
+def is_valid_location_candidate(
+    candidate: Optional[str],
+    customer_name: Optional[str] = None,
+    customer_email: Optional[str] = None,
+    customer_phone: Optional[str] = None,
+) -> bool:
+    """
+    Validates that a candidate location string is genuinely a location/city/address.
+    Under NO circumstance can it be an email, email username, email domain, customer name, or phone.
+    """
+    if not candidate:
+        return False
+    cand = candidate.strip()
+    if len(cand) < 2 or len(cand) > 60:
+        return False
+    cand_lower = cand.lower()
+
+    # 1. Strictly forbid email format, symbols, or domains
+    if "@" in cand or re.search(r'\b[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+\b', cand):
+        return False
+    if any(dom in cand_lower for dom in [".com", ".in", ".org", ".net", ".co", "gmail", "yahoo", "outlook", "hotmail", "icloud"]):
+        return False
+
+    # 2. Strictly forbid numeric strings or phone numbers
+    clean_num = re.sub(r'[\s\-\(\)\+]', '', cand)
+    if clean_num.isdigit() or re.match(r'^\+?\d{6,15}$', clean_num):
+        return False
+
+    # 3. Strictly forbid customer email username or email domain match
+    if customer_email and "@" in customer_email:
+        email_user = customer_email.split("@")[0].strip().lower()
+        if cand_lower == email_user or cand_lower.replace(" ", "") == email_user.replace(" ", ""):
+            return False
+        email_dom = customer_email.split("@")[1].strip().lower()
+        if cand_lower == email_dom or cand_lower in email_dom:
+            return False
+
+    # 4. Strictly forbid customer name match
+    if customer_name:
+        cust_clean = customer_name.strip().lower()
+        if cand_lower == cust_clean:
+            return False
+        name_tokens = [w for w in cust_clean.split() if len(w) > 2]
+        if cand_lower in name_tokens:
+            return False
+
+    # 5. Strictly forbid customer phone match
+    if customer_phone:
+        phone_digits = re.sub(r'\D', '', customer_phone)
+        if phone_digits and phone_digits in clean_num:
+            return False
+
+    # 6. Stopwords / common non-location conversational words, affirmations, questions, and domain terms
+    if "?" in cand:
+        return False
+
+    # Strictly reject questions, conversational utterances, affirmations, and confirmations
+    _QUESTION_OR_CONFIRM_PAT = re.compile(
+        r'\b(?:am\s+i|are\s+you|can\s+you|could\s+you|is\s+it|is\s+this|audible|hear\s+me|'
+        r'everything\s+is\s+correct|is\s+correct|all\s+correct|correct|all\s+good|'
+        r'confirm\s+my|confirm\s+the|confirm\s+appointment|confirm|confirmation|proceed|'
+        r'book\s+my|book\s+it|book\s+a\s+demo|schedule\s+a\s+demo|put\s+a\s+demo|'
+        r'yeah|yes|yep|sure|okay|ok|fine|yup|haan|sari|done|'
+        r'hrms|hrm|erp|crm|software|application|platform|survey|demo|'
+        r'i\s+said|call\s+me|my\s+name|this\s+is|i\s+want|want\s+to|explore)\b',
+        re.IGNORECASE
+    )
+    if _QUESTION_OR_CONFIRM_PAT.search(cand_lower):
+        return False
+
+    _INVALID_WORDS = {
+        "today", "tomorrow", "yesterday", "morning", "afternoon", "evening",
+        "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+        "doctor", "dr", "appointment", "booking", "me", "here", "myself", "sure", "yes", "no",
+        "email", "mail", "phone", "contact", "name", "call", "please", "thanks", "thank you",
+        "scratch", "demo", "representative", "patient", "none", "skip", "idhu", "vendaam",
+        "okay", "ok", "fine", "correct", "good", "right", "what", "which", "when", "where",
+        "how", "who", "why", "user", "test", "null", "undefined", "true", "false",
+        "audible", "hear", "proceed", "ahead", "everything", "confirm", "booked"
+    }
+    tokens = cand_lower.split()
+    if any(t in _INVALID_WORDS for t in tokens) and len(tokens) == 1:
+        return False
+    if tokens[0] in _INVALID_WORDS and len(tokens) == 1:
+        return False
+    if cand_lower in _INVALID_WORDS:
+        return False
+
+    return True
+
+
+def parse_spoken_location(
+    text: str,
+    session: Optional[Any] = None,
+    customer_name: Optional[str] = None,
+    customer_email: Optional[str] = None,
+    customer_phone: Optional[str] = None,
+) -> Optional[str]:
     """
     Extracts customer-provided location/city/area from natural speech without fabricating.
+    Guarantees independent extraction:
+    - Never derives from email address, email username, or domain.
+    - Never derives from customer name or phone number.
+    - Strictly rejects email addresses, names, and phone numbers.
     Examples:
       - 'I am from Chennai' -> 'Chennai'
       - 'My location is Adyar' -> 'Adyar'
       - 'I live in Bangalore' -> 'Bangalore'
       - 'Address is Anna Nagar' -> 'Anna Nagar'
       - 'from Coimbatore' -> 'Coimbatore'
+      - 'Anna Nagar, Chennai' -> 'Anna Nagar, Chennai'
+      - 'Chennai' -> 'Chennai'
     """
     if not text:
         return None
@@ -908,31 +1112,66 @@ def parse_spoken_location(text: str) -> Optional[str]:
     raw = text.strip()
     txt = raw.lower()
 
-    if txt in ("yes", "no", "sure", "ok", "okay", "thanks", "thank you", "hello", "hi"):
+    if txt in ("yes", "no", "sure", "ok", "okay", "thanks", "thank you", "hello", "hi", "skip", "none", "confirm", "yes confirm", "yes please", "proceed", "please confirm", "yeah confirm"):
         return None
 
+    c_name = customer_name or (getattr(session, "patient_name", None) if session else None)
+    c_email = customer_email or (getattr(session, "email", None) if session else None)
+    c_phone = customer_phone or (getattr(session, "contact_number", None) if session else None)
 
+    # 1. Reject if the text is explicitly an email utterance without location
+    if "@" in txt or re.search(r'\b(?:email|mail|e-mail)\s+(?:id|address|is|:)\b', txt):
+        loc_part_match = re.search(r'\b(?:location|living\s+in|residing\s+in|from|city|place)\s+(?:is|:)?\s*([a-zA-Z0-9\s,\.\-]{2,40})', raw, re.IGNORECASE)
+        if not loc_part_match:
+            return None
+        raw = loc_part_match.group(0)
+
+    # 2. Strict patterns that do NOT match 'email address' or 'mail address'
     patterns = [
-        r'\b(?:my\s+)?(?:location|address|city|area|place)\s+(?:is|:)?\s*([a-zA-Z0-9\s,\.\-]{2,40})',
+        r'\b(?:my\s+)?(?<!email\s)(?<!mail\s)(?<!e-mail\s)(?<!web\s)(?<!ip\s)(?:location|city|area|place|town|address)\s+(?:is|:)?\s*([a-zA-Z0-9\s,\.\-]{2,40})',
         r'\b(?:i\s+am\s+from|i\'m\s+from|calling\s+from|i\s+live\s+in|living\s+in|residing\s+in|located\s+at|located\s+in|staying\s+in)\s+([a-zA-Z0-9\s,\.\-]{2,40})',
         r'\b(?:from)\s+([a-zA-Z\s]{2,25})\b',
     ]
-    _INVALID_WORDS = {
-        "today", "tomorrow", "yesterday", "morning", "afternoon", "evening",
-        "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
-        "doctor", "dr", "appointment", "booking", "me", "here", "myself", "sure", "yes", "no",
-        "email", "phone", "contact", "name", "call", "please", "thanks", "scratch"
-    }
+
     for pat in patterns:
         m = re.search(pat, raw, re.IGNORECASE)
         if m:
             cand = m.group(1).strip()
             cand = re.sub(r'\s+(?:and|&|\bmy\b|\bphone\b|\bemail\b|\bnumber\b|\bfor\b|\bbooking\b|\bappointment\b).*$', '', cand, flags=re.IGNORECASE).strip()
             cand = re.sub(r'^(?:the|a|an)\s+', '', cand, flags=re.IGNORECASE).strip()
-            tokens = cand.lower().split()
-            if tokens and tokens[0] not in _INVALID_WORDS and len(cand) >= 2:
-                if not cand.isdigit():
-                    return cand.title()
+            cand = cand.rstrip(".,;!?")
+            if is_valid_location_candidate(cand, customer_name=c_name, customer_email=c_email, customer_phone=c_phone):
+                return cand.title()
+
+    # 3. Direct standalone location / city answers (e.g. customer replied "Chennai" or "Anna Nagar, Chennai")
+    clean_standalone = re.sub(r'^(?:i\s+am\s+in|in|at)\s+', '', raw, flags=re.IGNORECASE).strip().rstrip(".,;!?")
+
+    if session is not None:
+        last_asked = getattr(session, "last_asked_field", None)
+        curr_state = getattr(session, "state", None)
+        # When in confirmation state, never parse conversational speech or affirmations as location
+        if curr_state in (BookingState.WAITING_FOR_CONFIRMATION, getattr(BookingState, "CONFIRMATION", "WAITING_FOR_CONFIRMATION")):
+            if last_asked != "location":
+                return None
+        elif last_asked != "location" and curr_state not in (BookingState.COLLECTING_LOCATION, BookingState.WAITING_FOR_LOCATION):
+            # If unsolicited and not actively collecting location, accept only if it contains a comma or known city indicator
+            _KNOWN_CITIES = {"chennai", "bangalore", "bengaluru", "mumbai", "delhi", "hyderabad", "pune", "kolkata", "coimbatore", "madurai", "salem", "trichy", "kochi", "mysore", "noida", "gurgaon", "ahmedabad", "jaipur", "chandigarh"}
+            has_city_or_comma = ("," in clean_standalone) or any(c in clean_standalone.lower().split() for c in _KNOWN_CITIES)
+            if not has_city_or_comma:
+                return None
+    standalone_words = clean_standalone.split()
+    if 1 <= len(standalone_words) <= 4:
+        if is_valid_location_candidate(clean_standalone, customer_name=c_name, customer_email=c_email, customer_phone=c_phone):
+            _NON_LOC_PHRASES = {
+                "hello", "hi", "hey", "yes", "no", "sure", "ok", "okay", "fine", "correct",
+                "proceed", "confirm", "book", "appointment", "demo", "doctor", "consultation",
+                "morning", "evening", "afternoon", "today", "tomorrow", "thanks", "thank you",
+                "not yet", "skip", "none", "cancel", "reschedule", "transfer", "audible", "hear",
+                "everything is correct", "confirm my appointment", "confirm appointment"
+            }
+            if clean_standalone.lower() not in _NON_LOC_PHRASES:
+                return clean_standalone.title()
+
     return None
 
 
@@ -1303,22 +1542,31 @@ class BookingStateService:
     def clean_person_name(name: Optional[str]) -> Optional[str]:
         """
         Strips conversational prefixes, polite fillers, and non-name tokens from an extracted candidate name.
-        E.g. 'Sure John' -> 'John', 'Yes My Name Is Karthik' -> 'Karthik', 'It Is Vignesh' -> 'Vignesh'.
+        E.g. 'Sure John' -> 'John', 'Yes My Name Is Karthik' -> 'Karthik', 'It Is Vignesh' -> 'Vignesh',
+        'How much name is Sanjay' -> 'Sanjay', 'No my name is Sanjay' -> 'Sanjay'.
         """
         if not name or not name.strip():
             return None
 
         # Strip common introductory prefix patterns
-        clean = re.sub(r'^(?:(?:my|the)\s+)?(?:full\s+|first\s+|last\s+)?name\s+(?:is|was)\s+', '', name, flags=re.IGNORECASE)
-        clean = re.sub(r'^(?:this\s+is|myself|i\s+am|i\'?m|call\s+me|it\'?s)\s+', '', clean, flags=re.IGNORECASE)
+        clean = re.sub(r'^(?:(?:no|nope|not|wrong|actually|hey|hi|hello|well)\s*,?\s*)?(?:i\s+said\s+)?(?:(?:my|the)\s+)?(?:full\s+|first\s+|last\s+)?name\s+(?:is|was)\s+', '', name, flags=re.IGNORECASE)
+        clean = re.sub(r'^(?:(?:no|nope|not|wrong|actually|hey|hi|hello|well)\s*,?\s*)?(?:i\s+said\s+)?(?:this\s+is|myself|i\s+am|i\'?m|call\s+me|it\'?s|i\s+said)\s+', '', clean, flags=re.IGNORECASE)
         clean = re.sub(r'^(?:full\s+name|first\s+name|last\s+name)\s+', '', clean, flags=re.IGNORECASE)
         clean = re.sub(r'[^a-zA-Z\u0900-\u097F\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\s]', '', clean).strip()
         _fillers = {
             "sure", "yes", "yeah", "ok", "okay", "hi", "hello", "hey", "well",
-            "thanks", "thank", "you", "sir", "madam", "please", "myself", "this",
-            "it", "its", "is", "was", "are", "here", "am", "im", "my", "name", "names",
-            "full", "first", "last", "middle", "call", "me",
+            "thanks", "thank", "you", "your", "yours", "sir", "madam", "please", "myself", "this",
+            "it", "its", "is", "was", "are", "were", "be", "been", "here", "there", "am", "im",
+            "my", "name", "names", "full", "first", "last", "middle", "call", "me",
             "dr", "doctor", "mr", "mrs", "ms", "miss", "prof",
+            "how", "much", "what", "which", "who", "whom", "whose", "when", "where", "why",
+            "can", "could", "would", "should", "shall", "will", "may", "might", "must",
+            "do", "does", "did", "doing", "done", "have", "has", "had",
+            "no", "nope", "not", "never", "none", "neither",
+            "so", "if", "or", "and", "but", "the", "a", "an", "any", "some",
+            "just", "now", "right", "actually", "maybe", "about",
+            "want", "need", "like", "know", "think",
+            "for", "with", "from", "to", "in", "at", "on", "off", "up", "down",
             "before", "after", "during", "while", "say", "says", "saying", "said",
             "tell", "tells", "telling", "told", "speak", "talk", "listen", "hear"
         }
@@ -1345,10 +1593,26 @@ class BookingStateService:
         if not words or len(words) > 4:
             return False
 
+        _FORBIDDEN_NAME_TOKENS = {
+            "how", "much", "what", "which", "why", "where", "when",
+            "can", "could", "would", "should",
+            "no", "nope", "not", "never", "yes", "yeah", "ok", "okay",
+            "phone", "email", "mobile", "number", "doctor",
+            "appointment", "booking", "schedule", "cancel", "reschedule",
+            "website", "software", "demo", "none", "null", "undefined", "unknown",
+            "starting", "running", "launching", "building", "operating", "business", "company",
+            "startup", "firm", "retail", "manufacturing", "solution", "solutions", "application",
+            "platform", "continue", "proceed", "conversation", "last", "service", "services",
+            "department", "industry", "model", "assistant", "system", "caller", "speaker", "machine", "robot", "agent"
+        }
+        if any(w in _FORBIDDEN_NAME_TOKENS for w in words):
+            return False
+
         disallowed_standalone = {
             "name", "names", "my name", "patient", "customer", "person", "user", "someone", "anyone",
             "full name", "first name", "last name", "peru", "naam", "unknown", "none", "null", "undefined",
             "sir", "madam", "doctor", "dr", "appointment", "booking", "phone", "email",
+            "model", "the model", "assistant", "system", "caller", "agent",
             "yes", "no", "yeah", "okay", "ok", "sure", "hello", "hi", "hey", "thanks", "thank",
             "what", "who", "which", "how", "when", "where", "why", "pardon", "sorry", "pardon me",
             "today", "tomorrow", "yesterday", "tonight", "morning", "afternoon", "evening", "night",
@@ -1376,12 +1640,31 @@ class BookingStateService:
         if all(w in _non_names for w in words):
             return False
 
-        # Meaningful tokens must exist (tokens not purely conversational noise)
         meaningful_words = [w for w in words if w not in disallowed_standalone and w not in _non_names]
         if not meaningful_words:
             return False
 
         return True
+
+    @staticmethod
+    def _mask_pii(val: Optional[str]) -> str:
+        if not val:
+            return "None"
+        s = str(val).strip()
+        if "@" in s:
+            parts = s.split("@", 1)
+            user, domain = parts[0], parts[1]
+            if len(user) <= 2:
+                masked_user = user[0] + "*"
+            else:
+                masked_user = user[0] + "*" * (len(user) - 2) + user[-1]
+            return f"{masked_user}@{domain}"
+        digits = re.sub(r'\D', '', s)
+        if len(digits) >= 7:
+            return "*" * (len(digits) - 4) + digits[-4:]
+        if len(s) > 2:
+            return s[0] + "*" * (len(s) - 2) + s[-1]
+        return s[0] + "*"
 
     def __init__(self):
         self._sessions: Dict[str, BookingSession] = {}
@@ -1493,6 +1776,12 @@ class BookingStateService:
                     if session.contact_number and (not call.caller_phone or call.caller_phone in ('Unknown', 'unknown')):
                         call.caller_phone = session.contact_number
                     db.commit()
+                    if session.patient_name:
+                        try:
+                            from src.services.lead_service import LeadService
+                            LeadService(db).upsert_lead_from_session(session, call_log_id=call.id)
+                        except Exception as le:
+                            logger.debug(f"LeadService sync in save_session_state ignored: {le}")
             finally:
                 db.close()
         except Exception as e:
@@ -1843,6 +2132,19 @@ class BookingStateService:
                 return "ದಯವಿಟ್ಟು ನಿಮ್ಮ ಇಮೇಲ್ ವಿಳಾಸ ತಿಳಿಸಿ."
             return f"{name_prefix}Please let me know your email address when you're ready."
 
+        elif session.state in (BookingState.COLLECTING_LOCATION, BookingState.WAITING_FOR_LOCATION):
+            if lang in ("ta", "tanglish", "ta_mix"):
+                return "உங்க location அல்லது ஊர் சொல்லுங்க."
+            elif lang == "hi":
+                return "Kripya apna location ya shehar batayein."
+            elif lang in ("te", "telugu"):
+                return "దయచేసి మీ లొకేషన్ చెప్పండి."
+            elif lang in ("ml", "malayalam"):
+                return "ദയവായി നിങ്ങളുടെ ലൊക്കേഷൻ പറയൂ."
+            elif lang in ("kn", "kannada"):
+                return "ದಯವಿಟ್ಟು ನಿಮ್ಮ location ತಿಳಿಸಿ."
+            return f"{name_prefix}Please let me know your location or city whenever you're ready."
+
         elif session.state == BookingState.WAITING_FOR_DATE:
             if lang in ("ta", "tanglish", "ta_mix"):
                 return "எந்த date-ல appointment வேணும்?"
@@ -1891,6 +2193,7 @@ class BookingStateService:
     parse_spoken_phone_number = staticmethod(parse_spoken_phone_number)
     parse_spoken_email = staticmethod(parse_spoken_email)
     parse_spoken_location = staticmethod(parse_spoken_location)
+    is_valid_location_candidate = staticmethod(is_valid_location_candidate)
 
     def _get_target_entity_question(
         self,
@@ -1916,7 +2219,7 @@ class BookingStateService:
         # --- If department is already known, ask directly for the doctor in that department ---
         if session.department:
             if lang in ("ta", "tanglish", "ta_mix"):
-                return f"{name_ack}{session.department}-ல் எந்த மருத்துவரை நீங்கள் பார்க்க விரும்புகிறீர்கள்?"
+                return f"{name_ack}{session.department}-ல எந்த doctor-ஐ பார்க்கணும்?"
             elif lang == "hi":
                 return f"{name_ack}{session.department} में आप किस डॉक्टर से मिलना चाहते हैं?"
             elif lang in ("kn", "kannada"):
@@ -1954,7 +2257,7 @@ class BookingStateService:
         if user_entity_word and user_entity_word in _ALLOWED_ROLE_ECHOES:
             action_word = "book" if service_based else entity_action
             if lang in ("ta", "tanglish", "ta_mix"):
-                return f"{name_ack}எந்த {user_entity_word}-ஐ சந்திக்க விரும்புகிறீர்கள்?"
+                return f"{name_ack}எந்த {user_entity_word}-ஐ பார்க்கணும்?"
             elif lang == "hi":
                 return f"{name_ack}Aap kis {user_entity_word} se milna chahte hain?"
             return f"{name_ack}Sure. Which {user_entity_word} would you like to {action_word}?"
@@ -1963,13 +2266,13 @@ class BookingStateService:
         if rag_question:
             if lang in ("ta", "tanglish", "ta_mix"):
                 if entity_term == "doctor":
-                    return f"{name_ack}எந்த மருத்துவரை அல்லது துறையை நீங்கள் பார்க்க விரும்புகிறீர்கள்?"
+                    return f"{name_ack}எந்த doctor அல்லது department-ஐ பார்க்கணும்?"
                 elif entity_term == "teacher":
                     return f"{name_ack}எந்த teacher-ஐ சந்திக்க விரும்புகிறீர்கள்?"
                 elif service_based:
                     return f"{name_ack}எந்த service book பண்ணனும்?"
                 else:
-                    return f"{name_ack}யாரை சந்திக்க விரும்புகிறீர்கள்?"
+                    return f"{name_ack}யாரை பார்க்கணும்?"
             elif lang == "hi":
                 if entity_term == "doctor":
                     return f"{name_ack}Aap kis doctor ya vibhaag se milna chahte hain?"
@@ -1994,14 +2297,14 @@ class BookingStateService:
         # Hospital domain fallback
         if getattr(session, "booking_type", "") == "HOSPITAL_APPOINTMENT" or getattr(session, "business_type", "") == "HOSPITAL":
             if lang in ("ta", "tanglish", "ta_mix"):
-                return f"{name_ack}எந்த மருத்துவரை அல்லது துறையை நீங்கள் பார்க்க விரும்புகிறீர்கள்?"
+                return f"{name_ack}எந்த doctor அல்லது department-ஐ பார்க்கணும்?"
             elif lang == "hi":
                 return f"{name_ack}Aap kis doctor ya vibhaag se milna chahte hain?"
             return f"{name_ack}Which doctor or department would you like to consult?"
 
         # Generic neutral fallback — no business noun hardcoded
         if lang in ("ta", "tanglish", "ta_mix"):
-            return f"{name_ack}யாரை அல்லது எந்த service-ஐ book பண்ண விரும்புகிறீர்கள்?"
+            return f"{name_ack}எந்த service book பண்ணனும்?"
         elif lang == "hi":
             return f"{name_ack}Aap kisse milna ya kya book karna chahte hain?"
         return f"{name_ack}Sure. Who or what would you like to book the appointment for?"
@@ -2618,7 +2921,7 @@ class BookingStateService:
                 docs_formatted += f", as well as {extra_cnt} other specialists"
 
             if lang in ("ta", "tanglish", "ta_mix"):
-                msg = f"{date_label_ta} எங்களிடம் {docs_formatted} available-ஆ இருக்காங்க. எந்த மருத்துவரை நீங்கள் பார்க்க விரும்புகிறீர்கள்?"
+                msg = f"{date_label_ta} {docs_formatted} available-ஆ இருக்காங்க. நீங்க எந்த doctor-ஐ பார்க்கணும்?"
             elif lang == "hi":
                 msg = f"{date_label_hi} hamare paas {docs_formatted} available hain. Aap kis doctor se milna chahte hain?"
             elif lang in ("kn", "kannada"):
@@ -2722,15 +3025,17 @@ class BookingStateService:
                         return f"I could not find '{doctor_name or 'that doctor'}' in our directory. We currently have {names_text} available. Which doctor would you like to book with?"
                     return f"I could not find '{doctor_name or 'that person'}' in our directory. Could you please specify who you would like to book with?"
 
-                selected_d = date.today()
+                from src.routes.availability_routes import get_available_slots, get_current_business_datetime, find_next_available_slots
+                now_dt = get_current_business_datetime(org_id=org_id, db=db)
+                selected_d = now_dt.date()
                 if target_date_str:
                     t_lower = target_date_str.lower()
                     if "day after tomorrow" in t_lower:
-                        selected_d = date.today() + timedelta(days=2)
+                        selected_d = selected_d + timedelta(days=2)
                     elif "tomorrow" in t_lower or "naalai" in t_lower or "kal" in t_lower:
-                        selected_d = date.today() + timedelta(days=1)
+                        selected_d = selected_d + timedelta(days=1)
                     elif "today" in t_lower or "indru" in t_lower or "aaj" in t_lower:
-                        selected_d = date.today()
+                        selected_d = selected_d
                     else:
                         days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
                         for idx, day_name in enumerate(days):
@@ -2776,6 +3081,25 @@ class BookingStateService:
                     )
                     return f"For {date_label}, we have {', '.join(slot_times_12h)} available time slots for {staff_name_label}. Which time would you prefer?"
                 else:
+                    # Dynamically look ahead for next available date
+                    next_d, next_slots = find_next_available_slots(staff_id=staff.id, from_date=selected_d, db=db)
+                    if next_d and next_slots:
+                        next_d_label = next_d.strftime('%A, %b %d')
+                        slot_times_12h = [self._format_time_12h(s["start"]) for s in next_slots[:5]]
+                        if session:
+                            session.offered_slots = slot_times_12h
+                            session.last_question_field = "offered_slot_confirmation"
+                        logger.info(
+                            f"\n[AVAILABILITY]"
+                            f"\n  call_id={call_id}"
+                            f"\n  staff_id={staff.id}"
+                            f"\n  staff_name='{staff.name}'"
+                            f"\n  date='{selected_d}' (exhausted) -> next_available='{next_d}'"
+                            f"\n  total_slots={len(next_slots)}"
+                            f"\n  offered_slots={slot_times_12h}"
+                        )
+                        return f"There are no remaining slots available today for {staff_name_label}. The next available date is {next_d_label} with slots at {', '.join(slot_times_12h)}. Which time would you prefer?"
+
                     if session:
                         session.offered_slots = []
                     logger.info(
@@ -3702,65 +4026,134 @@ class BookingStateService:
             "booking", "book", "doctor", "phone", "email", "mobile", "number", "dr", "dr.", "at", "my",
             "is", "was", "are", "be", "am", "can", "could", "should", "would", "shall", "will", "have",
             "has", "had", "doing", "did", "do", "like", "up", "down", "out", "in", "off", "on", "not",
-            "name", "names", "patient", "customer", "person", "user", "full", "peru", "naam", "sir", "madam", "please"
+            "name", "names", "patient", "customer", "person", "user", "full", "peru", "naam", "sir", "madam", "please",
+            "looking", "wanting", "interested", "trying", "wondering", "asking",
+            "starting", "launching", "building", "running", "operating", "business", "company",
+            "startup", "firm", "retail", "manufacturing", "continue", "proceed", "conversation",
+            "working", "planning"
         }
 
-        has_explicit_time_query = bool(re.search(r'\b(?:1[0-2]|0?[1-9])(?::[0-5][0-9])?\s*(?:a\.?m\.?|p\.?m\.?)\b', txt_lower))
-        if session.last_asked_field == "last_name":
-            # Caller is responding specifically to last name request
-            if any(w in txt_lower for w in ["no", "none", "don't have", "dont have", "no last name", "just abi", "only abi", "single name", "nope"]):
-                session.booking_data["last_name_asked"] = True
-                session.last_asked_field = None
-            else:
-                cleaned_last = self.clean_person_name(text)
-                if cleaned_last and self.is_valid_person_name(cleaned_last):
-                    session.patient_name = f"{session.patient_name} {cleaned_last}".strip()
+        # 4-pre. Business Description Extraction (Must never overwrite caller name)
+        if re.search(r'\b(?:starting|running|launching|building|have|own|operating)\s+(?:a|an)?\s*(?:new\s+)?(?:business|company|startup|firm|shop|store|venture|enterprise)\b', txt_lower) or any(phrase in txt_lower for phrase in ["starting a business", "new business", "my business", "starting business", "starting new business"]):
+            bus_desc = text.strip()
+            session.booking_data["business_description"] = bus_desc
+            session.business_description = bus_desc
+            logger.info(f"[BUSINESS_DESCRIPTION_EXTRACTED] {bus_desc}")
+
+        # 4a. Universal Explicit Name Statement & Correction (Evaluated unconditionally across all turns)
+        explicit_name_handled = False
+        _conv_prefix = r"(?:(?:no|nope|not|wrong|actually|hey|hi|hello|well|sure|yes|yeah|ok|okay),?\s*)*"
+        _explicit_name_patterns = [
+            rf"{_conv_prefix}(?:i\s+said,?\s+)?(?:(?:my|the)\s+)?(?:full\s+|first\s+|last\s+)?name\s+(?:is|was)\s+([a-zA-Z\u0900-\u097F\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\s]+)",
+            rf"{_conv_prefix}(?:how\s+much\s+)?name\s+(?:is|was)\s+([a-zA-Z\u0900-\u097F\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\s]+)",
+            rf"{_conv_prefix}(?:you\s+can\s+call\s+me|call\s+me)\s+([a-zA-Z\u0900-\u097F\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\s]+)",
+            rf"{_conv_prefix}(?:i\s+said)\s+([a-zA-Z\u0900-\u097F\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\s]+)",
+            rf"{_conv_prefix}(?:this\s+is)\s+([a-zA-Z\u0900-\u097F\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\s]+)",
+            rf"{_conv_prefix}(?:i\s*(?:am|'m))\s+([a-zA-Z\u0900-\u097F\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\s]+)",
+            rf"{_conv_prefix}(?:en(?:noda|\s)?\s*(?:full\s+)?(?:peru|name)\s*(?:is)?)\s+([a-zA-Z\u0900-\u097F\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\s]+)",
+            rf"{_conv_prefix}(?:naam\s+(?:hai)?)\s+([a-zA-Z\u0900-\u097F\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\s]+)",
+        ]
+        for exp_pat in _explicit_name_patterns:
+            m_exp = re.search(exp_pat, text, re.IGNORECASE)
+            if m_exp:
+                raw_exp = m_exp.group(1).strip()
+                first_tok = raw_exp.split()[0].lower() if raw_exp else ""
+                if first_tok in _NON_NAME_WORDS:
+                    continue
+                raw_exp = re.sub(r'[\.\?\!\;]\s+.*$', '', raw_exp).strip()
+                raw_exp = re.sub(r'[,;]?\s*(?:and|&)?\s*(?:i\s+want|want\s+to|book|need|schedule|with|for|to|at|on|my\s+email|my\s+mail|my\s+phone|my\s+number|my\s+mobile|email|mail|phone|number|mobile).*$', '', raw_exp, flags=re.IGNORECASE).strip()
+                raw_exp = re.sub(r'\s+(?:what|how|when|where|why|can|could|do|does|is|are)\b.*$', '', raw_exp, flags=re.IGNORECASE).strip()
+                cand_exp = self.clean_person_name(raw_exp)
+                if cand_exp and self.is_valid_person_name(cand_exp):
+                    if session.patient_name != cand_exp:
+                        logger.info(f"[NAME_CORRECTION] Correcting patient_name from '{session.patient_name}' to '{cand_exp}'")
+                        session.patient_name = cand_exp
+                        session.caller_name = cand_exp
+                        session.booking_data["patient_name"] = cand_exp
+                        session.booking_data["caller_name"] = cand_exp
+                        session.booking_data["name_just_corrected"] = True
+                    explicit_name_handled = True
+                    break
+
+        if not explicit_name_handled:
+            has_explicit_time_query = bool(re.search(r'\b(?:1[0-2]|0?[1-9])(?::[0-5][0-9])?\s*(?:a\.?m\.?|p\.?m\.?)\b', txt_lower))
+            if session.last_asked_field == "last_name":
+                # Caller is responding specifically to last name request
+                if any(w in txt_lower for w in ["no", "none", "don't have", "dont have", "no last name", "just abi", "only abi", "single name", "nope"]):
                     session.booking_data["last_name_asked"] = True
                     session.last_asked_field = None
-        elif not has_explicit_time_query and (not session.patient_name or session.last_asked_field == "patient_name" or (not session.booking_data.get("last_name_asked") and session.state in (BookingState.WAITING_FOR_PATIENT_NAME, BookingState.COLLECTING_PATIENT_NAME))):
-            _conv = r"(?:(?:hi|hello|hey|good\s+(?:morning|afternoon|evening)|sure|yeah|yes|ok|okay|well|actually),?\s*)*"
-            _name_prefixes = [
-                rf"(?:{_conv})?(?:my\s+(?:full\s+)?name\s+is)",
-                rf"(?:{_conv})?(?:it's|its|it\s+is|this\s+is)",
-                rf"(?:{_conv})?(?:you\s+can\s+call\s+me)",
-                rf"(?:{_conv})?(?:call\s+me)",
-                rf"(?:{_conv})?(?:myself)",
-                rf"(?:{_conv})?(?:en(?:noda|\s)?\s*(?:full\s+)?(?:peru|name))",
-                rf"(?:{_conv})?(?:என்(?:னோட)?\s*(?:பெயர்|full\s*name))",
-                rf"(?:{_conv})?(?:name\s+is)",
-                rf"(?:{_conv})?(?:naam\s+(?:hai)?)",
-            ]
-            _name_suffixes = [r"\b(?:sir|madam|ji|bro|anna|akka)\b", r"(?:தான்|டா|ங்க)"]
-            _name_prefix_pattern = r"^\s*(?:" + "|".join(_name_prefixes) + r")\s+"
-            _name_suffix_pattern = r"\s*(?:" + "|".join(_name_suffixes) + r")\s*$"
+                else:
+                    cleaned_last = self.clean_person_name(text)
+                    if cleaned_last and self.is_valid_person_name(cleaned_last):
+                        session.patient_name = f"{session.patient_name} {cleaned_last}".strip()
+                        session.booking_data["last_name_asked"] = True
+                        session.last_asked_field = None
+            elif not has_explicit_time_query and (not session.patient_name or session.last_asked_field == "patient_name" or (not session.booking_data.get("last_name_asked") and session.state in (BookingState.WAITING_FOR_PATIENT_NAME, BookingState.COLLECTING_PATIENT_NAME))):
+                _conv = r"(?:(?:hi|hello|hey|good\s+(?:morning|afternoon|evening)|sure|yeah|yes|ok|okay|well|actually),?\s*)*"
+                _name_prefixes = [
+                    rf"(?:{_conv})?(?:my\s+(?:full\s+)?name\s+is)",
+                    rf"(?:{_conv})?(?:it's|its|it\s+is|this\s+is)",
+                    rf"(?:{_conv})?(?:you\s+can\s+call\s+me)",
+                    rf"(?:{_conv})?(?:call\s+me)",
+                    rf"(?:{_conv})?(?:myself)",
+                    rf"(?:{_conv})?(?:en(?:noda|\s)?\s*(?:full\s+)?(?:peru|name))",
+                    rf"(?:{_conv})?(?:என்(?:னோட)?\s*(?:பெயர்|full\s*name))",
+                    rf"(?:{_conv})?(?:name\s+is)",
+                    rf"(?:{_conv})?(?:naam\s+(?:hai)?)",
+                ]
+                _name_suffixes = [r"\b(?:sir|madam|ji|bro|anna|akka)\b", r"(?:தான்|டா|ங்க)"]
+                _name_prefix_pattern = r"^\s*(?:" + "|".join(_name_prefixes) + r")\s+"
+                _name_suffix_pattern = r"\s*(?:" + "|".join(_name_suffixes) + r")\s*$"
 
-            name_match = re.search(_name_prefix_pattern, txt_lower, re.IGNORECASE)
-            if not name_match and re.search(rf"^\s*(?:{_conv})?(?:i\s*(?:am|'m))\s+", txt_lower, re.IGNORECASE):
-                # Only accept "I am / I'm" if not followed by non-name words like gonna, going, here, etc.
-                after_iam = re.sub(rf"^\s*(?:{_conv})?(?:i\s*(?:am|'m))\s+", "", txt_lower, flags=re.IGNORECASE).strip()
-                first_w = after_iam.split()[0] if after_iam else ""
-                if first_w and first_w not in _NON_NAME_WORDS:
-                    name_match = re.search(rf"^\s*(?:{_conv})?(?:i\s*(?:am|'m))\s+", txt_lower, re.IGNORECASE)
+                name_match = re.search(_name_prefix_pattern, txt_lower, re.IGNORECASE)
+                if not name_match and re.search(rf"^\s*(?:{_conv})?(?:i\s*(?:am|'m))\s+", txt_lower, re.IGNORECASE):
+                    # Only accept "I am / I'm" if not followed by non-name words like gonna, going, here, etc.
+                    after_iam = re.sub(rf"^\s*(?:{_conv})?(?:i\s*(?:am|'m))\s+", "", txt_lower, flags=re.IGNORECASE).strip()
+                    first_w = after_iam.split()[0] if after_iam else ""
+                    if first_w and first_w not in _NON_NAME_WORDS:
+                        name_match = re.search(rf"^\s*(?:{_conv})?(?:i\s*(?:am|'m))\s+", txt_lower, re.IGNORECASE)
 
-            if name_match:
-                raw_name = text[name_match.end():].strip()
-                raw_name = re.sub(_name_suffix_pattern, '', raw_name, flags=re.IGNORECASE).strip()
-                raw_name = re.sub(r'\b(dr|mr|mrs|ms|prof)\.', r'\1', raw_name, flags=re.IGNORECASE)
-                raw_name = re.sub(r'[\.\?\!\;]\s+.*$', '', raw_name).strip()
-                raw_name = re.sub(r'[,;]?\s*(?:and|&)?\s*(?:i\s+want|want\s+to|book|need|schedule|with|for|my\s+email|my\s+mail|my\s+phone|my\s+number|my\s+mobile|email|mail|phone|number|mobile).*$', '', raw_name, flags=re.IGNORECASE).strip()
-                raw_name = re.sub(r'\s+(?:what|how|when|where|why|can|could|do|does|is|are)\b.*$', '', raw_name, flags=re.IGNORECASE).strip()
-                cand = self.clean_person_name(raw_name)
-                if cand and self.is_valid_person_name(cand):
-                    session.patient_name = cand
-            elif (not session.patient_name or len(session.patient_name.split()) < 2) and (session.state in (BookingState.WAITING_FOR_PATIENT_NAME, BookingState.COLLECTING_PATIENT_NAME) or session.last_asked_field == "patient_name"):
-                # When system explicitly asked for name, strip conversational prefix cleanly
-                cleaned = re.sub(r'^(?:(?:sure|yes|yeah|ok|okay|hi|hello|hey|good\s+(?:morning|afternoon|evening)|well|actually)\s*,?\s*)*(?:it\'s|its|it\s+is|this\s+is|i\s+am|i\'m|my\s+(?:full\s+|first\s+|last\s+)?name\s+(?:is|was)|my\s+name|name\s+(?:is|was)|you\s+can\s+call\s+me|call\s+me)?\s*,?\s*', '', text, flags=re.IGNORECASE).strip()
-                cleaned = re.sub(r'[,;]?\s*(?:and|&)?\s*(?:i\s+want|want\s+to|book|need|schedule|with|for|my\s+email|my\s+mail|my\s+phone|my\s+number|my\s+mobile|email|mail|phone|number|mobile).*$', '', cleaned, flags=re.IGNORECASE).strip()
-                cleaned = re.sub(r'[^\w\s\u0900-\u097F\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF]', '', cleaned).strip()
-                cleaned = re.sub(_name_suffix_pattern, '', cleaned, flags=re.IGNORECASE).strip()
-                cand = self.clean_person_name(cleaned)
-                if cand and self.is_valid_person_name(cand):
-                    session.patient_name = cand
+                if name_match:
+                    raw_name = text[name_match.end():].strip()
+                    raw_name = re.sub(_name_suffix_pattern, '', raw_name, flags=re.IGNORECASE).strip()
+                    raw_name = re.sub(r'\b(dr|mr|mrs|ms|prof)\.', r'\1', raw_name, flags=re.IGNORECASE)
+                    raw_name = re.sub(r'[\.\?\!\;]\s+.*$', '', raw_name).strip()
+                    raw_name = re.sub(r'[,;]?\s*(?:and|&)?\s*(?:i\s+want|want\s+to|book|need|schedule|with|for|my\s+email|my\s+mail|my\s+phone|my\s+number|my\s+mobile|email|mail|phone|number|mobile).*$', '', raw_name, flags=re.IGNORECASE).strip()
+                    raw_name = re.sub(r'\s+(?:what|how|when|where|why|can|could|do|does|is|are)\b.*$', '', raw_name, flags=re.IGNORECASE).strip()
+                    cand = self.clean_person_name(raw_name)
+                    if cand and self.is_valid_person_name(cand):
+                        session.patient_name = cand
+                        session.caller_name = cand
+                        session.booking_data["patient_name"] = cand
+                        session.booking_data["caller_name"] = cand
+                elif (not session.patient_name or session.last_asked_field == "patient_name") and (session.state in (BookingState.WAITING_FOR_PATIENT_NAME, BookingState.COLLECTING_PATIENT_NAME) or session.last_asked_field == "patient_name"):
+                    # When system explicitly asked for name, strip conversational prefix cleanly
+                    cleaned = re.sub(r'^(?:(?:sure|yes|yeah|ok|okay|hi|hello|hey|good\s+(?:morning|afternoon|evening)|well|actually)\s*,?\s*)*(?:it\'s|its|it\s+is|this\s+is|i\s+am|i\'m|my\s+(?:full\s+|first\s+|last\s+)?name\s+(?:is|was)|my\s+name|name\s+(?:is|was)|you\s+can\s+call\s+me|call\s+me)?\s*,?\s*', '', text, flags=re.IGNORECASE).strip()
+                    cleaned = re.sub(r'[,;]?\s*(?:and|&)?\s*(?:i\s+want|want\s+to|book|need|schedule|with|for|my\s+email|my\s+mail|my\s+phone|my\s+number|my\s+mobile|email|mail|phone|number|mobile).*$', '', cleaned, flags=re.IGNORECASE).strip()
+                    cleaned = re.sub(r'[^\w\s\u0900-\u097F\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF]', '', cleaned).strip()
+                    cleaned = re.sub(_name_suffix_pattern, '', cleaned, flags=re.IGNORECASE).strip()
+                    cand = self.clean_person_name(cleaned)
+                    if cand and self.is_valid_person_name(cand):
+                        session.patient_name = cand
+                        session.caller_name = cand
+                        session.booking_data["patient_name"] = cand
+                        session.booking_data["caller_name"] = cand
+
+            # Direct Standalone Name Correction:
+            # If caller says a single person name (e.g. "Sanjay." or "No, Sanjay.") when asked for phone or after name ack:
+            if not explicit_name_handled and session.patient_name:
+                cleaned_cand = re.sub(r'^(?:no,?\s+|nope,?\s+|actually,?\s+|i\s+said,?\s+)?', '', text, flags=re.IGNORECASE).strip().rstrip('.,?!')
+                if cleaned_cand and len(cleaned_cand.split()) <= 2 and not any(c.isdigit() for c in cleaned_cand) and "@" not in cleaned_cand:
+                    cand_name = self.clean_person_name(cleaned_cand)
+                    if cand_name and self.is_valid_person_name(cand_name) and cand_name.lower() != session.patient_name.lower():
+                        # Verify it's not a generic word, greeting, or business description
+                        if not any(w in cand_name.lower().split() for w in _NON_NAME_WORDS):
+                            logger.info(f"[NAME_CORRECTION] Standalone name correction from '{session.patient_name}' to '{cand_name}'")
+                            session.patient_name = cand_name
+                            session.caller_name = cand_name
+                            session.booking_data["patient_name"] = cand_name
+                            session.booking_data["caller_name"] = cand_name
+                            session.booking_data["name_just_corrected"] = True
 
 
         # 5. Email Extraction
@@ -3793,9 +4186,70 @@ class BookingStateService:
                 session.booking_data["caller_id_confirmed"] = True
 
         # 7. Customer Location Extraction
-        spoken_loc = self.parse_spoken_location(text)
+        spoken_loc = self.parse_spoken_location(text, session=session)
         if spoken_loc:
             session.location = spoken_loc
+
+        # 8. Business Context Extraction (Industry, Requirement, Interested Area / Team)
+        _INDUSTRIES = [
+            "manufacturing", "healthcare", "retail", "education", "finance", "banking",
+            "logistics", "supply chain", "construction", "real estate", "automotive",
+            "hospitality", "technology", "e-commerce", "ecommerce", "pharma", "pharmaceutical"
+        ]
+        for ind in _INDUSTRIES:
+            if re.search(rf'\b{re.escape(ind)}\b', txt_lower):
+                ind_val = ind.title() if ind not in ("e-commerce", "ecommerce") else "E-Commerce"
+                session.industry = ind_val
+                session.booking_data["industry"] = ind_val
+                break
+
+        _TEAMS = [
+            ("sales demo", "Sales"),
+            ("sales team", "Sales"),
+            ("sales", "Sales"),
+            ("marketing", "Marketing"),
+            ("operations", "Operations"),
+            ("support", "Support"),
+            ("customer support", "Customer Support"),
+            ("billing", "Billing"),
+            ("engineering", "Engineering"),
+            ("hr", "HR"),
+            ("human resources", "HR"),
+            ("it", "IT")
+        ]
+        for t_key, t_val in _TEAMS:
+            if re.search(rf'\b{re.escape(t_key)}\b', txt_lower):
+                session.interested_area = t_val
+                session.booking_data["interested_area"] = t_val
+                break
+
+        _REQUIREMENTS = [
+            ("website development", "Website Development"),
+            ("web development", "Website Development"),
+            ("build a website", "Website Development"),
+            ("website design", "Website Design & Development"),
+            ("website", "Website Development"),
+            ("web application", "Web Application"),
+            ("voice agent", "AI Voice Agent"),
+            ("ai voice agent", "AI Voice Agent"),
+            ("voice receptionist", "AI Voice Receptionist"),
+            ("galaxy chat", "Galaxy Chat"),
+            ("erp", "ERP Application"),
+            ("project management", "Project Management Application"),
+            ("employee tracking", "Employee Activity Tracking"),
+            ("employee activity tracking", "Employee Activity Tracking"),
+            ("survey platform", "Survey Platform"),
+            ("custom software", "Custom Software Integration"),
+            ("software integration", "Custom Software Integration")
+        ]
+        for r_key, r_val in _REQUIREMENTS:
+            if re.search(rf'\b{re.escape(r_key)}\b', txt_lower):
+                session.requirement = r_val
+                session.booking_data["requirement"] = r_val
+                if not session.service:
+                    session.service = r_val
+                    session.booking_data["service"] = r_val
+                break
 
     def check_and_handle_intent_switch(self, session: BookingSession, current_intent: str, text: str = "") -> bool:
         """
@@ -3970,11 +4424,11 @@ class BookingStateService:
 
     def handle_confirmation_turn(self, session: BookingSession, text: str, turn_id: Optional[str] = None, state_before: Optional[Dict[str, Any]] = None) -> str:
         """
-        DEDICATED CONFIRMATION HANDLER:
+        DEDICATED CONFIRMATION & CORRECTION HANDLER:
         Evaluated with highest priority before any NLP, greeting, general conversation, or RAG.
         Enforces proper state transitions:
-        WAITING_FOR_CONFIRMATION -> CONFIRMATION_ACCEPTED -> BOOKING_PROCESSING -> BOOKING_CONFIRMED.
-        Handles greetings, change requests, cancellations, and affirmations without repetitive loops.
+        WAITING_FOR_CONFIRMATION -> WAITING_FOR_CORRECTION_FIELD -> WAITING_FOR_CORRECTION_VALUE -> WAITING_FOR_FINAL_CONFIRMATION -> CONFIRMATION_ACCEPTED -> BOOKING_PROCESSING -> BOOKING_CONFIRMED.
+        Handles affirmations, change requests, multiple field corrections, cancellations, and presence checks.
         """
         def _ret(response_str: str) -> str:
             session.turn_count += 1
@@ -3982,7 +4436,7 @@ class BookingStateService:
                 self.save_session_state(session)
             return response_str
 
-        lang = session.conversation_language
+        lang = getattr(session, "conversation_language", "en") or "en"
         txt_lower = text.lower().strip()
         clean_norm = re.sub(r'[^a-zA-Z0-9\s]', ' ', txt_lower).strip()
         norm_words = clean_norm.split()
@@ -3994,104 +4448,297 @@ class BookingStateService:
             or getattr(session, "workflow_type", None) == "SALES_DEMO"
         )
         target_str = "for your product demo" if is_demo else (f"with {session.doctor}" if session.doctor else f"for {session.service or 'your appointment'}")
-        loc_str = f", Location: {session.location}" if session.location else ""
-        email_confirm_str = f", Email: {session.email}" if session.email else ""
+
+        def _build_summary_prompt() -> str:
+            p_name = session.patient_name or "there"
+            p_phone = session.contact_number or ""
+            p_email = f", Email: {session.email}" if session.email else ""
+            p_loc = f", Location: {session.location}" if session.location else ""
+            p_date = session.date or "tomorrow"
+            p_time = session.time or "10:00 AM"
+            if lang in ("ta", "tanglish", "ta_mix"):
+                return f"நன்றி! உங்க விவரங்கள்: Name: {p_name}, Phone: {p_phone}{p_email}{p_loc}, {p_date} அன்று {p_time}-க்கு {target_str}. இந்த விவரங்கள் சரியா?"
+            elif lang == "hi":
+                return f"Dhanyawad! Aapki updated details: Naam: {p_name}, Phone: {p_phone}{p_email}{p_loc}, {target_str} ke liye {p_date} ko {p_time} par. Kya yeh sab sahi hai?"
+            else:
+                return f"Thank you! Here are your updated details: Name: {p_name}, Phone: {p_phone}{p_email}{p_loc}, {target_str} on {p_date} at {p_time}. Is everything correct now?"
 
         # 1. Natural presence / greeting check ("Hello?", "Are you there?")
         _PRESENCE_WORDS = {"hello", "hi", "hey", "hello there", "are you there", "can you hear me", "am i audible", "is anyone there", "can you hear", "hear me"}
         if single_str in _PRESENCE_WORDS or (norm_words and norm_words[0] in ("hello", "hi", "hey") and len(norm_words) <= 2):
             resp = "I'm here. Would you like me to proceed with the appointment?"
             if lang in ("ta", "tanglish", "ta_mix"):
-                resp = "நான் இங்கேயே தான் இருக்கிறேன். உங்கள் முன்பதிவை உறுதிப்படுத்தலாமா?"
+                resp = "நான் line-ல தான் இருக்கேன். உங்க booking-ஐ confirm பண்ணலாமா?"
             elif lang == "hi":
                 resp = "Main yahin hoon. Kya main aapka appointment confirm kar doon?"
-            session.state = BookingState.WAITING_FOR_CONFIRMATION
             self._log_conversation_turn(session, text, resp, "presence_reassurance", state_before=state_before)
             return _ret(resp)
 
-        # 2. Field change requests
-        if any(p in clean_norm for p in ["change the time", "change time", "change my time", "different time", "another time", "switch time", "wrong time"]):
-            session.time = None
-            session.availability_verified = False
-            session.state = BookingState.WAITING_FOR_TIME
-            session.last_asked_field = "time"
-            resp = "Sure! Which time would you prefer instead?"
-            self._log_conversation_turn(session, text, resp, "change_time_requested", state_before=state_before)
-            return _ret(resp)
-
-        if any(p in clean_norm for p in ["change the date", "change date", "change my date", "different date", "another date", "switch date", "wrong date"]):
-            session.date = None
-            session.time = None
-            session.availability_verified = False
-            session.state = BookingState.WAITING_FOR_DATE
-            session.last_asked_field = "date"
-            resp = "Sure! Which date would you prefer instead?"
-            self._log_conversation_turn(session, text, resp, "change_date_requested", state_before=state_before)
-            return _ret(resp)
-
-        if any(p in clean_norm for p in ["change doctor", "change the doctor", "different doctor", "another doctor", "switch doctor", "wrong doctor"]):
-            session.doctor = None
-            session.doctor_id = None
-            session.time = None
-            session.availability_verified = False
-            session.state = BookingState.WAITING_FOR_DOCTOR
-            session.last_asked_field = "doctor"
-            resp = "Sure! Which doctor or department would you prefer instead?"
-            self._log_conversation_turn(session, text, resp, "change_doctor_requested", state_before=state_before)
-            return _ret(resp)
-
-        # 3. Explicit cancellation
+        # 2. Explicit cancellation
         if any(p in clean_norm for p in ["cancel booking", "cancel appointment", "dont book", "do not book", "stop booking", "cancel", "never mind", "nevermind", "forget it", "leave it", "no dont", "no do not"]):
-            session.state = BookingState.BOOKING_CANCELLED
             session.reset()
-            resp = "Your appointment booking has been cancelled. How else may I assist you today?"
+            session.state = BookingState.BOOKING_CANCELLED
+            logger.info(f"[BOOKING_CORRECTION] Booking cancelled by caller for session {session.session_id}")
+            if lang in ("ta", "tanglish", "ta_mix"):
+                resp = "Booking cancel பண்ணியாச்சு. உங்களுக்கு வேற ஏதாவது help வேணுமா?"
+            else:
+                resp = "Your appointment booking has been cancelled. How else may I assist you today?"
             self._log_conversation_turn(session, text, resp, "booking_cancelled", state_before=state_before)
             return _ret(resp)
 
-        # 4. Specific field corrections
-        new_email = self.parse_spoken_email(text)
-        new_phone = self.parse_spoken_phone_number(text)
-        new_loc = self.parse_spoken_location(text)
+        # 3. Handle state WAITING_FOR_CORRECTION_FIELD
+        if session.state == BookingState.WAITING_FOR_CORRECTION_FIELD or (state_before and state_before.get("state") == BookingState.WAITING_FOR_CORRECTION_FIELD):
+            # Check if caller named specific field or field+value
+            target_field = None
+            if any(w in norm_words for w in ["email", "mail", "e mail"]) or "@" in text:
+                target_field = "email"
+            elif any(w in norm_words for w in ["phone", "mobile", "number", "contact"]):
+                target_field = "phone"
+            elif any(w in norm_words for w in ["name", "peru", "naam"]):
+                target_field = "name"
+            elif any(w in norm_words for w in ["date", "day"]):
+                target_field = "date"
+            elif any(w in norm_words for w in ["time", "timing", "slot"]):
+                target_field = "time"
+            elif any(w in norm_words for w in ["location", "city", "address", "area", "place"]):
+                target_field = "location"
 
-        if new_email and ("@" in text or "mail" in txt_lower or new_email != session.email):
-            session.email = new_email
-            session.booking_data["email_confirmed"] = False
-            session.state = BookingState.WAITING_FOR_CONFIRMATION
-            resp = f"I've updated your email to {session.email}. Shall I proceed with confirming your appointment?"
-            self._log_conversation_turn(session, text, resp, "email_corrected", state_before=state_before)
-            return _ret(resp)
+            if target_field:
+                # Check if new value was already supplied in this turn
+                val_supplied = False
+                if target_field == "email":
+                    cand = self.parse_spoken_email(text)
+                    if cand and "@" in cand and "." in cand:
+                        old_val = session.email
+                        session.email = cand
+                        session.booking_data["email"] = cand
+                        session.booking_data["email_confirmed"] = False
+                        logger.info(f"[BOOKING_FIELD_UPDATED] field=email, old={self._mask_pii(old_val)}, new={self._mask_pii(cand)}")
+                        val_supplied = True
+                elif target_field == "phone":
+                    cand = self.parse_spoken_phone_number(text)
+                    if cand and len(re.sub(r'\D', '', cand)) >= 10:
+                        old_val = session.contact_number
+                        session.contact_number = cand
+                        session.booking_data["contact_number"] = cand
+                        logger.info(f"[BOOKING_FIELD_UPDATED] field=phone, old={self._mask_pii(old_val)}, new={self._mask_pii(cand)}")
+                        val_supplied = True
+                elif target_field == "name":
+                    cand = self.clean_person_name(re.sub(r'^(?:name\s+(?:is|was)|my\s+name\s+(?:is|was)|it\'s|its|is)\s*', '', text, flags=re.I))
+                    if cand and self.is_valid_person_name(cand):
+                        old_val = session.patient_name
+                        session.patient_name = cand
+                        session.caller_name = cand
+                        session.booking_data["patient_name"] = cand
+                        session.booking_data["caller_name"] = cand
+                        logger.info(f"[BOOKING_FIELD_UPDATED] field=name, old={self._mask_pii(old_val)}, new={self._mask_pii(cand)}")
+                        val_supplied = True
 
-        if new_phone and ("phone" in txt_lower or "number" in txt_lower or "mobile" in txt_lower or new_phone != session.contact_number):
-            session.contact_number = new_phone
-            session.state = BookingState.WAITING_FOR_CONFIRMATION
-            resp = f"I've updated your phone number to {session.contact_number}. Shall I proceed with confirming your appointment?"
-            self._log_conversation_turn(session, text, resp, "phone_corrected", state_before=state_before)
-            return _ret(resp)
+                if val_supplied:
+                    session.state = BookingState.WAITING_FOR_FINAL_CONFIRMATION
+                    session.last_asked_field = "final_confirmation"
+                    resp = _build_summary_prompt()
+                    self._log_conversation_turn(session, text, resp, "correction_value_updated", state_before=state_before)
+                    return _ret(resp)
 
-        if new_loc:
-            session.location = new_loc
-            session.state = BookingState.WAITING_FOR_CONFIRMATION
-            resp = f"I've updated your location to {session.location}. Shall I proceed with confirming your appointment?"
-            self._log_conversation_turn(session, text, resp, "location_corrected", state_before=state_before)
-            return _ret(resp)
+                session.booking_data["correction_field"] = target_field
+                session.state = BookingState.WAITING_FOR_CORRECTION_VALUE
+                session.last_asked_field = f"correction_{target_field}"
+                logger.info(f"[BOOKING_CORRECTION] Selected field to correct: {target_field}. Transitioned to WAITING_FOR_CORRECTION_VALUE.")
+                
+                if target_field == "email":
+                    resp = "Sure, please tell me your correct email address."
+                elif target_field == "phone":
+                    resp = "Sure, please tell me your correct contact phone number."
+                elif target_field == "name":
+                    resp = "Sure, please tell me your correct full name."
+                elif target_field == "date":
+                    resp = "Sure, which date would you prefer instead?"
+                elif target_field == "time":
+                    resp = "Sure, what time works best for you?"
+                else:
+                    resp = "Sure, what is your correct location?"
 
-        if any(w in txt_lower for w in ["my name is", "name is", "call me", "myself"]):
-            name_clean = re.sub(r'^(?:(?:no|actually|wrong|not|change)\s*,?\s*)?(?:my\s+name\s+is|name\s+is|i\s+am|it\'s|its)?\s*', '', text, flags=re.IGNORECASE).strip()
-            cand_name = self.clean_person_name(name_clean)
-            if cand_name and self.is_valid_person_name(cand_name):
-                session.patient_name = cand_name
-                session.state = BookingState.WAITING_FOR_CONFIRMATION
-                resp = f"I've updated your name to {session.patient_name}. Shall I proceed with confirming your appointment?"
-                self._log_conversation_turn(session, text, resp, "name_corrected", state_before=state_before)
+                if lang in ("ta", "tanglish", "ta_mix"):
+                    if target_field == "email":
+                        resp = "கண்டிப்பா, உங்க சரியான email address சொல்லுங்க."
+                    elif target_field == "phone":
+                        resp = "கண்டிப்பா, உங்க சரியான phone number சொல்லுங்க."
+                    elif target_field == "name":
+                        resp = "கண்டிப்பா, உங்க முழு பெயரை சொல்லுங்க."
+                    elif target_field == "date":
+                        resp = "கண்டிப்பா, எந்த தேதி வசதியாக இருக்கும்?"
+                    elif target_field == "time":
+                        resp = "கண்டிப்பா, எந்த நேரம் உங்களுக்கு வசதியாக இருக்கும்?"
+                    else:
+                        resp = "கண்டிப்பா, உங்க location சொல்லுங்க."
+                self._log_conversation_turn(session, text, resp, "waiting_for_correction_value", state_before=state_before)
                 return _ret(resp)
 
-        # 5. Negation check
-        is_negation = (
-            any(w in norm_words for w in ["no", "nope", "wrong", "incorrect", "mistake", "illa", "nahi", "galat"])
-            or "not correct" in clean_norm
-        )
+        # 4. Handle state WAITING_FOR_CORRECTION_VALUE
+        if session.state == BookingState.WAITING_FOR_CORRECTION_VALUE or (state_before and state_before.get("state") == BookingState.WAITING_FOR_CORRECTION_VALUE):
+            corr_field = session.booking_data.get("correction_field") or "email"
+            field_updated = False
 
-        # 6. Affirmation Recognition
+            if corr_field == "email":
+                cand = self.parse_spoken_email(text)
+                if cand and "@" in cand and "." in cand:
+                    old_val = session.email
+                    session.email = cand
+                    session.booking_data["email"] = cand
+                    session.booking_data["email_confirmed"] = False
+                    logger.info(f"[BOOKING_FIELD_UPDATED] field=email, old={self._mask_pii(old_val)}, new={self._mask_pii(cand)}")
+                    field_updated = True
+                else:
+                    resp = "Could you please repeat or spell out your complete email address?"
+                    self._log_conversation_turn(session, text, resp, "re_ask_correction_email", state_before=state_before)
+                    return _ret(resp)
+
+            elif corr_field == "phone":
+                cand = self.parse_spoken_phone_number(text)
+                if cand and len(re.sub(r'\D', '', cand)) >= 10:
+                    old_val = session.contact_number
+                    session.contact_number = cand
+                    session.booking_data["contact_number"] = cand
+                    logger.info(f"[BOOKING_FIELD_UPDATED] field=phone, old={self._mask_pii(old_val)}, new={self._mask_pii(cand)}")
+                    field_updated = True
+                else:
+                    resp = "Could you please provide a valid 10-digit phone number?"
+                    self._log_conversation_turn(session, text, resp, "re_ask_correction_phone", state_before=state_before)
+                    return _ret(resp)
+
+            elif corr_field == "name":
+                cand = self.clean_person_name(re.sub(r'^(?:my\s+name\s+is|it\'s|its|is)\s*', '', text, flags=re.I))
+                if cand and self.is_valid_person_name(cand):
+                    old_val = session.patient_name
+                    session.patient_name = cand
+                    session.caller_name = cand
+                    session.booking_data["patient_name"] = cand
+                    session.booking_data["caller_name"] = cand
+                    logger.info(f"[BOOKING_FIELD_UPDATED] field=name, old={self._mask_pii(old_val)}, new={self._mask_pii(cand)}")
+                    field_updated = True
+                else:
+                    resp = "Could you please repeat your name?"
+                    self._log_conversation_turn(session, text, resp, "re_ask_correction_name", state_before=state_before)
+                    return _ret(resp)
+
+            elif corr_field == "date":
+                cand_date = None
+                if any(w in txt_lower for w in ["tomorrow", "naalai", "naalaikku", "kal"]):
+                    cand_date = "Tomorrow"
+                elif any(w in txt_lower for w in ["today", "inniku", "aaj"]):
+                    cand_date = "Today"
+                else:
+                    cand_date = self._normalize_date(text)
+                if cand_date:
+                    old_val = session.date
+                    session.date = cand_date
+                    session.booking_data["date"] = cand_date
+                    session.time = None
+                    session.availability_verified = False
+                    logger.info(f"[BOOKING_FIELD_UPDATED] field=date, old={old_val}, new={cand_date}")
+                    field_updated = True
+                else:
+                    resp = "Sorry, I didn't catch the date. Would tomorrow or another date work for you?"
+                    self._log_conversation_turn(session, text, resp, "re_ask_correction_date", state_before=state_before)
+                    return _ret(resp)
+
+            elif corr_field == "time":
+                extracted_t = None
+                time_match = re.search(r'\b((?:1[0-2]|0?[1-9])(?:[:\-\s][0-5][0-9])?\s*(?:a\.?m\.?|p\.?m\.?))\b', txt_lower)
+                if time_match:
+                    raw_tm = time_match.group(1).replace('.', '').upper()
+                    if ':' not in raw_tm:
+                        raw_tm = re.sub(r'(\d+)\s*(AM|PM)', r'\1:00 \2', raw_tm)
+                    extracted_t = raw_tm
+                elif re.search(r'\b(1[0-2]|0?[1-9])\s*(?:o\'clock)?\b', txt_lower):
+                    bm = re.search(r'\b(1[0-2]|0?[1-9])\b', txt_lower)
+                    if bm:
+                        extracted_t = f"{bm.group(1)}:00 PM"
+                if extracted_t:
+                    # Validate extracted_t against live availability & past-time
+                    from src.services.calendar_verification_service import calendar_verification_service
+                    target_ent = session.doctor or session.service or "Representative"
+                    target_d = session.date or "today"
+                    v_res = calendar_verification_service.verify_availability(f"Appointment with {target_ent} on {target_d} at {extracted_t}")
+                    if v_res.is_checked and v_res.is_available is False:
+                        if v_res.is_past_time:
+                            if v_res.alternative_slots:
+                                alt_str = ", ".join(v_res.alternative_slots)
+                                resp = f"Sorry, {extracted_t} is no longer available because that time has passed. Today's available slots are {alt_str}. Which time would you prefer?"
+                                if lang in ("ta", "tanglish", "ta_mix"):
+                                    resp = f"மன்னிக்கவும், {extracted_t} நேரம் முடிந்துவிட்டது. இன்றைக்கு available slots: {alt_str}. இதில எந்த நேரம் வசதியாக இருக்கும்?"
+                                elif lang == "hi":
+                                    resp = f"Kshama kijiye, {extracted_t} ka samay nikal chuka hai. Aaj ke available slots hain: {alt_str}. Aap konsa samay pasand karenge?"
+                            else:
+                                resp = f"Sorry, {extracted_t} is no longer available because that time has passed, and there are no remaining slots available today. Would you like to check tomorrow or another date?"
+                                if lang in ("ta", "tanglish", "ta_mix"):
+                                    resp = f"மன்னிக்கவும், {extracted_t} நேரம் முடிந்துவிட்டது, இன்றைக்கு வேறு slots இல்லை. நாளை அல்லது வேறு date check பண்ணலாமா?"
+                                elif lang == "hi":
+                                    resp = f"Kshama kijiye, {extracted_t} ka samay nikal chuka hai aur aaj koi slots available nahi hain. Kya aap kal ya koi aur date check karna chahenge?"
+                        else:
+                            if v_res.alternative_slots:
+                                alt_str = ", ".join(v_res.alternative_slots)
+                                resp = f"{extracted_t} is already booked. Available alternative slots are: {alt_str}. Which time would you prefer?"
+                            else:
+                                resp = f"{extracted_t} is not available. Would you like to check another date?"
+                        self._log_conversation_turn(session, text, resp, "correction_time_unavailable", state_before=state_before)
+                        return _ret(resp)
+
+                    old_val = session.time
+                    session.time = extracted_t
+                    session.booking_data["time"] = extracted_t
+                    session.availability_verified = True
+                    logger.info(f"[BOOKING_FIELD_UPDATED] field=time, old={old_val}, new={extracted_t}")
+                    field_updated = True
+                else:
+                    resp = "Which time slot would you prefer?"
+                    self._log_conversation_turn(session, text, resp, "re_ask_correction_time", state_before=state_before)
+                    return _ret(resp)
+
+            elif corr_field == "location":
+                cand = self.parse_spoken_location(text, session=session)
+                if cand:
+                    old_val = session.location
+                    session.location = cand
+                    session.booking_data["location"] = cand
+                    logger.info(f"[BOOKING_FIELD_UPDATED] field=location, old={old_val}, new={cand}")
+                    field_updated = True
+                else:
+                    resp = "Could you please tell me your city or location?"
+                    self._log_conversation_turn(session, text, resp, "re_ask_correction_location", state_before=state_before)
+                    return _ret(resp)
+
+            if field_updated:
+                # Check if more fields are pending correction
+                pending = session.booking_data.get("pending_correction_fields", [])
+                if pending:
+                    next_f = pending.pop(0)
+                    session.booking_data["pending_correction_fields"] = pending
+                    session.booking_data["correction_field"] = next_f
+                    session.state = BookingState.WAITING_FOR_CORRECTION_VALUE
+                    logger.info(f"[BOOKING_CORRECTION] Moving to next pending correction field: {next_f}")
+                    if next_f == "time":
+                        resp = "Got it! And which time would you prefer?"
+                    elif next_f == "date":
+                        resp = "Got it! And which date would you prefer?"
+                    elif next_f == "email":
+                        resp = "Got it! And what is your correct email address?"
+                    elif next_f == "phone":
+                        resp = "Got it! And what is your correct phone number?"
+                    else:
+                        resp = f"Got it! What is your updated {next_f}?"
+                    self._log_conversation_turn(session, text, resp, "waiting_for_next_correction_field", state_before=state_before)
+                    return _ret(resp)
+
+                # All corrections completed!
+                session.state = BookingState.WAITING_FOR_FINAL_CONFIRMATION
+                session.last_asked_field = "final_confirmation"
+                resp = _build_summary_prompt()
+                self._log_conversation_turn(session, text, resp, "corrections_completed_summary", state_before=state_before)
+                return _ret(resp)
+
+        # 5. Affirmation & Negation Intent Recognition in Confirmation States
         _AFFIRM_EXACT = {
             "yes", "yeah", "yep", "sure", "correct", "right", "fine", "perfect",
             "good", "proceed", "confirm", "ok", "okay", "ha", "haan", "sari", "aam",
@@ -4102,7 +4749,12 @@ class BookingStateService:
             "that works", "that is correct", "thats correct", "yes please book it",
             "yeah please", "yeah confirm", "yeah go ahead", "yes go ahead", "yes proceed",
             "yes confirm", "please proceed", "please confirm", "go on", "yup", "absolutely",
-            "okay go ahead", "ok go ahead", "thats fine", "that is fine"
+            "okay go ahead", "ok go ahead", "thats fine", "that is fine",
+            "everything is correct", "yeah everything is correct", "yes everything is correct",
+            "all is correct", "confirm my appointment", "yeah confirm my appointment",
+            "yes confirm my appointment", "confirm appointment", "yeah confirm appointment",
+            "yes confirm appointment", "confirm the appointment", "confirm my booking",
+            "confirm booking", "all details are correct", "details are correct"
         }
         _AFFIRM_SUBSTRINGS = [
             "go ahead", "book it", "okay book it", "ok book it", "confirm it",
@@ -4111,8 +4763,18 @@ class BookingStateService:
             "that is correct", "fine with me", "that works", "yeah go", "do it",
             "please do", "lock it in", "schedule it", "okay go ahead", "ok go ahead",
             "yes proceed", "yes confirm", "yeah go ahead", "yes go ahead",
-            "please proceed", "please confirm"
+            "please proceed", "please confirm", "everything is correct", "all is correct",
+            "confirm my appointment", "confirm appointment", "confirm the appointment",
+            "confirm my booking", "confirm booking", "details are correct", "everything correct"
         ]
+
+        # Negation check
+        is_negation = (
+            any(w in norm_words for w in ["no", "nope", "wrong", "incorrect", "mistake", "illa", "nahi", "galat", "changes", "change"])
+            or "not correct" in clean_norm
+            or "make changes" in clean_norm
+            or "want to change" in clean_norm
+        )
 
         is_affirmation = (
             single_str in _AFFIRM_EXACT
@@ -4123,21 +4785,21 @@ class BookingStateService:
             )
         )
 
-        if is_negation and not is_affirmation:
-            session.state = BookingState.WAITING_FOR_CONFIRMATION
-            session.last_asked_field = "field_to_correct"
-            if lang in ("ta", "tanglish", "ta_mix"):
-                resp = "மன்னிக்கவும்! எந்த விவரத்தை மாற்ற வேண்டும் — உங்கள் பெயர், தொலைபேசி எண், மின்னஞ்சல், தேதி அல்லது நேரமா?"
-            elif lang == "hi":
-                resp = "Kshama kijiye! Aap konsi detail badalna chahte hain — apna naam, phone number, email, date ya samay?"
-            else:
-                resp = "I apologize! Which detail would you like to correct — your name, phone number, email, date, or time?"
-            self._log_conversation_turn(session, text, resp, "ask_which_field_to_correct", state_before=state_before)
-            return _ret(resp)
+        if is_affirmation and not is_negation:
+            # Prevent duplicate bookings on multiple confirmations (Idempotency)
+            if session.is_completed and session.appointment_id:
+                logger.info(f"[BOOKING_CONFIRMATION] Already confirmed #{session.appointment_id}. Returning idempotent response.")
+                b_name = session.business_name or "our team"
+                resp = (
+                    f"Your appointment is already confirmed on {session.date} at {session.time}. "
+                    f"Your appointment ID is #{session.appointment_id}. Thank you for calling {b_name}."
+                )
+                self._log_conversation_turn(session, text, resp, "booking_already_confirmed", state_before=state_before)
+                return _ret(resp)
 
-        if is_affirmation:
             # Enforce proper state transitions:
             # WAITING_FOR_CONFIRMATION -> CONFIRMATION_ACCEPTED -> BOOKING_PROCESSING -> BOOKING_CONFIRMED
+            logger.info(f"[BOOKING_CONFIRMATION] State=CONFIRMED, caller confirmed details for session {session.session_id}")
             session.state = BookingState.CONFIRMATION_ACCEPTED
             session.booking_data["details_confirmed"] = True
             session.booking_data["email_confirmed"] = bool(session.email)
@@ -4145,16 +4807,466 @@ class BookingStateService:
             resp = self._execute_db_booking(session)
             self._log_conversation_turn(session, text, resp, "booking_executed", state_before=state_before)
             return _ret(resp)
-        else:
-            # Ambiguous: single short clarification question
-            session.state = BookingState.WAITING_FOR_CONFIRMATION
-            resp = f"Would you like me to proceed with confirming this appointment {target_str} on {session.date} at {session.time}? Please say 'Yes' to confirm or 'No' to make changes."
+
+        # 6. Negation / Correction Handling
+        if is_negation or any(w in txt_lower for w in ["change", "wrong", "mistake", "correct"]):
+            # Check if multiple fields requested to change (e.g. "change my email and appointment time")
+            req_fields = []
+            if "email" in txt_lower or "mail" in txt_lower:
+                req_fields.append("email")
+            if "time" in txt_lower or "timing" in txt_lower or "slot" in txt_lower:
+                req_fields.append("time")
+            if "date" in txt_lower or "day" in txt_lower:
+                req_fields.append("date")
+            if "phone" in txt_lower or "number" in txt_lower or "mobile" in txt_lower:
+                req_fields.append("phone")
+            if "name" in txt_lower:
+                req_fields.append("name")
+            if "location" in txt_lower or "city" in txt_lower:
+                req_fields.append("location")
+
+            if len(req_fields) > 1:
+                first_target = req_fields[0]
+                session.booking_data["pending_correction_fields"] = req_fields[1:]
+                session.booking_data["correction_field"] = first_target
+                session.state = BookingState.WAITING_FOR_CORRECTION_VALUE
+                session.last_asked_field = f"correction_{first_target}"
+                logger.info(f"[BOOKING_CORRECTION] Multiple corrections requested: {req_fields}. Prompting for {first_target}.")
+                if first_target == "email":
+                    resp = "Sure! What is your updated email address?"
+                elif first_target == "phone":
+                    resp = "Sure! What is your updated contact phone number?"
+                elif first_target == "name":
+                    resp = "Sure! What is your updated full name?"
+                elif first_target == "date":
+                    resp = "Sure! Which date would you prefer?"
+                else:
+                    resp = "Sure! What time would you prefer?"
+                self._log_conversation_turn(session, text, resp, "ask_first_of_multiple_corrections", state_before=state_before)
+                return _ret(resp)
+
+            # Check if inline value provided for a single field
+            new_email = self.parse_spoken_email(text)
+            new_phone = self.parse_spoken_phone_number(text)
+            new_loc = self.parse_spoken_location(text, session=session)
+
+            if new_email and ("@" in text or "mail" in txt_lower or new_email != session.email):
+                old_val = session.email
+                session.email = new_email
+                session.booking_data["email"] = new_email
+                session.booking_data["email_confirmed"] = False
+                session.state = BookingState.WAITING_FOR_FINAL_CONFIRMATION
+                logger.info(f"[BOOKING_FIELD_UPDATED] field=email, old={self._mask_pii(old_val)}, new={self._mask_pii(new_email)}")
+                resp = _build_summary_prompt()
+                self._log_conversation_turn(session, text, resp, "email_corrected_inline", state_before=state_before)
+                return _ret(resp)
+
+            if new_phone and ("phone" in txt_lower or "number" in txt_lower or "mobile" in txt_lower or new_phone != session.contact_number):
+                old_val = session.contact_number
+                session.contact_number = new_phone
+                session.booking_data["contact_number"] = new_phone
+                session.state = BookingState.WAITING_FOR_FINAL_CONFIRMATION
+                logger.info(f"[BOOKING_FIELD_UPDATED] field=phone, old={self._mask_pii(old_val)}, new={self._mask_pii(new_phone)}")
+                resp = _build_summary_prompt()
+                self._log_conversation_turn(session, text, resp, "phone_corrected_inline", state_before=state_before)
+                return _ret(resp)
+
+            if any(w in txt_lower for w in ["my name is", "name is", "call me", "myself", "i said"]):
+                _conf_name_patterns = [
+                    r'(?:(?:no|nope|not|wrong|actually|hey|hi|hello|well|sure|yes|yeah|ok|okay),?\s*)*(?:i\s+said,?\s+)?(?:(?:my|the)\s+)?(?:full\s+|first\s+|last\s+)?name\s+(?:is|was)\s+([a-zA-Z\u0900-\u097F\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\s]+)',
+                    r'(?:(?:no|nope|not|wrong|actually|hey|hi|hello|well|sure|yes|yeah|ok|okay),?\s*)*(?:you\s+can\s+call\s+me|call\s+me)\s+([a-zA-Z\u0900-\u097F\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\s]+)',
+                    r'(?:(?:no|nope|not|wrong|actually|hey|hi|hello|well|sure|yes|yeah|ok|okay),?\s*)*(?:i\s+said)\s+([a-zA-Z\u0900-\u097F\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\s]+)',
+                ]
+                for c_pat in _conf_name_patterns:
+                    m_c = re.search(c_pat, text, re.IGNORECASE)
+                    if m_c:
+                        raw_c = m_c.group(1).strip()
+                        cand_name = self.clean_person_name(raw_c)
+                        if cand_name and self.is_valid_person_name(cand_name):
+                            old_val = session.patient_name
+                            session.patient_name = cand_name
+                            session.caller_name = cand_name
+                            session.booking_data["patient_name"] = cand_name
+                            session.booking_data["caller_name"] = cand_name
+                            session.state = BookingState.WAITING_FOR_FINAL_CONFIRMATION
+                            logger.info(f"[BOOKING_FIELD_UPDATED] field=name, old={self._mask_pii(old_val)}, new={self._mask_pii(cand_name)}")
+                            resp = _build_summary_prompt()
+                            self._log_conversation_turn(session, text, resp, "name_corrected_inline", state_before=state_before)
+                            return _ret(resp)
+
+            # Check if caller named a single field to change (e.g. "Email." or "Change my email" or "My phone number")
+            if any(w in norm_words for w in ["email", "mail"]):
+                session.booking_data["correction_field"] = "email"
+                session.state = BookingState.WAITING_FOR_CORRECTION_VALUE
+                session.last_asked_field = "correction_email"
+                logger.info(f"[BOOKING_CORRECTION] User selected email to correct.")
+                if lang in ("ta", "tanglish", "ta_mix"):
+                    resp = "கண்டிப்பா, உங்க சரியான email address சொல்லுங்க."
+                elif lang == "hi":
+                    resp = "Zaroor, kripya apna sahi email address batayein."
+                else:
+                    resp = "Sure, please tell me your correct email address."
+                self._log_conversation_turn(session, text, resp, "waiting_for_correction_email", state_before=state_before)
+                return _ret(resp)
+            if any(w in norm_words for w in ["phone", "mobile", "number", "contact"]):
+                session.booking_data["correction_field"] = "phone"
+                session.state = BookingState.WAITING_FOR_CORRECTION_VALUE
+                session.last_asked_field = "correction_phone"
+                logger.info(f"[BOOKING_CORRECTION] User selected phone to correct.")
+                if lang in ("ta", "tanglish", "ta_mix"):
+                    resp = "கண்டிப்பா, உங்க சரியான phone number சொல்லுங்க."
+                elif lang == "hi":
+                    resp = "Zaroor, kripya apna sahi contact number batayein."
+                else:
+                    resp = "Sure, please tell me your correct contact phone number."
+                self._log_conversation_turn(session, text, resp, "waiting_for_correction_phone", state_before=state_before)
+                return _ret(resp)
+            if any(w in norm_words for w in ["date", "day"]):
+                session.booking_data["correction_field"] = "date"
+                session.state = BookingState.WAITING_FOR_CORRECTION_VALUE
+                session.last_asked_field = "correction_date"
+                logger.info(f"[BOOKING_CORRECTION] User selected date to correct.")
+                if lang in ("ta", "tanglish", "ta_mix"):
+                    resp = "கண்டிப்பா! எந்த date-ல appointment book பண்ணணும்?"
+                elif lang == "hi":
+                    resp = "Zaroor! Aap kis tareekh par appointment book karna chahenge?"
+                else:
+                    resp = "Sure, which date would you prefer instead?"
+                self._log_conversation_turn(session, text, resp, "waiting_for_correction_date", state_before=state_before)
+                return _ret(resp)
+            if any(w in norm_words for w in ["time", "timing", "slot"]):
+                session.booking_data["correction_field"] = "time"
+                session.state = BookingState.WAITING_FOR_CORRECTION_VALUE
+                session.last_asked_field = "correction_time"
+                logger.info(f"[BOOKING_CORRECTION] User selected time to correct.")
+                if lang in ("ta", "tanglish", "ta_mix"):
+                    resp = "கண்டிப்பா! எந்த time உங்களுக்கு வசதியா இருக்கும்?"
+                elif lang == "hi":
+                    resp = "Zaroor! Kaunsa time aapke liye theek rahega?"
+                else:
+                    resp = "Sure, what time works best for you?"
+                self._log_conversation_turn(session, text, resp, "waiting_for_correction_time", state_before=state_before)
+                return _ret(resp)
+            if any(w in norm_words for w in ["name", "peru", "naam"]):
+                session.booking_data["correction_field"] = "name"
+                session.state = BookingState.WAITING_FOR_CORRECTION_VALUE
+                session.last_asked_field = "correction_name"
+                logger.info(f"[BOOKING_CORRECTION] User selected name to correct.")
+                if lang in ("ta", "tanglish", "ta_mix"):
+                    resp = "கண்டிப்பா! உங்க முழு பெயரை சொல்லுங்க."
+                elif lang == "hi":
+                    resp = "Zaroor! Kripya apna poora naam batayein."
+                else:
+                    resp = "Sure, please tell me your correct full name."
+                self._log_conversation_turn(session, text, resp, "waiting_for_correction_name", state_before=state_before)
+                return _ret(resp)
+
+            # Caller gave bare negation ("No", "Make changes", "Change it", "Incorrect")
+            session.state = BookingState.WAITING_FOR_CORRECTION_FIELD
+            session.last_asked_field = "field_to_correct"
+            logger.info(f"[BOOKING_CORRECTION] Entering correction mode, waiting for correction field. Session {session.session_id}")
             if lang in ("ta", "tanglish", "ta_mix"):
-                resp = f"{session.date} {session.time}-ல் முன்பதிவை உறுதிப்படுத்தலாமா? 'ஆம்' அல்லது 'இல்லை' என்று சொல்லுங்கள்."
+                resp = "மன்னிக்கவும்! எந்த detail-ஐ மாத்தணும் — உங்க name, phone number, email, date அல்லது time-ஆ?"
             elif lang == "hi":
-                resp = f"Kya aap {session.date} ko {session.time} par booking confirm karna chahte hain? Kripya 'Haan' ya 'Nahi' kahein."
-            self._log_conversation_turn(session, text, resp, "clarify_confirmation", state_before=state_before)
+                resp = "Kshama kijiye! Aap konsi detail badalna chahte hain — apna naam, phone number, email, date ya samay?"
+            else:
+                resp = "Sure! Which detail would you like to change: your name, phone number, email, date, time, or location?"
+            self._log_conversation_turn(session, text, resp, "ask_which_field_to_correct", state_before=state_before)
             return _ret(resp)
+
+        # 7. Ambiguous input in confirmation state:
+        resp = f"Would you like me to proceed with confirming this appointment {target_str} on {session.date} at {session.time}? Please say 'Yes' to confirm or 'No' to make changes."
+        if lang in ("ta", "tanglish", "ta_mix"):
+            resp = f"{session.date} {session.time}-க்கு உங்க booking confirm பண்ணலாமா? 'Yes' அல்லது 'No' சொல்லுங்க."
+        elif lang == "hi":
+            resp = f"Kya aap {session.date} ko {session.time} par booking confirm karna chahte hain? Kripya 'Haan' ya 'Nahi' kahein."
+        self._log_conversation_turn(session, text, resp, "clarify_confirmation", state_before=state_before)
+        return _ret(resp)
+
+    def process_lead_collection_turn(
+        self,
+        text: str,
+        session: BookingSession,
+        turn_id: Optional[str] = None,
+        state_before: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """
+        Dedicated Lead Collection & Team Callback State Machine.
+        Collects:
+        1. Full name
+        2. Email address
+        3. Phone number
+        4. Business/industry
+        5. Requirement/interested service
+        6. Additional details if available
+        Asks only for fields that are missing. Never repeats fields already collected.
+        Promises direct team callback without mentioning calendar invites.
+        Saves lead to DB via LeadService with status New and appointment Not Booked.
+        """
+        if not hasattr(session, "_turn_response_cache"):
+            session._turn_response_cache = {}
+        if turn_id and str(turn_id) in session._turn_response_cache:
+            cached_resp = session._turn_response_cache[str(turn_id)]
+            logger.info(f"[LEAD_TURN_IDEMPOTENT] Reusing cached response for turn {turn_id}: '{cached_resp[:60]}...'")
+            return cached_resp
+
+        def _ret(r: str) -> str:
+            session.last_ai_response = r
+            if turn_id:
+                session._turn_response_cache[str(turn_id)] = r
+            return r
+
+        session.conversation_started = True
+        txt_lower = (text or "").lower().strip()
+        session.last_user_text = txt_lower
+        session.turn_count += 1
+        session.turn_id = session.turn_count
+        session.state_version = getattr(session, "state_version", 0) + 1
+        lang = getattr(session, "conversation_language", "en")
+
+        # 1. Presence check ("are you there", "can you hear me", "hello")
+        presence_phrases = ["can you hear me", "are you there", "am i audible", "can you hear", "hear me", "is anyone there"]
+        is_bare_hello = txt_lower.rstrip(".,?!") in ("hello", "hi", "hey", "hello there", "hi there", "hello?", "hi?")
+        if (any(phrase in txt_lower for phrase in presence_phrases) or is_bare_hello) and not any(w in txt_lower for w in ["name", "email", "phone", "number", "retail", "business", "service", "help"]):
+            if lang in ("ta", "tanglish", "ta_mix"):
+                resp = "ஆமா, நான் line-ல தான் இருக்கேன்! சொல்லுங்க."
+            elif lang == "hi":
+                resp = "Haan, main line par hoon! Kripya batayein."
+            else:
+                resp = "Yes, I'm right here! Please go ahead."
+            self._log_conversation_turn(session, text, resp, "presence_reassurance", state_before=state_before)
+            return _ret(resp)
+
+        # 2. Dynamic Language Switch check
+        from src.services.language_service import language_service, SUPPORTED_LANGUAGES
+        target_lang, is_switch = language_service.check_explicit_language_switch(text)
+        if is_switch and target_lang in SUPPORTED_LANGUAGES:
+            session.conversation_language = target_lang
+            resp = language_service.get_language_switch_confirmation(target_lang, booking_session=session)
+            self._log_conversation_turn(session, text, resp, "language_switch", state_before=state_before)
+            return _ret(resp)
+
+        # 3. Thank you / Gratitude closure check
+        _THANKS_PHRASES = ["thank you", "thanks", "thank u", "many thanks", "thank you so much", "appreciated", "that's all", "thats all", "that is all"]
+        if any(tp in txt_lower for tp in _THANKS_PHRASES):
+            first_name = (session.patient_name or "").split()[0] if session.patient_name else ""
+            if session.is_completed:
+                if lang in ("ta", "tanglish", "ta_mix"):
+                    resp = f"ரொம்ப நன்றி{f', {first_name}' if first_name else ''}! எங்க team உங்களை சீக்கிரம் contact பண்ணுவாங்க. Have a wonderful day!"
+                elif lang == "hi":
+                    resp = f"Aapka bahut dhanyawad{f', {first_name}' if first_name else ''}! Hamari team aapse jaldi contact karegi. Aapka din shubh ho!"
+                else:
+                    resp = f"You're very welcome{f', {first_name}' if first_name else ''}! Our team will contact you soon. Have a wonderful day!"
+                self._log_conversation_turn(session, text, resp, "lead_closing", state_before=state_before)
+                return _ret(resp)
+
+        # 4. Cancellation check
+        _CANCEL_PHRASES = ["cancel", "stop", "never mind", "nevermind", "forget it", "leave it", "dont contact", "don't contact", "dont call", "don't call"]
+        if any(phrase in txt_lower for phrase in _CANCEL_PHRASES):
+            session.reset()
+            if lang in ("ta", "tanglish", "ta_mix"):
+                resp = "சரிங்க, contact request cancel பண்ணியாச்சு. உங்களுக்கு வேற ஏதாவது help வேணுமா?"
+            elif lang == "hi":
+                resp = "Theek hai, contact request cancel kar diya gaya hai. Main aapki aur kya sahayata kar sakta hoon?"
+            else:
+                resp = "No problem at all. I've cancelled the request. How else may I assist you today?"
+            self._log_conversation_turn(session, text, resp, "lead_cancelled", state_before=state_before)
+            return _ret(resp)
+
+        # 5. Extract slots
+        self.extract_slots(text, session)
+
+        # Extract Industry if asked or mentioned
+        non_industry = {"yes", "yeah", "ok", "okay", "no", "sure", "continue", "go ahead", "proceed", "hello", "hi"}
+        if getattr(session, "last_asked_field", "") == "industry" or not session.industry:
+            cleaned_ind = re.sub(r'^(?:in\s+|we\s+are\s+in\s+|our\s+industry\s+is\s+|our\s+business\s+is\s+|my\s+business\s+is\s+|it\'s\s+|its\s+|i\s+am\s+in\s+)', '', txt_lower).strip().rstrip('.,?!')
+            if cleaned_ind and cleaned_ind not in non_industry and len(cleaned_ind.split()) <= 5:
+                if not any(w in cleaned_ind for w in ["phone", "email", "name", "@"]):
+                    session.industry = cleaned_ind.title()
+                    session.booking_data["industry"] = session.industry
+            elif any(w in txt_lower for w in ["retail", "healthcare", "it", "software", "logistics", "education", "real estate", "manufacturing", "ecommerce", "e-commerce", "finance", "hospitality", "construction", "consulting"]):
+                for ind_w in ["retail", "healthcare", "it", "software", "logistics", "education", "real estate", "manufacturing", "ecommerce", "e-commerce", "finance", "hospitality", "construction", "consulting"]:
+                    if ind_w in txt_lower:
+                        session.industry = ind_w.title()
+                        session.booking_data["industry"] = session.industry
+                        break
+            elif session.booking_data.get("business_description"):
+                session.industry = session.booking_data["business_description"]
+
+        # Extract Requirement if asked or mentioned
+        if getattr(session, "last_asked_field", "") == "requirement" or not session.requirement:
+            non_req = {"yes", "yeah", "ok", "okay", "no", "sure", "continue", "go ahead", "proceed", "hello", "hi"}
+            if getattr(session, "last_asked_field", "") == "requirement":
+                cleaned_req = re.sub(r'^(?:i\s+want|we\s+want|i\s+need|we\s+need|interested\s+in|looking\s+for|for|about)\s+', '', text, flags=re.IGNORECASE).strip().rstrip('.,?!')
+                if cleaned_req and cleaned_req.lower() not in non_req and len(cleaned_req.split()) <= 7:
+                    session.requirement = cleaned_req.title()
+                    session.booking_data["requirement"] = session.requirement
+            elif session.service or session.booking_data.get("product"):
+                session.requirement = session.service or session.booking_data.get("product")
+            elif any(w in txt_lower for w in ["hrms", "erp", "voice agent", "voice agents", "voice receptionist", "galaxy chat", "chat", "project management", "activity tracking", "survey", "website", "custom software"]):
+                for req_w in ["AI Voice Agents", "Galaxy Chat", "ERP", "HRMS", "Project Management", "Employee Activity Tracking", "Survey Platform", "Website Development", "Custom Software"]:
+                    if req_w.lower() in txt_lower:
+                        session.requirement = req_w
+                        session.booking_data["requirement"] = req_w
+                        break
+
+        # Check explicit request to change email, phone, or name
+        if re.search(r'\b(?:change|update|correct)\s+(?:my\s+)?(?:email|mail|address)\b', txt_lower):
+            new_em = self.parse_spoken_email(text)
+            if new_em:
+                session.email = new_em
+                session.booking_data["email"] = new_em
+                resp = f"Sure! I've updated your email address to {new_em}."
+            else:
+                session.email = None
+                session.state = BookingState.COLLECTING_EMAIL
+                session.last_asked_field = "email"
+                resp = "Sure! What is your new email address?"
+            self._log_conversation_turn(session, text, resp, "request_new_email", state_before=state_before)
+            return _ret(resp)
+
+        if re.search(r'\b(?:change|update|correct)\s+(?:my\s+)?(?:phone|number|mobile|contact)\b', txt_lower):
+            new_ph = self.parse_spoken_phone_number(text)
+            if new_ph:
+                session.contact_number = new_ph
+                session.booking_data["contact_number"] = new_ph
+                resp = f"Sure! I've updated your contact phone number to {new_ph}."
+            else:
+                session.contact_number = None
+                session.state = BookingState.COLLECTING_PHONE
+                session.last_asked_field = "contact_number"
+                resp = "Sure! What is your new contact phone number?"
+            self._log_conversation_turn(session, text, resp, "request_new_phone", state_before=state_before)
+            return _ret(resp)
+
+        # Handle customer saying "I already told you"
+        _ALREADY_TOLD_PHRASES = [
+            "already told you", "already told", "already said", "already gave you",
+            "already gave", "already shared", "told you already", "gave you already",
+            "already provided", "i already told", "i told you", "already answered"
+        ]
+        if any(atp in txt_lower for atp in _ALREADY_TOLD_PHRASES):
+            ref_field = getattr(session, "last_asked_field", "patient_name")
+            val = getattr(session, ref_field, None) or session.booking_data.get(ref_field)
+            if val:
+                missing = session.get_missing_lead_fields()
+                if missing:
+                    next_f = missing[0].replace("_", " ")
+                    resp = f"You're right, I have your {ref_field.replace('_', ' ')} as {val}. Could you please share your {next_f}?"
+                else:
+                    cust_name = session.patient_name or "there"
+                    req_name = session.requirement or session.service or session.booking_data.get("product") or "requirements"
+                    resp = f"Thank you, {cust_name}. I've noted your contact details and requirements. Our team will contact you to discuss your {req_name}. Is there anything else I can help you with?"
+            else:
+                resp = f"I apologize for the confusion. Could you please share your {ref_field.replace('_', ' ')} once more?"
+            self._log_conversation_turn(session, text, resp, "already_told_lead", state_before=state_before)
+            return _ret(resp)
+
+        first_name = (session.patient_name or "").split()[0] if session.patient_name and self.is_valid_person_name(session.patient_name) else ""
+
+        # Evaluate next missing field in order
+        missing = session.get_missing_lead_fields()
+        logger.info(f"[LEAD_COLLECTION] session_id={session.session_id} missing_fields={missing} last_asked={session.last_asked_field}")
+
+        if not missing:
+            session.state = BookingState.COMPLETED
+            session.is_completed = True
+            session.last_asked_field = None
+            cust_name = session.patient_name or "there"
+            req_name = session.requirement or session.service or session.booking_data.get("product") or "requirements"
+
+            if lang in ("ta", "tanglish", "ta_mix"):
+                resp = f"ரொம்ப நன்றி, {cust_name}. உங்க contact details மற்றும் requirements-ஐ நோட் பண்ணிட்டேன். எங்க team உங்க {req_name} பத்தி பேச உங்களை contact பண்ணுவாங்க. உங்களுக்கு வேற ஏதாவது help வேணுமா?"
+            elif lang == "hi":
+                resp = f"Dhanyawad, {cust_name}. Maine aapke contact details aur requirements note kar liye hain. Hamari team aapke {req_name} par charcha karne ke liye aapse contact karegi. Kya main aapki aur koi sahayata kar sakta hoon?"
+            else:
+                resp = f"Thank you, {cust_name}. I've noted your contact details and requirements. Our team will contact you to discuss your {req_name}. Is there anything else I can help you with?"
+
+            try:
+                from src.services.lead_service import LeadService
+                from src.config.database import SessionLocal
+                _db = SessionLocal()
+                try:
+                    lead_svc = LeadService(_db)
+                    lead_svc.upsert_lead_from_session(
+                        session,
+                        lead_status="New",
+                        appointment_status="Not Booked",
+                        follow_up_required=True,
+                        notes=f"Callback requested: {req_name}"
+                    )
+                    _db.commit()
+                    logger.info(f"[LEAD_SAVED] Successfully saved lead for {cust_name} ({session.contact_number}) with status New, Not Booked")
+                finally:
+                    _db.close()
+            except Exception as exc:
+                logger.warning(f"[LEAD_SAVED] Error upserting lead: {exc}")
+
+            self._log_conversation_turn(session, text, resp, "lead_completed", state_before=state_before)
+            return _ret(resp)
+
+        next_missing = missing[0]
+        if next_missing == "patient_name":
+            session.state = BookingState.COLLECTING_PATIENT_NAME
+            session.last_asked_field = "patient_name"
+            if lang in ("ta", "tanglish", "ta_mix"):
+                resp = "நிச்சயமாக! உங்க full name சொல்ல முடியுமா?"
+            elif lang == "hi":
+                resp = "Zaroor! Kya main aapka poora naam jaan sakta hoon?"
+            else:
+                resp = "Certainly! May I have your full name?"
+            self._log_conversation_turn(session, text, resp, "lead_ask_name", state_before=state_before)
+            return _ret(resp)
+
+        elif next_missing == "email":
+            session.state = BookingState.COLLECTING_EMAIL
+            session.last_asked_field = "email"
+            if lang in ("ta", "tanglish", "ta_mix"):
+                resp = f"சரி, {first_name}. உங்க email address சொல்லுங்க." if first_name else "உங்க email address சொல்லுங்க."
+            elif lang == "hi":
+                resp = f"Dhanyawad, {first_name}. Kripya apna email address batayein." if first_name else "Kripya apna email address batayein."
+            else:
+                resp = f"Thanks, {first_name}. What is your email address?" if first_name else "Could you please share your email address?"
+            self._log_conversation_turn(session, text, resp, "lead_ask_email", state_before=state_before)
+            return _ret(resp)
+
+        elif next_missing == "contact_number":
+            session.state = BookingState.COLLECTING_PHONE
+            session.last_asked_field = "contact_number"
+            if lang in ("ta", "tanglish", "ta_mix"):
+                resp = f"சரி, {first_name}. உங்க contact phone number சொல்லுங்க." if first_name else "உங்க contact phone number சொல்லுங்க."
+            elif lang == "hi":
+                resp = f"Theek hai, {first_name}. Kripya apna contact phone number batayein." if first_name else "Kripya apna contact phone number batayein."
+            else:
+                resp = f"Thanks, {first_name}. Could you please share your contact phone number?" if first_name else "Could you please share your contact phone number?"
+            self._log_conversation_turn(session, text, resp, "lead_ask_phone", state_before=state_before)
+            return _ret(resp)
+
+        elif next_missing == "industry":
+            session.state = BookingState.COLLECTING_BUSINESS
+            session.last_asked_field = "industry"
+            if lang in ("ta", "tanglish", "ta_mix"):
+                resp = f"சரி, {first_name}. நீங்க எந்த business அல்லது industry-ல இருக்கீங்க?" if first_name else "நீங்க எந்த business அல்லது industry-ல இருக்கீங்க?"
+            elif lang == "hi":
+                resp = f"Theek hai, {first_name}. Aap kis business ya industry se hain?" if first_name else "Aap kis business ya industry se hain?"
+            else:
+                resp = f"Thanks, {first_name}. What business or industry are you in?" if first_name else "What business or industry are you in?"
+            self._log_conversation_turn(session, text, resp, "lead_ask_industry", state_before=state_before)
+            return _ret(resp)
+
+        elif next_missing == "requirement":
+            session.state = BookingState.COLLECTING_REQUIREMENT
+            session.last_asked_field = "requirement"
+            if lang in ("ta", "tanglish", "ta_mix"):
+                resp = "எங்க team-கூட எந்த service அல்லது requirement பத்தி பேச விரும்புறீங்க?"
+            elif lang == "hi":
+                resp = "Aap hamari team ke saath kis service ya requirement ke baare mein baat karna chahenge?"
+            else:
+                resp = "What specific requirement or service would you like our team to discuss with you?"
+            self._log_conversation_turn(session, text, resp, "lead_ask_requirement", state_before=state_before)
+            return _ret(resp)
+
+        return _ret("How else may I assist you?")
 
     def process_booking_turn(self, text: str, session: BookingSession, turn_id: Optional[str] = None) -> str:
         """
@@ -4218,7 +5330,10 @@ class BookingStateService:
         is_bare_hello = txt_lower.rstrip(".,?!") in ("hello", "hi", "hey", "hello there", "hi there", "hello?", "hi?")
         if (any(phrase in txt_lower for phrase in presence_phrases) or is_bare_hello) and not any(w in txt_lower for w in ["book", "appointment", "doctor", "schedule", "reserve", "demo"]):
             silence_prompt = self.get_silence_prompt(session)
-            resp = f"Yes, I'm right here! {silence_prompt}"
+            if getattr(session, "conversation_language", "en") in ("ta", "tanglish", "ta_mix"):
+                resp = f"ஆமா, நான் line-ல தான் இருக்கேன்! {silence_prompt}"
+            else:
+                resp = f"Yes, I'm right here! {silence_prompt}"
             self._log_conversation_turn(session, text, resp, "presence_reassurance", state_before=state_before)
             return _ret(resp)
 
@@ -4233,6 +5348,38 @@ class BookingStateService:
 
         lang = session.conversation_language
 
+        # Workflow Mode Evaluation: Callback / Lead Collection vs Explicit Appointment Booking
+        _CALLBACK_TRIGGER_PHRASES = [
+            "arrange a call", "arrange call", "make an arrangement", "make arrangement",
+            "speak with your team", "speak with the team", "speak to your team", "speak to the team",
+            "talk to your team", "talk to the team", "talk with your team", "talk with the team",
+            "connect with your team", "connect with the team", "i want to speak with your team",
+            "i want to talk to your team", "contact me", "yes contact me", "yes, contact me",
+            "call me back", "request a callback", "callback", "arrange a callback",
+            "give me a call back", "schedule a callback", "schedule a call", "call back",
+            "have someone call me", "can someone call me", "get someone to call me"
+        ]
+        is_callback_trigger = any(cb in txt_lower for cb in _CALLBACK_TRIGGER_PHRASES)
+
+        _EXPLICIT_APPT_TRIGGERS = [
+            "book an appointment", "book appointment", "schedule an appointment", "make an appointment",
+            "book a slot", "reserve a slot", "want to book an appointment", "need an appointment",
+            "i want an appointment", "take an appointment", "fix an appointment"
+        ]
+        is_explicit_appt = any(ab in txt_lower for ab in _EXPLICIT_APPT_TRIGGERS) or (
+            any(w in txt_lower for w in ["book", "booking", "schedule", "reserve"])
+            and any(w in txt_lower for w in ["appointment", "slot", "meeting", "demo"])
+            and not is_callback_trigger
+        )
+
+        if is_explicit_appt:
+            session.workflow_mode = SessionWorkflowMode.APPOINTMENT_BOOKING
+        elif is_callback_trigger:
+            session.workflow_mode = SessionWorkflowMode.LEAD_COLLECTION
+
+        if getattr(session, "workflow_mode", None) == SessionWorkflowMode.LEAD_COLLECTION:
+            return self.process_lead_collection_turn(text, session, turn_id=turn_id, state_before=state_before)
+
         # Cancellation check — only explicit booking-cancel phrases, not bare 'cancel'
         _CANCEL_PHRASES = [
             "cancel booking", "cancel the booking", "cancel appointment", "cancel the appointment",
@@ -4243,11 +5390,29 @@ class BookingStateService:
             session.reset()
             resp = "Your appointment booking has been cancelled. How else may I assist you today?"
             if lang in ("ta", "tanglish", "ta_mix"):
-                resp = "உங்க appointment booking ரத்து பண்ணியாச்சு. வேற ஏதாச்சு உதவி வேணுமா?"
+                resp = "Booking cancel பண்ணியாச்சு. உங்களுக்கு வேற ஏதாவது help வேணுமா?"
             elif lang == "hi":
                 resp = "Aapka appointment booking cancel kar diya gaya hai. Main aapki aur kya sahayata kar sakta hoon?"
             self._log_conversation_turn(session, text, resp, "booking_cancelled", state_before=state_before)
             return _ret(resp)
+
+        # Resume / Continue Intent Detection
+        _RESUME_PHRASES = {
+            "continue the last conversation", "continue last conversation",
+            "continue the conversation", "continue conversation",
+            "continue", "let's proceed", "lets proceed", "proceed",
+            "okay go ahead", "ok go ahead", "go ahead", "resume",
+            "carry on", "keep going"
+        }
+        clean_text_for_resume = re.sub(r'[^a-zA-Z\s]', '', txt_lower).strip()
+        if (clean_text_for_resume in _RESUME_PHRASES or any(p == clean_text_for_resume for p in _RESUME_PHRASES)) and session.is_active():
+            logger.info(f"[RESUME_CONVERSATION] Resuming active booking at stage={session.state}, missing_fields={session.missing_fields}")
+            if not session.missing_fields or session.state in CORRECTION_AND_CONFIRMATION_STATES:
+                return self.handle_confirmation_turn(session, text, turn_id=turn_id, state_before=state_before)
+
+        # Dedicated confirmation routing: If waiting for confirmation or in correction flow, route directly to handle_confirmation_turn
+        if session.state in CORRECTION_AND_CONFIRMATION_STATES or (state_before and state_before.get("state") in CORRECTION_AND_CONFIRMATION_STATES):
+            return self.handle_confirmation_turn(session, text, turn_id=turn_id, state_before=state_before)
 
         # If already booked/confirmed in this session
         is_already_confirmed = session.state in (BookingState.BOOKING_CONFIRMED, BookingState.CALL_TERMINATING, BookingState.CALL_COMPLETED, BookingState.BOOKED, BookingState.COMPLETED)
@@ -4256,7 +5421,7 @@ class BookingStateService:
             if any(w in txt_lower for w in ["thank you", "thanks", "bye", "goodbye", "that's all", "that is all", "nothing else", "no that's it"]):
                 resp = f"You're very welcome, {session.patient_name or 'there'}! Your appointment is all set. Have a wonderful day!"
                 if lang in ("ta", "tanglish", "ta_mix"):
-                    resp = f"ரொம்ப நன்றி! உங்க appointment confirm ஆயிடுச்சு. நல்ல நாளாக அமையட்டும்!"
+                    resp = f"ரொம்ப நன்றி! உங்க appointment confirm ஆயிடுச்சு. Have a great day!"
                 elif lang == "hi":
                     resp = f"Aapka bahut dhanyawad! Aapka appointment confirm hai. Aapka din shubh ho!"
                 self._log_conversation_turn(session, text, resp, "booking_closing", state_before=state_before)
@@ -4352,10 +5517,65 @@ class BookingStateService:
             session.last_asked_field = "confirm_time_change"
             resp = f"You previously selected {session.time}. Would you like to change your appointment time to {cand_time}?"
             if lang in ("ta", "tanglish", "ta_mix"):
-                resp = f"நீங்க முன்னாடி {session.time} தேர்வு செய்திருந்தீங்க. Appointment நேரத்தை {cand_time}-க்கு மாற்ற விரும்புகிறீர்களா?"
+                resp = f"நீங்க முன்னாடி {session.time} select பண்ணியிருந்தீங்க. Appointment time-ஐ {cand_time}-க்கு மாத்தலாமா?"
             elif lang == "hi":
                 resp = f"Aapne pehle {session.time} chuna tha. Kya aap appointment ka samay badal kar {cand_time} karna chahte hain?"
             self._log_conversation_turn(session, text, resp, "clarify_time_change", state_before=state_before)
+            return _ret(resp)
+
+        # 1b. If caller just corrected/stated their name while waiting for a different field, acknowledge and continue
+        if session.booking_data.pop("name_just_corrected", False):
+            first_name = (session.patient_name or "").split()[0] if session.patient_name else ""
+            if not session.contact_number or session.contact_number == "Unknown":
+                session.state = BookingState.COLLECTING_PHONE
+                session.last_asked_field = "contact_number"
+                if lang in ("ta", "tanglish", "ta_mix"):
+                    resp = f"சரி, {first_name}. உங்க contact phone number சொல்லுங்க."
+                elif lang == "hi":
+                    resp = f"Theek hai, {first_name}. Kripya apna contact phone number batayein."
+                else:
+                    resp = f"Got it, {first_name}. Could you please share your contact phone number?"
+            elif not session.email and not session.booking_data.get("email_declined"):
+                session.state = BookingState.COLLECTING_EMAIL
+                session.last_asked_field = "email"
+                if lang in ("ta", "tanglish", "ta_mix"):
+                    resp = f"சரி, {first_name}. Confirmation அனுப்ப உங்க email address சொல்லுங்க."
+                elif lang == "hi":
+                    resp = f"Theek hai, {first_name}. Confirmation bhejne ke liye kripya apna email address batayein."
+                else:
+                    resp = f"Got it, {first_name}. What is your email address so I can send your appointment confirmation?"
+            elif not session.location and not session.booking_data.get("location_declined") and session.is_field_required("location"):
+                session.state = BookingState.COLLECTING_LOCATION
+                session.last_asked_field = "location"
+                if lang in ("ta", "tanglish", "ta_mix"):
+                    resp = f"சரி, {first_name}. உங்க city அல்லது location என்ன?"
+                elif lang == "hi":
+                    resp = f"Theek hai, {first_name}. Kripya apna city ya location batayein."
+                else:
+                    resp = f"Got it, {first_name}. Which city or location are you joining from?"
+            elif not session.date:
+                session.state = BookingState.WAITING_FOR_DATE
+                session.last_asked_field = "date"
+                if lang in ("ta", "tanglish", "ta_mix"):
+                    resp = f"சரி, {first_name}. எந்த date-ல appointment book பண்ணலாம்?"
+                elif lang == "hi":
+                    resp = f"Theek hai, {first_name}. Aap kis date ko appointment prefer karenge?"
+                else:
+                    resp = f"Got it, {first_name}. Which date would you prefer for your appointment?"
+            elif not session.time:
+                session.state = BookingState.WAITING_FOR_TIME
+                session.last_asked_field = "time"
+                if lang in ("ta", "tanglish", "ta_mix"):
+                    resp = f"சரி, {first_name}. எந்த time slot உங்களுக்கு வசதியா இருக்கும்?"
+                elif lang == "hi":
+                    resp = f"Theek hai, {first_name}. Aap kaun sa time slot prefer karenge?"
+                else:
+                    resp = f"Got it, {first_name}. Which time slot would you prefer?"
+            else:
+                session.state = BookingState.WAITING_FOR_CONFIRMATION
+                session.last_asked_field = "confirmation"
+                resp = f"Got it, {first_name}. I've updated your name to {session.patient_name}. Shall I proceed with confirming your appointment?"
+            self._log_conversation_turn(session, text, resp, "name_corrected_progress", state_before=state_before)
             return _ret(resp)
 
         # Handle explicit request to change email, phone, or name when new value is not in current turn
@@ -4695,11 +5915,36 @@ class BookingStateService:
             return _ret(resp)
 
         # Check if caller explicitly asked for available slots
-        if any(phrase in txt_lower for phrase in [
-            "available slots", "slots available", "what slots", "which slots",
-            "time slots", "open slots", "free slots", "available times", "available time",
-            "schedule of doctor", "schedule of staff", "what time slots do you have", "what times"
-        ]):
+        has_stated_time = bool(session.time or re.search(r'\b(?:1[0-2]|0?[1-9])(?::[0-5][0-9])?\s*(?:a\.?m\.?|p\.?m\.?)\b', txt_lower))
+        is_asking_slots = not has_stated_time and (
+            any(phrase in txt_lower for phrase in [
+                "available slots", "slots available", "what slots", "which slots",
+                "time slots", "open slots", "free slots", "available times",
+                "schedule of doctor", "schedule of staff", "what time slots do you have", "what times"
+            ]) or ("available time" in txt_lower and not any(w in txt_lower for w in ["my available time", "time is", "time would be", "available at", "i am available", "i'm available"]))
+        )
+        if is_asking_slots:
+            is_demo = (
+                getattr(session, "booking_type", None) in ("SALES_DEMO", "BUSINESS_CONSULTATION")
+                or getattr(session, "business_type", None) == "SOFTWARE"
+                or getattr(session, "workflow_type", None) == "SALES_DEMO"
+            )
+            if is_demo:
+                session.state = BookingState.WAITING_FOR_TIME
+                session.last_asked_field = "time"
+                if lang in ("ta", "tanglish", "ta_mix"):
+                    resp = "எங்கள் demo slots காலை 9:30 AM, 11:00 AM, மதியம் 2:00 PM மற்றும் 4:00 PM-க்கு ലഭ്യமாக உள்ளது. உங்களுக்கு எந்த நேரம் வசதியாக இருக்கும்?"
+                elif lang == "hi":
+                    resp = "Hamare demo slots 9:30 AM, 11:00 AM, 2:00 PM aur 4:00 PM par uplabdh hain. Aapke liye kaun sa samay sahi rahega?"
+                elif lang in ("kn", "kannada"):
+                    resp = "ನಮ್ಮ ಡೆಮೊ ಸ್ಲಾಟ್‌ಗಳು 9:30 AM, 11:00 AM, 2:00 PM ಮತ್ತು 4:00 PM ಗೆ ಲಭ್ಯವಿವೆ. ನಿಮಗೆ ಯಾವ ಸಮಯ ಸೂಕ್ತವಾಗಿರುತ್ತದೆ?"
+                elif lang in ("te", "telugu"):
+                    resp = "మా డెమో స్లాట్లు 9:30 AM, 11:00 AM, 2:00 PM మరియు 4:00 PM అందుబాటులో ఉన్నాయి. మీకు ఏ సమయం అనుకూలంగా ఉంటుంది?"
+                else:
+                    resp = "Our demo slots are available at 9:30 AM, 11:00 AM, 2:00 PM, and 4:00 PM. Which time works best for you?"
+                self._log_conversation_turn(session, text, resp, "presented_demo_slots", state_before=state_before)
+                return _ret(resp)
+
             doc_to_check = session.doctor
             if not doc_to_check:
                 session.state = BookingState.WAITING_FOR_DOCTOR
@@ -4713,7 +5958,7 @@ class BookingStateService:
                 elif lang in ("kn", "kannada"):
                     resp = f"{name_ack_slots}ಲಭ್ಯವಿರುವ ಸಮಯ ಸ್ಲಾಟ್‌ಗಳನ್ನು ನೋಡಲು, ನೀವು ಯಾವ ವೈದ್ಯರನ್ನು ಅಥವಾ ವಿಭಾಗವನ್ನು ಸಂಪರ್ಕಿಸಲು ಬಯಸುತ್ತೀರಿ?"
                 elif lang in ("te", "telugu"):
-                    resp = f"{name_ack_slots}అందుబాటులో ఉన్న సమయ స్లాట్‌లను తనిఖీ చేయడానికి, మీరు ఏ వైద్యుడిని లేదా విభాగాన్ని సంప్రదించాలనుకుంటున్నారు?"
+                    resp = f"{name_ack_slots}అందుబాటులో ఉన్న సమయ స్లాట్‌లను తనిಖీ చేయడానికి, మీరు ఏ వైద్యుడిని లేదా విభాగాన్ని సంప్రదించాలనుకుంటున్నారు?"
                 else:
                     resp = f"{name_ack_slots}To check available time slots, which doctor or department would you like to consult?"
                 self._log_conversation_turn(session, text, resp, "ask_doctor_for_slots", state_before=state_before)
@@ -4779,7 +6024,7 @@ class BookingStateService:
 
                 if is_doctor_request:
                     if lang in ("ta", "tanglish", "ta_mix"):
-                        resp = f"மன்னிக்கவும், எங்கள் directory-ல் '{unverified}' என்ற மருத்துவர் விவரம் இல்லை. நீங்கள் பார்க்க விரும்பும் மருத்துவர் அல்லது துறையின் பெயரை மீண்டும் கூற முடியுமா?"
+                        resp = f"மன்னிக்கவும், எங்க directory-ல '{unverified}' doctor இல்ல. நீங்க பார்க்க விரும்பும் doctor அல்லது department பெயர் சொல்ல முடியுமா?"
                     elif lang == "hi":
                         resp = f"Maaf kijiye, hamari directory me '{unverified}' doctor nahi mile. Kya aap doctor ka naam ya vibhaag dohra sakte hain?"
                     else:
@@ -4798,7 +6043,7 @@ class BookingStateService:
                         ask_target = self._get_target_entity_question(session, lang=lang)
                         resp = f"I couldn't find '{unverified}' in our directory. {ask_target}"
                     if lang in ("ta", "tanglish", "ta_mix"):
-                        resp = f"மன்னிக்கவும், '{unverified}' எங்க directory-ல இல்ல. எந்த product அல்லது service-ஐ book பண்ண விரும்புகிறீர்கள்?"
+                        resp = f"மன்னிக்கவும், '{unverified}' எங்க directory-ல இல்ல. எந்த product அல்லது service book பண்ணனும்?"
                     elif lang == "hi":
                         resp = f"Maaf kijiye, '{unverified}' hamari directory me nahi mile. Aap kaunsa product ya service book karna chahte hain?"
                 self._log_conversation_turn(session, text, resp, "unverified_entity_clarification", state_before=state_before)
@@ -5095,6 +6340,19 @@ class BookingStateService:
         if not session.date:
             session.state = BookingState.WAITING_FOR_DATE
             session.last_asked_field = "date"
+            was_waiting_date = (
+                (state_before and state_before.get("state") in (BookingState.WAITING_FOR_DATE, BookingState.WAITING_FOR_BOOKING_DATE))
+                or (state_before and state_before.get("last_asked_field") == "date")
+            )
+            if was_waiting_date and text.strip() and not any(w in txt_lower for w in ["book", "appointment", "schedule", "demo"]):
+                resp = "Sorry, I didn't catch the date. Would tomorrow or another date work for you?"
+                if lang in ("ta", "tanglish", "ta_mix"):
+                    resp = "மன்னிக்கவும், தேதி சரியாக விளங்கவில்லை. நாளை அல்லது வேறு ஏதேனும் தேதி உங்களுக்கு வசதியாக இருக்குமா?"
+                elif lang == "hi":
+                    resp = "Kshama kijiye, mujhe tareekh samajh nahi aayi. Kya kal ya koi aur tareekh theek rahegi?"
+                self._log_conversation_turn(session, text, resp, "unclear_date_clarification", state_before=state_before)
+                return _ret(resp)
+
             is_demo_date = (
                 getattr(session, "booking_type", None) in ("SALES_DEMO", "BUSINESS_CONSULTATION")
                 or getattr(session, "business_type", None) == "SOFTWARE"
@@ -5203,21 +6461,54 @@ class BookingStateService:
                     session.availability_verified = False
                     session.state = BookingState.WAITING_FOR_TIME
                     session.last_asked_field = "time"
-                    if verif.alternative_slots:
-                        session.offered_slots = verif.alternative_slots
-                        alt_text = ", ".join(verif.alternative_slots)
-                        resp = f"{requested_time} is not available for {target_entity_name} on {session.date}. Available alternative slots are: {alt_text}. Would you like one of these available times?"
-                        if lang in ("ta", "tanglish", "ta_mix"):
-                            resp = f"{requested_time} slot {target_entity_name}-க்கு busy-ஆ இருக்கு. Available alternative slots: {alt_text}. இதில எது ok?"
-                        elif lang == "hi":
-                            resp = f"{requested_time} slot {target_entity_name} ke saath available nahi hai. Available alternative slots hain: {alt_text}. Kya inme se koi chalega?"
+                    if verif.is_past_time:
+                        if verif.alternative_slots:
+                            session.offered_slots = verif.alternative_slots
+                            alt_text = ", ".join(verif.alternative_slots)
+                            resp = f"Sorry, {requested_time} is no longer available because that time has passed. Today's available slots are {alt_text}. Which time would you prefer?"
+                            if lang in ("ta", "tanglish", "ta_mix"):
+                                resp = f"மன்னிக்கவும், {requested_time} நேரம் முடிந்துவிட்டது. இன்றைக்கு available slots: {alt_text}. இதில எந்த நேரம் வசதியாக இருக்கும்?"
+                            elif lang == "hi":
+                                resp = f"Kshama kijiye, {requested_time} ka samay nikal chuka hai. Aaj ke available slots hain: {alt_text}. Aap konsa samay pasand karenge?"
+                        elif verif.next_available_date and verif.next_available_slots:
+                            session.offered_slots = verif.next_available_slots
+                            next_alt = ", ".join(verif.next_available_slots)
+                            resp = f"Sorry, {requested_time} is no longer available because that time has passed, and there are no remaining slots available today. The next available date is {verif.next_available_date} with slots at {next_alt}. Which time would you prefer?"
+                            if lang in ("ta", "tanglish", "ta_mix"):
+                                resp = f"மன்னிக்கவும், {requested_time} நேரம் முடிந்துவிட்டது, இன்றைக்கு வேறு slots இல்லை. அடுத்த available date {verif.next_available_date}, available slots: {next_alt}. இதில எந்த நேரம் வசதியாக இருக்கும்?"
+                            elif lang == "hi":
+                                resp = f"Kshama kijiye, {requested_time} ka samay nikal chuka hai aur aaj koi slots available nahi hain. Agli available date {verif.next_available_date} hai jisme slots hain: {next_alt}. Aap konsa samay pasand karenge?"
+                        else:
+                            session.offered_slots = []
+                            resp = f"Sorry, {requested_time} is no longer available because that time has passed, and there are no remaining slots available today. Would you like to check tomorrow or another date?"
+                            if lang in ("ta", "tanglish", "ta_mix"):
+                                resp = f"மன்னிக்கவும், {requested_time} நேரம் முடிந்துவிட்டது, இன்றைக்கு வேறு slots இல்லை. நாளை அல்லது வேறு date check பண்ணலாமா?"
+                            elif lang == "hi":
+                                resp = f"Kshama kijiye, {requested_time} ka samay nikal chuka hai aur aaj koi slots available nahi hain. Kya aap kal ya koi aur date check karna chahenge?"
                     else:
-                        session.offered_slots = []
-                        resp = f"{requested_time} is not available for {target_entity_name} on {session.date}, and there are no other open slots available on this date. Would you like to try another date?"
-                        if lang in ("ta", "tanglish", "ta_mix"):
-                            resp = f"{requested_time} slot {target_entity_name}-க்கு unavailable, {session.date}-ல வேற slots இல்ல. வேற date check பண்ணலாமா?"
-                        elif lang == "hi":
-                            resp = f"{requested_time} slot {target_entity_name} ke saath available nahi hai aur is date par koi dusra slot nahi hai. Kya aap dusri date try karna chahenge?"
+                        if verif.alternative_slots:
+                            session.offered_slots = verif.alternative_slots
+                            alt_text = ", ".join(verif.alternative_slots)
+                            resp = f"{requested_time} is not available for {target_entity_name} on {session.date}. Available alternative slots are: {alt_text}. Would you like one of these available times?"
+                            if lang in ("ta", "tanglish", "ta_mix"):
+                                resp = f"{requested_time} slot {target_entity_name}-க்கு busy-ஆ இருக்கு. Available alternative slots: {alt_text}. இதில எது ok?"
+                            elif lang == "hi":
+                                resp = f"{requested_time} slot {target_entity_name} ke saath available nahi hai. Available alternative slots hain: {alt_text}. Kya inme se koi chalega?"
+                        elif verif.next_available_date and verif.next_available_slots:
+                            session.offered_slots = verif.next_available_slots
+                            next_alt = ", ".join(verif.next_available_slots)
+                            resp = f"{requested_time} is not available for {target_entity_name} on {session.date}, and there are no other open slots available on this date. The next available date is {verif.next_available_date} with slots at {next_alt}. Which time would you prefer?"
+                            if lang in ("ta", "tanglish", "ta_mix"):
+                                resp = f"{requested_time} slot {target_entity_name}-க்கு unavailable, {session.date}-ல வேற slots இல்ல. அடுத்த available date {verif.next_available_date}, available slots: {next_alt}. இதில எது ok?"
+                            elif lang == "hi":
+                                resp = f"{requested_time} slot {target_entity_name} ke saath available nahi hai aur is date par koi dusra slot nahi hai. Agli available date {verif.next_available_date} hai jisme slots hain: {next_alt}. Aap konsa samay pasand karenge?"
+                        else:
+                            session.offered_slots = []
+                            resp = f"{requested_time} is not available for {target_entity_name} on {session.date}, and there are no other open slots available on this date. Would you like to try another date?"
+                            if lang in ("ta", "tanglish", "ta_mix"):
+                                resp = f"{requested_time} slot {target_entity_name}-க்கு unavailable, {session.date}-ல வேற slots இல்ல. வேற date check பண்ணலாமா?"
+                            elif lang == "hi":
+                                resp = f"{requested_time} slot {target_entity_name} ke saath available nahi hai aur is date par koi dusra slot nahi hai. Kya aap dusri date try karna chahenge?"
                     self._log_conversation_turn(session, text, resp, "slot_unavailable", state_before=state_before)
                     return _ret(resp)
                 else:
@@ -5245,6 +6536,19 @@ class BookingStateService:
             session.patient_name = None
             session.state = BookingState.COLLECTING_PATIENT_NAME
             session.last_asked_field = "patient_name"
+            was_waiting_name = (
+                (state_before and state_before.get("state") in (BookingState.COLLECTING_PATIENT_NAME, BookingState.WAITING_FOR_PATIENT_NAME, BookingState.WAITING_FOR_NAME))
+                or (state_before and state_before.get("last_asked_field") == "patient_name")
+            )
+            if was_waiting_name and text.strip() and not any(w in txt_lower for w in ["book", "appointment", "schedule", "demo"]):
+                resp = "Could you please repeat your name?"
+                if lang in ("ta", "tanglish", "ta_mix"):
+                    resp = "மன்னிக்கவும், உங்க பெயரை திரும்ப சொல்ல முடியுமா?"
+                elif lang == "hi":
+                    resp = "Kripya apna naam ek baar phir se batayenge?"
+                self._log_conversation_turn(session, text, resp, "unclear_name_clarification", state_before=state_before)
+                return _ret(resp)
+
             rel = session.patient_relationship or "relative"
             for_other = getattr(session, "is_booking_for_other", False)
             is_demo = (
@@ -5390,8 +6694,54 @@ class BookingStateService:
                 self._log_conversation_turn(session, text, resp, "waiting_for_email", state_before=state_before)
                 return _ret(resp)
 
+        # STEP 7b: Location Check
+        if not session.location and not session.booking_data.get("location_declined"):
+            was_waiting_loc = (
+                (state_before and state_before.get("state") in (BookingState.COLLECTING_LOCATION, BookingState.WAITING_FOR_LOCATION))
+                or (state_before and state_before.get("last_asked_field") == "location")
+            )
+            # Check if customer explicitly declines location
+            decline_phrases = [
+                "no location", "don't want to share", "skip", "decline", "not now",
+                "prefer not to say", "none", "no thanks", "idhu vendaam", "nahi batana"
+            ]
+            clean_token = txt_lower.strip().rstrip(".,!?")
+            is_explicit_decline = any(dp in txt_lower for dp in decline_phrases) or (was_waiting_loc and clean_token in ("no", "nope", "skip", "none", "na", "illa", "nahi"))
+
+            if is_explicit_decline:
+                session.booking_data["location_declined"] = True
+                session.location = None
+                # Continue directly to confirmation (Step 8) without location
+            else:
+                session.state = BookingState.COLLECTING_LOCATION
+                session.last_asked_field = "location"
+
+                if was_waiting_loc:
+                    resp = "I didn't catch your location. Could you please tell me your city or location, or say 'skip' to continue?"
+                    if lang in ("ta", "tanglish", "ta_mix"):
+                        resp = "உங்கள் இடம் சரியாகக் கேட்கவில்லை. உங்கள் நகரம் அல்லது இடத்தை சொல்லுங்கள், அல்லது 'skip' என்று சொல்லுங்கள்."
+                    elif lang == "hi":
+                        resp = "Mujhe aapka location theek se sunai nahi diya. Kripya apna shehar ya location batayein ya 'skip' kahein."
+                    elif lang in ("kn", "kannada"):
+                        resp = "ನಿಮ್ಮ location ಸರಿಯಾಗಿ ಕೇಳಿಸಲಿಲ್ಲ. ದಯವಿಟ್ಟು ನಿಮ್ಮ ಊರು ಅಥವಾ location ತಿಳಿಸಿ, ಅಥವಾ 'skip' ಎಂದು ಹೇಳಿ."
+                    elif lang in ("te", "telugu"):
+                        resp = "మీ location సరిగ్గా వినబడలేదు. దయచేసి మీ ఊరు లేదా location చెప్పండి, లేదా 'skip' అని చెప్పండి."
+                else:
+                    if lang in ("ta", "tanglish", "ta_mix"):
+                        resp = "உங்க location அல்லது ஊர் சொல்ல முடியுமா?"
+                    elif lang == "hi":
+                        resp = "क्या आप कृपया मुझे अपना स्थान या शहर बता सकते हैं?"
+                    elif lang in ("kn", "kannada"):
+                        resp = "ದಯವಿಟ್ಟು ನಿಮ್ಮ ಊರು ಅಥವಾ ಸ್ಥಳವನ್ನು ತಿಳಿಸಬಹುದೇ?"
+                    elif lang in ("te", "telugu"):
+                        resp = "దయచేసి మీ ప్రాంతం లేదా ఊరు చెప్పగలరా?"
+                    else:
+                        resp = "Could you please tell me your location?"
+                self._log_conversation_turn(session, text, resp, "waiting_for_location", state_before=state_before)
+                return _ret(resp)
+
         # STEP 8: Read-Back Confirmation Check & Handling
-        if session.state == BookingState.WAITING_FOR_CONFIRMATION or (state_before and state_before.get("state") == BookingState.WAITING_FOR_CONFIRMATION):
+        if session.state in CORRECTION_AND_CONFIRMATION_STATES or (state_before and state_before.get("state") in CORRECTION_AND_CONFIRMATION_STATES):
             return self.handle_confirmation_turn(session, text, turn_id=turn_id, state_before=state_before)
 
         # First time all details are present — Read back and ask for confirmation
@@ -5407,15 +6757,15 @@ class BookingStateService:
             target_str = "for your product demo" if is_demo else (f"with {session.doctor}" if session.doctor else f"for {session.service or 'your appointment'}")
             loc_str = f", Location: {session.location}" if session.location else ""
             email_part = f", Email: {session.email}" if session.email else ""
-            email_ta = f", மின்னஞ்சல்: {session.email}" if session.email else ""
+            email_ta = f", Email: {session.email}" if session.email else ""
             email_hi = f", Email: {session.email}" if session.email else ""
 
             if lang in ("ta", "tanglish", "ta_mix"):
                 resp = (
-                    f"நன்றி, {first_name or 'வணக்கம்'}! உங்க விவரங்களை உறுதி செய்கிறேன்: "
-                    f"பெயர்: {session.patient_name}, தொலைபேசி: {session.contact_number}"
-                    f"{email_ta}{f', இடம்: {session.location}' if session.location else ''}, "
-                    f"{session.date} அன்று {session.time}-க்கு {target_str}. இந்த விவரங்கள் சரியா?"
+                    f"நன்றி {first_name or ''}! உங்க details confirm பண்றேன்: "
+                    f"Name: {session.patient_name}, Phone: {session.contact_number}"
+                    f"{email_ta}{f', Location: {session.location}' if session.location else ''}, "
+                    f"{session.date} அன்று {session.time}-க்கு {target_str}. இந்த details சரியா?"
                 )
             elif lang == "hi":
                 resp = (
@@ -5580,6 +6930,7 @@ class BookingStateService:
             from src.services.appointment_service import AppointmentService
             from src.validators.appointment_validator import AppointmentCreate
             from src.models.appointment import Appointment
+            from src.models.staff import Staff
             from src.services.calendar_verification_service import calendar_verification_service
 
             import time
@@ -5641,8 +6992,44 @@ class BookingStateService:
                         f"\n  confirmation_count={session.confirmation_count}"
                         f"\n  playback_status=QUEUED"
                         f"\n  appointment_id={existing_for_customer.id}"
+                        f"\n  booking_status=CONFIRMED"
+                        f"\n  calendar_sync_status={getattr(existing_for_customer, 'calendar_sync_status', 'PENDING')}"
+                        f"\n  email_notification_status={getattr(existing_for_customer, 'email_status', 'PENDING')}"
+                        f"\n  whatsapp_notification_status={getattr(existing_for_customer, 'whatsapp_status', 'PENDING')}"
+                        f"\n  customer={self._mask_pii(session.patient_name)}"
+                        f"\n  phone={self._mask_pii(session.contact_number)}"
                     )
                     return resp_text
+
+                # Authoritative Pre-Commit Past-Time Check
+                from src.routes.availability_routes import get_current_business_datetime, get_available_slots
+                now_dt = get_current_business_datetime(org_id=org_id, db=db)
+                current_date = now_dt.date()
+                naive_now = now_dt.replace(tzinfo=None) if now_dt.tzinfo else now_dt
+
+                try:
+                    slot_t_obj = datetime.strptime(time_24h, "%H:%M").time()
+                    slot_datetime_obj = datetime.combine(target_date_obj, slot_t_obj)
+                    is_past_commit = (target_date_obj < current_date) or (target_date_obj == current_date and slot_datetime_obj <= naive_now)
+                except Exception:
+                    is_past_commit = False
+
+                if is_past_commit:
+                    logger.warning(f"[PAST_TIME_PREVENTION] Pre-commit rejected past slot: {target_date_obj} {normalized_time_str} <= {naive_now}")
+                    session.time = None
+                    session.availability_verified = False
+                    session.state = BookingState.WAITING_FOR_TIME
+                    session.last_asked_field = "time"
+                    staff_rec = db.query(Staff).filter(Staff.name.ilike(f"%{doctor_name}%")).first() if doctor_name else None
+                    staff_id_val = staff_rec.id if staff_rec else (session.doctor_id or 1)
+                    rem_slots_res = get_available_slots(staff_id=staff_id_val, selected_date=target_date_obj, db=db)
+                    rem_slots = [calendar_verification_service.format_time_12h(s["start"]) for s in rem_slots_res.get("available_slots", [])[:4]]
+                    if rem_slots:
+                        session.offered_slots = rem_slots
+                        alt_text = ", ".join(rem_slots)
+                        return f"Sorry, {normalized_time_str} is no longer available because that time has passed. Today's available slots are {alt_text}. Which time would you prefer?"
+                    else:
+                        return f"Sorry, {normalized_time_str} is no longer available because that time has passed, and there are no remaining slots available today. Would you like to check tomorrow or another date?"
 
                 # Race condition check: slot taken by another customer right before commit
                 conflict = db.query(Appointment).filter(
@@ -5659,9 +7046,9 @@ class BookingStateService:
                 availability_check_ms = max(1, int((time.time() - t_avail0) * 1000))
 
                 svc = AppointmentService(db)
-                svc_val = session.service or session.product or session.booking_data.get("service") or session.booking_data.get("product")
-                intent_val = session.current_intent or session.booking_data.get("intent", "appointment_booking")
-                purpose_note = f"Booked via AI Voice Receptionist ({intent_val.replace('_', ' ').title()})"
+                svc_val = session.service or session.product or session.booking_data.get("service") or session.booking_data.get("product") or "General Consultation"
+                intent_val = session.current_intent or session.booking_data.get("intent") or "appointment_booking"
+                purpose_note = f"Booked via AI Voice Receptionist ({str(intent_val).replace('_', ' ').title()})"
                 confirmed_email = (session.email or session.booking_data.get("email") or "").strip() or None
                 if not confirmed_email and session.contact_number:
                     try:
@@ -5683,6 +7070,7 @@ class BookingStateService:
                         customer=session.patient_name,
                         phone=session.contact_number or "Unknown",
                         email=confirmed_email,
+                        location=session.location,
                         department=dept_name,
                         staff=doctor_name,
                         service=svc_val,
@@ -5716,20 +7104,32 @@ class BookingStateService:
                         t_conf_start = time.time()
                         # Spoken confirmation without LLM dependency
                         b_name = session.business_name or "our team"
-                        if session.booking_type == "SALES_DEMO":
+                        if lang in ("ta", "tanglish", "ta_mix"):
+                            if session.booking_type == "SALES_DEMO":
+                                resp_text = (
+                                    f"உங்க demo appointment {normalized_date_str} அன்று {normalized_time_str}-க்கு confirm ஆயிடுச்சு! "
+                                    f"Appointment ID #{verified_appt.id}. {b_name}-க்கு call பண்ணதுக்கு நன்றி {session.patient_name}!"
+                                )
+                            else:
+                                resp_text = (
+                                    f"உங்க appointment {doctor_name}-கூட {normalized_date_str} அன்று {normalized_time_str}-க்கு confirm ஆயிடுச்சு! "
+                                    f"Appointment ID #{verified_appt.id}. விவரங்களை அனுப்பிவிட்டேன். நன்றி, {session.patient_name}!"
+                                )
+                        elif lang == "hi":
+                            if session.booking_type == "SALES_DEMO":
+                                resp_text = (
+                                    f"आपका डेमो अपॉइंटमेंट {normalized_date_str} को {normalized_time_str} पर कन्फर्म हो गया है। "
+                                    f"अपॉइंटमेंट आईडी #{verified_appt.id} है। {b_name} को कॉल करने के लिए धन्यवाद, {session.patient_name}!"
+                                )
+                            else:
+                                resp_text = (
+                                    f"Aapka appointment {doctor_name} ke saath {normalized_date_str} ko {normalized_time_str} par confirm ho gaya hai! "
+                                    f"Appointment ID #{verified_appt.id}. Maine aapko details bhej di hain. Dhanyawad, {session.patient_name}!"
+                                )
+                        elif session.booking_type == "SALES_DEMO":
                             resp_text = (
                                 f"Your demo appointment is confirmed for {normalized_date_str} at {normalized_time_str}. "
                                 f"Your appointment ID is #{verified_appt.id}. Thank you for calling {b_name}."
-                            )
-                        elif lang in ("ta", "tanglish", "ta_mix"):
-                            resp_text = (
-                                f"உங்க appointment {doctor_name}-கூட {normalized_date_str} அன்று {normalized_time_str}-க்கு confirm ஆயிடுச்சு! "
-                                f"Appointment ID #{verified_appt.id}. விவரங்களை அனுப்பிவிட்டேன். நன்றி, {session.patient_name}!"
-                            )
-                        elif lang == "hi":
-                            resp_text = (
-                                f"Aapka appointment {doctor_name} ke saath {normalized_date_str} ko {normalized_time_str} par confirm ho gaya hai! "
-                                f"Appointment ID #{verified_appt.id}. Maine aapko details bhej di hain. Dhanyawad, {session.patient_name}!"
                             )
                         else:
                             resp_text = (
@@ -5741,11 +7141,21 @@ class BookingStateService:
                         session.confirmation_message = resp_text
                         session.confirmed_appointment_id = verified_appt.id
 
+                        cal_status = getattr(verified_appt, "calendar_sync_status", "PENDING")
+                        email_status = getattr(verified_appt, "email_status", "PENDING")
+                        wa_status = getattr(verified_appt, "whatsapp_status", "PENDING")
+
                         logger.info(
                             f"\n[BOOKING_CONFIRMATION]"
                             f"\n  confirmation_count={session.confirmation_count}"
                             f"\n  playback_status=QUEUED"
                             f"\n  appointment_id={verified_appt.id}"
+                            f"\n  booking_status=CONFIRMED"
+                            f"\n  calendar_sync_status={cal_status}"
+                            f"\n  email_notification_status={email_status}"
+                            f"\n  whatsapp_notification_status={wa_status}"
+                            f"\n  customer={self._mask_pii(session.patient_name)}"
+                            f"\n  phone={self._mask_pii(session.contact_number)}"
                         )
                         confirmation_text_ms = max(1, int((time.time() - t_conf_start) * 1000))
                         booking_total_ms = max(1, int((time.time() - t_booking_start) * 1000))
@@ -5790,7 +7200,7 @@ class BookingStateService:
             if "conflict" in str(e).lower() or "409" in str(e):
                 return "I'm sorry, that appointment time on our calendar was just taken. Which other time would you prefer?"
             if lang in ("ta", "tanglish", "ta_mix"):
-                return "மன்னிக்கவும், கேலெண்டரில் அந்த நேரத்தை உறுதிப்படுத்த முடியவில்லை. உங்கள் விவரங்கள் சேமிக்கப்பட்டுள்ளன, எங்கள் குழு உங்களை விரைவில் தொடர்பு கொள்ளும்."
+                return "மன்னிக்கவும், calendar-ல அந்த time-ஐ confirm பண்ண முடியல. உங்க details save பண்ணியாச்சு, எங்க team உங்களை சீக்கிரமே contact பண்ணுவாங்க."
             return "I apologize, but we encountered an issue booking that slot in our calendar system. I have saved your details, and our team will follow up with you shortly to confirm your appointment."
 
 

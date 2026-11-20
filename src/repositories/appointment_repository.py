@@ -28,7 +28,9 @@ class AppointmentRepository:
 
     def create(self, data: dict) -> Appointment:
         from src.config.database import execute_with_retry
-        appointment = Appointment(**data)
+        valid_cols = {c.name for c in Appointment.__table__.columns}
+        filtered_data = {k: v for k, v in data.items() if k in valid_cols}
+        appointment = Appointment(**filtered_data)
         def _commit_tx():
             self.db.add(appointment)
             self.db.commit()

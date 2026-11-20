@@ -234,6 +234,9 @@ class AIService:
             "   - If the caller provides multiple details in one sentence (e.g. name, email, phone), capture all of them simultaneously.\n"
             "   - If the caller modifies a previously selected value (e.g. 'Actually make it 2 PM'), update ONLY that specific field without clearing other collected information.\n"
             "   - NEVER ask for information that already exists in [CONVERSATION STATE].\n"
+            "   - Track collected business context (Industry, Requirement, Interested Area / Team) in [CONVERSATION STATE]. Once an industry, requirement (such as website development), or team (such as sales) is provided, NEVER ask the caller for this information again.\n"
+            "   - When a caller corrects their name (e.g. 'No. My name is Sanjay', 'Call me Sanjay'), immediately acknowledge the corrected name and NEVER use the old or incorrect name.\n"
+            "   - DO NOT repeat previous questions or ask what team they want when they have already answered or provided context.\n"
             if is_ongoing else ""
         )
 
@@ -243,15 +246,46 @@ class AIService:
             lang_name = language_service.get_language_name(conversation_language)
             native_names = {"ta": "தமிழ்", "hi": "हिंदी", "kn": "ಕನ್ನಡ", "te": "తెలుగు"}
             native_str = f" / {native_names.get(conversation_language, '')}"
-            lang_directive = (
-                f"\n=== MANDATORY LANGUAGE DIRECTIVE: {lang_name.upper()}{native_str} ({conversation_language}) ===\n"
-                f"The customer has chosen to converse in {lang_name} ({conversation_language}).\n"
-                f"- You MUST generate your ENTIRE response strictly and fluently in {lang_name} ({conversation_language}).\n"
-                f"- Do NOT speak or respond in English or any other language.\n"
-                f"- Do NOT translate or corrupt customer names, doctor names, company names, email addresses, phone numbers, or appointment dates.\n"
-                f"- Maintain a polite, natural, and concise receptionist dialogue in {lang_name} (1 to 3 spoken sentences).\n"
-                f"===================================================================\n\n"
-            )
+            if conversation_language == "ta":
+                lang_directive = (
+                    f"\n=== MANDATORY NATURAL SPOKEN TAMIL (பேச்சுத் தமிழ்) DIRECTIVE ===\n"
+                    f"The caller is speaking in Tamil. You MUST formulate all speech in NATURAL, DECENT, PROFESSIONAL SPOKEN TAMIL (பேச்சுத் தமிழ்) — exactly how an educated, polite Tamil receptionist speaks in real life.\n"
+                    f"CRITICAL STYLE RULES FOR NATURAL SPOKEN TAMIL:\n"
+                    f"1. DO NOT USE LITERARY, ARCHAIC, OR CLASSICAL WRITTEN TAMIL (தூய தமிழ் / செந்தமிழ்):\n"
+                    f"   - Avoid: 'நீங்கள் எந்த வகையான சேவையைப் பற்றி அறிய விரும்புகிறீர்கள்?' -> Prefer: 'எந்த service பத்தி தெரிஞ்சுக்க விரும்புறீங்க?'\n"
+                    f"   - Avoid: 'உங்களுக்கு எவ்வாறு உதவ முடியும்?' or 'உங்களுக்கு எவ்வாறு உதவலாம்?' -> Prefer: 'நான் உங்களுக்கு எப்படி help பண்ணலாம்?'\n"
+                    f"   - Avoid: 'உங்கள் சந்திப்பை எந்த நாளில் ஏற்பாடு செய்ய வேண்டும்?' -> Prefer: 'உங்களுக்கு எந்த date-ல appointment book பண்ணணும்?'\n"
+                    f"   - Avoid: 'உங்களுடைய பெயரைத் தெரிவிக்க முடியுமா?' -> Prefer: 'உங்க பெயர் சொல்ல முடியுமா?'\n"
+                    f"   - Avoid: 'தயவுசெய்து உங்கள் தொடர்பு எண்ணை வழங்கவும்' -> Prefer: 'உங்க contact number சொல்லுங்க.'\n"
+                    f"   - Avoid: 'உங்கள் மின்னஞ்சல் முகவரியைத் தெரிவிக்கவும்' -> Prefer: 'உங்க email id சொல்லுங்க.'\n"
+                    f"   - Avoid: 'உங்கள் முன்பதிவு உறுதி செய்யப்பட்டது' -> Prefer: 'உங்க booking confirm ஆயிடுச்சு.'\n"
+                    f"   - Avoid: 'முன்பதிவு ரத்து செய்யப்பட்டது' -> Prefer: 'booking cancel பண்ணியாச்சு.'\n"
+                    f"   - Avoid: 'நீங்கள் எந்த மருத்துவத் துறையை நாட விரும்புகிறீர்கள்?' -> Prefer: 'எந்த department அல்லது doctor-ஐ பார்க்கணும்?'\n"
+                    f"   - Avoid: 'நலமாக இருக்கிறேன்' -> Prefer: 'நான் நல்லா இருக்கேன், நன்றி!'\n"
+                    f"   - Avoid: 'போய் வருகிறேன்' -> Prefer: 'Have a great day! Bye.'\n"
+                    f"2. NATURAL CODE-SWITCHING (KEEP COMMON ENGLISH TECHNICAL/BUSINESS TERMS IN ENGLISH):\n"
+                    f"   - Always keep commonly understood English words in English naturally: service, appointment, booking, date, time, slot, confirm, cancel, help, details, name, phone number, contact number, email id, location, product, demo, doctor, department, website, software.\n"
+                    f"   - Do NOT translate these into pure Tamil words (e.g. NEVER use முன்பதிவு, மின்னஞ்சல், தொலைபேசி எண், சேவை, சந்திப்பு, இருப்பிடம்).\n"
+                    f"3. RESPECTFUL SPOKEN SUFFIXES & NATURAL FLOW:\n"
+                    f"   - Use polite conversational verb endings: விரும்புறீங்க, சொல்லுங்க, பண்ணலாம், இருக்கு, ஆயிடுச்சு, பண்ணியாச்சு, பார்க்கணும்.\n"
+                    f"4. SHORT & CRISP FOR VOICE:\n"
+                    f"   - Keep responses strictly to 1 or 2 conversational spoken sentences so voice synthesis is prompt and clear.\n"
+                    f"5. LANGUAGE CONTINUITY:\n"
+                    f"   - Maintain spoken Tamil across every single turn until the caller explicitly asks for English.\n"
+                    f"===================================================================\n\n"
+                )
+            else:
+                lang_directive = (
+                    f"\n=== MANDATORY LANGUAGE DIRECTIVE: {lang_name.upper()}{native_str} ({conversation_language}) ===\n"
+                    f"The customer has chosen to converse in {lang_name} ({conversation_language}).\n"
+                    f"- You MUST generate your ENTIRE response strictly and fluently in {lang_name} ({conversation_language}).\n"
+                    f"- Do NOT speak or respond in English or any other language.\n"
+                    f"- Even if the customer speaks English words, transcribes in English script, or asks questions containing English product/brand names, you MUST continue responding in {lang_name}.\n"
+                    f"- Do NOT switch to English unless the customer explicitly requests another language (e.g. 'speak in English').\n"
+                    f"- Preserve necessary product names, brand names (e.g. 'Aminoid AI', 'Galaxy Chat', 'ERP', 'Survey Platform'), proper nouns, doctor names, email addresses, and phone numbers in their original form without translating or corrupting them.\n"
+                    f"- Maintain a polite, natural, and concise receptionist dialogue in {lang_name} (1 to 3 spoken sentences).\n"
+                    f"===================================================================\n\n"
+                )
 
         if business_type in ("HOSPITAL", "CLINIC") or booking_type == "HOSPITAL_APPOINTMENT":
             domain_isolation_rule = (
@@ -321,7 +355,16 @@ class AIService:
             "   - ZERO MARKDOWN, HEADINGS, OR BULLETS: ABSOLUTELY NO asterisks (**bold**), NO bullet points, NO numbered lists, NO dashes (-), NO colons (:), NO section headings. If information is a list in RAG, convert it into smooth spoken sentences (e.g. 'We offer haircuts, coloring, and styling. What service would you like?').\n"
             "   - NATURAL TRANSITIONS & CONTRACTIONS: Use friendly conversational transitions ('Sure!', 'Of course!', 'I can help with that!') and natural contractions ('I\'m', 'we\'re', 'it\'s', 'can\'t').\n"
             "   - ONE NATURAL FOLLOW-UP: Ask at most one relevant follow-up question to keep the conversation flowing.\n"
-            "   - ZERO METADATA LEAKAGE: Never mention chunk IDs, RAG context, system prompts, or internal document headers."
+            "   - ZERO METADATA LEAKAGE: Never mention chunk IDs, RAG context, system prompts, or internal document headers.\n\n"
+            "12. STRICT CALENDAR INVITE BAN & LEAD COLLECTION WORKFLOW:\n"
+            "   - NEVER tell the customer 'We will send you a calendar invite', 'I\'ll book a calendar invite for you', 'Your calendar invite will be sent', or 'I\'ve scheduled a meeting' unless the customer has EXPLICITLY requested an appointment on a specific date and time and that appointment has been confirmed.\n"
+            "   - When the customer agrees to speak with the team, requests a callback, or asks to arrange a call ('Arrange a call', 'Go ahead', 'I want to speak with your team', 'Make an arrangement', 'Yes, contact me'):\n"
+            "     * The default workflow is LEAD / CONTACT COLLECTION for a direct team callback, NOT an automatic appointment booking or calendar invite.\n"
+            "     * Collect missing fields one by one: 1. Full name, 2. Email address, 3. Phone number, 4. Business/industry, 5. Requirement/interested service.\n"
+            "     * Ask ONLY for fields that are missing. NEVER ask for details already provided or validated.\n"
+            "     * Final response format after collecting details: 'Thank you, [Customer Name]. I\'ve noted your contact details and requirements. Our team will contact you to discuss your [Requirement]. Is there anything else I can help you with?'\n"
+            "     * NEVER mention a calendar invite or schedule an appointment for callback/contact requests.\n"
+            "   - SEPARATE APPOINTMENT BOOKING: Only activate appointment booking when the customer explicitly says they want to book/schedule an appointment, meeting, or demo with a date and time (e.g., 'Book a meeting tomorrow', 'Schedule a demo at 3 PM', 'I want to schedule an appointment')."
             + continuity_rule
         )
 
@@ -378,24 +421,154 @@ class AIService:
             )
 
         # Multilingual Protection: When active conversation language is not English,
-        # bypass hardcoded English pleasantries so Gemini or localized handlers respond in target language.
-        curr_lang = conversation_language if conversation_language in ("ta", "hi", "kn", "te") else "en"
+        # resolve language from session if not explicitly provided, and ensure in-language responses.
+        sess_lang = None
+        if booking_session:
+            if isinstance(booking_session, dict):
+                sess_lang = booking_session.get("conversation_language")
+            else:
+                sess_lang = getattr(booking_session, "conversation_language", None)
+        effective_lang = (conversation_language if conversation_language in ("ta", "hi", "kn", "te") else None) or sess_lang or "en"
+        curr_lang = effective_lang if effective_lang in ("ta", "hi", "kn", "te") else "en"
+
         if curr_lang != "en":
+            # 1. Any business / product / doctor / booking inquiry in non-English must go directly to LLM/RAG
+            # Exclude common pleasantries ("how are you") and audio checks from being blocked by business terms
+            is_common_pleasantry = any(p in txt for p in ["how are you", "how are you doing", "can you hear", "hear me", "are you there", "audible"])
+            business_content_terms = {
+                "what", "who", "which", "where", "service", "services", "product", "products",
+                "pricing", "price", "cost", "fee", "feature", "features", "demo", "software",
+                "solution", "solutions", "offer", "offers", "offering", "crm", "erp", "hrms",
+                "payroll", "agent", "agents", "bot", "bots", "hospital", "doctor", "clinic",
+                "treatment", "book", "booking", "schedule", "appointment"
+            }
+            indic_business_terms = {
+                "ta": ["தயாரிப்பு", "சேவை", "மருத்துவர்", "முன்பதிவு", "விலை", "விவரம்", "சாப்ட்வேர்", "டெமோ", "என்ன", "எங்கு", "எப்போது", "யார்"],
+                "hi": ["उत्पाद", "सेवा", "डॉक्टर", "बुकिंग", "अपॉइंटमेंट", "दाम", "सॉफ्टवेयर", "डेमो", "क्या", "कहाँ", "कब", "कौन"],
+                "kn": ["ಉತ್ಪನ್ನ", "ಸೇವೆ", "ವೈದ್ಯ", "ಬುಕಿಂಗ್", "ಅಪಾಯಿಂಟ್ಮೆಂಟ್", "ಬೆಲೆ", "ವಿವರ", "ಸಾಫ್ಟ್‌ವೇರ್", "ಡೆಮೊ", "ಏನು", "ಎಲ್ಲಿ", "ಯಾವಾಗ", "ಯಾರು"],
+                "te": ["ఉత్పత్తి", "సేవ", "డాక్టర్", "బుకింగ్", "అపాయింట్మెంట్", "ధర", "వివరాలు", "సాఫ్ట్‌వేర్", "డెమో", "ఏమిటి", "ఎక్కడ", "ఎప్పుడు", "ఎవరు"]
+            }
+            all_biz_terms = business_content_terms | set(indic_business_terms.get(curr_lang, []))
+            if not is_common_pleasantry and any(term in txt for term in all_biz_terms):
+                return None
+
+            already_greeted = is_ongoing or bool(
+                (booking_session and getattr(booking_session, "greeting_sent", False))
+                or (isinstance(booking_session, dict) and booking_session.get("greeting_sent"))
+            )
+
+            # 2. Localized audio checks ("can you hear me", "கேட்கிறதா", "are you there")
+            audio_terms = {
+                "ta": ["கேட்கிறதா", "பேசுவது கேட்கிறதா", "உங்களுக்கு கேட்கிறதா", "can you hear me", "are you there", "am i audible", "hear me"],
+                "hi": ["आवाज़ आ रही है", "सुन पा रहे हैं", "can you hear me", "are you there", "am i audible"],
+                "kn": ["ಕೇಳಿಸುತ್ತಿದೆಯಾ", "ಧ್ವನಿ ಕೇಳಿಸುತ್ತಿದೆಯಾ", "can you hear me", "are you there"],
+                "te": ["వినబడుతోందా", "నా మాట వినబడుతోందా", "can you hear me", "are you there"]
+            }
+            if any(p in txt for p in audio_terms.get(curr_lang, [])):
+                if curr_lang == "ta":
+                    return "ஆமா, உங்க voice தெளிவா கேக்குதுங்க! நான் உங்களுக்கு எப்படி help பண்ணலாம்?"
+                elif curr_lang == "hi":
+                    return "हाँ, मुझे आपकी आवाज़ साफ़ सुनाई दे रही है! मैं आपकी क्या सहायता कर सकता हूँ?"
+                elif curr_lang == "kn":
+                    return "ಹೌದು, ನಿಮ್ಮ ಧ್ವನಿ ಸ್ಪಷ್ಟವಾಗಿ ಕೇಳಿಸುತ್ತಿದೆ! ನಾನು ನಿಮಗೆ ಹೇಗೆ ಸಹಾಯ ಮಾಡಲಿ?"
+                elif curr_lang == "te":
+                    return "అవును, మీ స్వరం స్పష్టంగా వినబడుతోంది! నేను మీకు ఎలా సహాయపడగలను?"
+
+            # 3. Localized greetings ("வணக்கம்", "hello", "hi")
             greetings_native = {
-                "ta": ["வணக்கம்", "வணக்கமுங்க", "வணக்கம்ங்க", "vanakkam", "vanakam", "hello", "hi"],
-                "hi": ["नमस्ते", "नमस्कार", "namaste", "namaskar", "hello", "hi"],
-                "kn": ["ನಮಸ್ಕಾರ", "namaskara", "namaste", "hello", "hi"],
-                "te": ["నమస్కారం", "నమస్తే", "namaskaram", "namaste", "hello", "hi"],
+                "ta": ["வணக்கம்", "வணக்கமுங்க", "வணக்கம்ங்க", "vanakkam", "vanakam", "hello", "hi", "hey"],
+                "hi": ["नमस्ते", "नमस्कार", "namaste", "namaskar", "hello", "hi", "hey"],
+                "kn": ["ನಮಸ್ಕಾರ", "namaskara", "namaste", "hello", "hi", "hey"],
+                "te": ["నమస్కారం", "నమస్తే", "namaskaram", "namaste", "hello", "hi", "hey"],
             }
             if any(g in txt for g in greetings_native.get(curr_lang, [])):
+                if already_greeted:
+                    if curr_lang == "ta":
+                        return "ஆமா சொல்லுங்க, நான் உங்களுக்கு எப்படி help பண்ணலாம்?"
+                    elif curr_lang == "hi":
+                        return "हाँ, बताइए मैं आपकी क्या सहायता कर सकता हूँ?"
+                    elif curr_lang == "kn":
+                        return "ಹೌದು, ನಾನು ನಿಮಗೆ ಹೇಗೆ ಸಹಾಯ ಮಾಡಲಿ?"
+                    elif curr_lang == "te":
+                        return "అవును, నేను మీకు ఎలా సహాయపడగలను?"
+                else:
+                    if curr_lang == "ta":
+                        return f"வணக்கம்! நான் {org_name}-ஓட AI receptionist. உங்களுக்கு எப்படி help பண்ணலாம்?"
+                    elif curr_lang == "hi":
+                        return f"नमस्ते! मैं {org_name} का AI स्वागतकर्ता हूँ। आज मैं आपकी क्या सहायता कर सकता हूँ?"
+                    elif curr_lang == "kn":
+                        return f"ನಮಸ್ಕಾರ! ನಾನು {org_name} AI ಸ್ವಾಗತಕಾರ. ಇಂದು ನಾನು ನಿಮಗೆ ಹೇಗೆ ಸಹಾಯ ಮಾಡಲಿ?"
+                    elif curr_lang == "te":
+                        return f"నమస్కారం! నేను {org_name} AI రిసెప్షనిస్ట్‌ని. ఈరోజు నేను మీకు ఎలా సహాయపడగలను?"
+
+            # 4. Localized pleasantries ("how are you", "எப்படி இருக்கிறீர்கள்", "நலமா")
+            pleasantry_terms = {
+                "ta": ["எப்படி இருக்கிறீர்கள்", "நலமா", "how are you", "how are you doing", "whats up"],
+                "hi": ["आप कैसे हैं", "कैसे हो", "how are you", "how are you doing"],
+                "kn": ["ಹೇಗಿದ್ದೀರಾ", "how are you"],
+                "te": ["ఎలా ఉన్నారు", "బాగున్నారా", "how are you"]
+            }
+            if any(p in txt for p in pleasantry_terms.get(curr_lang, [])):
                 if curr_lang == "ta":
-                    return f"வணக்கம்! நான் {org_name} AI வரவேற்பாளர். உங்களுக்கு இன்று எவ்வாறு உதவலாம்?"
+                    return "நான் நல்லா இருக்கேன், நன்றி! நான் உங்களுக்கு எப்படி help பண்ணலாம்?"
                 elif curr_lang == "hi":
-                    return f"नमस्ते! मैं {org_name} का AI स्वागतकर्ता हूँ। आज मैं आपकी क्या सहायता कर सकता हूँ?"
+                    return "मैं ठीक हूँ, धन्यवाद! आज मैं आपकी क्या सहायता कर सकता हूँ?"
                 elif curr_lang == "kn":
-                    return f"ನಮಸ್ಕಾರ! ನಾನು {org_name} AI ಸ್ವಾಗತಕಾರ. ಇಂದು ನಾನು ನಿಮಗೆ ಹೇಗೆ ಸಹಾಯ ಮಾಡಲಿ?"
+                    return "ನಾನು ಚೆನ್ನಾಗಿದ್ದೇನೆ, ಧನ್ಯವಾದಗಳು! ಇಂದು ನಾನು ನಿಮಗೆ ಹೇಗೆ ಸಹಾಯ ಮಾಡಲಿ?"
                 elif curr_lang == "te":
-                    return f"నమస్కారం! నేను {org_name} AI రిసెప్షనిస్ట్‌ని. ఈరోజు నేను మీకు ఎలా సహాయపడగలను?"
+                    return "నేను బాగున్నాను, ధನ್ಯవాదాలు! ఈరోజు నేను మీకు ఎలా సహాయపడగలను?"
+
+            # 5. Localized thanks ("நன்றி", "thank you", "thanks")
+            thanks_terms = {
+                "ta": ["நன்றி", "மிக்க நன்றி", "thanks", "thank you", "thank u"],
+                "hi": ["धन्यवाद", "शुक्रिया", "thanks", "thank you"],
+                "kn": ["ಧನ್ಯವಾದಗಳು", "ಧನ್ಯವಾದ", "thanks", "thank you"],
+                "te": ["ధన్యవాదాలు", "thanks", "thank you"]
+            }
+            if any(p in txt for p in thanks_terms.get(curr_lang, [])):
+                if curr_lang == "ta":
+                    return f"{org_name}-க்கு call பண்ணதுக்கு ரொம்ப நன்றி! உங்களுக்கு வேற ஏதாவது help வேணுமா?"
+                elif curr_lang == "hi":
+                    return f"{org_name} से संपर्क करने के लिए धन्यवाद! क्या आपको कोई और सहायता चाहिए?"
+                elif curr_lang == "kn":
+                    return f"{org_name} ಅನ್ನು ಸಂಪರ್ಕಿಸಿದ್ದಕ್ಕಾಗಿ ಧನ್ಯವಾದಗಳು! ನಿಮಗೆ ಬೇರೆ ಯಾವುದೇ ಸಹಾಯ ಬೇಕೇ?"
+                elif curr_lang == "te":
+                    return f"{org_name}ని సంప్రదించినందుకు ధన్యవాదాలు! మీకు ఇంకా ఏదైనా సహాయం కావాలా?"
+
+            # 6. Localized goodbye ("bye", "goodbye", "போய் வருகிறேன்")
+            bye_terms = {
+                "ta": ["போய் வருகிறேன்", "வருகிறேன்", "bye", "goodbye", "see you"],
+                "hi": ["अलविदा", "फिर मिलेंगे", "bye", "goodbye"],
+                "kn": ["ಹೋಗಿ ಬರುತ್ತೇನೆ", "bye", "goodbye"],
+                "te": ["వీడ్కోలు", "మళ్ళీ కలుద్దాం", "bye", "goodbye"]
+            }
+            if any(p in txt for p in bye_terms.get(curr_lang, [])):
+                if curr_lang == "ta":
+                    return f"Call பண்ணதுக்கு ரொம்ப நன்றி. Have a great day! Bye."
+                elif curr_lang == "hi":
+                    return f"हमसे संपर्क करने के लिए धन्यवाद। आपका दिन शुभ हो! अलविदा।"
+                elif curr_lang == "kn":
+                    return f"ನಮ್ಮನ್ನು ಸಂಪರ್ಕಿಸಿದ್ದಕ್ಕಾಗಿ ಧನ್ಯವಾದಗಳು. ನಿಮ್ಮ ದಿನ ಶುಭವಾಗಿರಲಿ! ಹೋಗಿ ಬರುತ್ತೇನೆ."
+                elif curr_lang == "te":
+                    return f"మమ్మల్ని సంప్రదించినందుకు ధನ್ಯవాదాలు. మీకు మంచి రోజు కావాలని కోరుకుంటున్నాను! వీడ్కోలు."
+
+            # 7. Localized identity questions ("who are you", "who is calling", "யார் பேசுகிறீர்கள்")
+            origin_indic_terms = {
+                "ta": ["யார் பேசுகிறீர்கள்", "எங்கிருந்து பேசுகிறீர்கள்", "எந்த அலுவலகம்", "எந்த நிறுவனம்", "who is this", "who are you", "who am i speaking with"],
+                "hi": ["आप कौन बोल रहे हैं", "कहाँ से बोल रहे हैं", "who is this", "who are you"],
+                "kn": ["ನೀವು ಯಾರು", "who is this", "who are you"],
+                "te": ["మీరు ఎవరు", "who is this", "who are you"]
+            }
+            if any(p in txt for p in origin_indic_terms.get(curr_lang, [])):
+                if curr_lang == "ta":
+                    return f"நீங்க {org_name}-க்கு call பண்ணியிருக்கீங்க. நான் உங்களுக்கு எப்படி help பண்ணலாம்?"
+                elif curr_lang == "hi":
+                    return f"आप {org_name} से संपर्क कर रहे हैं। मैं आपकी क्या सहायता कर सकता हूँ?"
+                elif curr_lang == "kn":
+                    return f"ನೀವು {org_name} ಅನ್ನು ಸಂಪರ್ಕಿಸಿದ್ದೀರಿ. ನಾನು ನಿಮಗೆ ಹೇಗೆ ಸಹಾಯ ಮಾಡಲಿ?"
+                elif curr_lang == "te":
+                    return f"మీరు {org_name}ని సంప్రదించారు. నేను మీకు ఎలా సహాయపడగలను?"
+
             # For all other statements in non-English, pass to LLM to generate fluent in-language response
             return None
 
@@ -438,8 +611,11 @@ class AIService:
             "which hospital is this", "which clinic is this", "which organization is this", "which business is this", "which company is this",
             "who is this", "who am i speaking with", "who am i talking to"
         ])
+        help_inquiry_match = any(phrase in txt_clean for phrase in [
+            "can i help you", "can you help me", "can you help", "how can you help", "could you help me", "i need help"
+        ])
 
-        if has_business_inquiry and not audio_check_match and not origin_match:
+        if has_business_inquiry and not audio_check_match and not origin_match and not help_inquiry_match:
             logger.info(f"[FAST_PATH_CONTEXT] intent={intent or 'business_inquiry'} bypassed=false reason=business_inquiry")
             return None
 
@@ -490,6 +666,17 @@ class AIService:
             elif isinstance(booking_session, dict) and booking_session.get("state") not in (None, "IDLE", "COMPLETED"):
                 return "Yes, I can hear you clearly! We were discussing your appointment. How would you like to proceed?"
             return "Yes, I can hear you clearly! How may I assist you today?"
+
+        if help_inquiry_match:
+            target_org = org_name or rag_service.get_organization_name(organization_id)
+            if not target_org or target_org.strip().lower() in ("default organization", "unknown", "none"):
+                target_org = "our office"
+            logger.info(f"[FAST_PATH_CONTEXT] intent={intent or 'help_inquiry'} bypassed=true reason=help_clarification")
+            if booking_session and hasattr(booking_session, "is_active") and booking_session.is_active():
+                from src.services.booking_state_service import booking_state_service
+                resume_prompt = booking_state_service.get_silence_prompt(booking_session)
+                return f"I'm the AI receptionist for {target_org}. {resume_prompt}"
+            return f"I'm the AI receptionist for {target_org}. I can help answer questions about our products and services, or help you book a demo or appointment. How may I assist you today?"
 
         if any(phrase in txt_clean for phrase in ["how are you", "how are you doing", "whats up"]):
             logger.info(f"[FAST_PATH_CONTEXT] intent={intent or 'pleasantry'} bypassed=true reason=casual_pleasantry")
@@ -645,7 +832,10 @@ class AIService:
         if conversation_language and conversation_language in ("ta", "hi", "kn", "te"):
             from src.services.language_service import language_service
             lang_name = language_service.get_language_name(conversation_language)
-            user_content += f"\n\n[MANDATORY: Formulate your entire response strictly in {lang_name} ({conversation_language}). Do NOT use English.]"
+            if conversation_language == "ta":
+                user_content += f"\n\n[MANDATORY: Formulate your entire response strictly in natural conversational spoken Tamil (பேச்சுத் தமிழ்). Use common English technical loanwords like service, appointment, booking, date, time, book, help, details naturally. Avoid pure/classical/literary Tamil.]"
+            else:
+                user_content += f"\n\n[MANDATORY: Formulate your entire response strictly in {lang_name} ({conversation_language}). Do NOT use English.]"
 
         raw_result = None
         provider = self._get_provider()
@@ -980,13 +1170,30 @@ class AIService:
 
             # Factual query about an unlisted product or entity
             if any(w in txt_low for w in ["product", "software", "tool", "platform"]):
-                return guardrail_service.validate_and_sanitize_response(
-                    f"I apologize, but that product is not available in our current offerings based on our active records for {org_name or 'our company'}."
-                )
+                if conversation_language == "ta":
+                    msg = f"மன்னிக்கவும், {org_name or 'எங்க'} records படி அந்த product இப்போ available-ஆ இல்ல."
+                elif conversation_language == "hi":
+                    msg = f"क्षमा करें, {org_name or 'हमारी कंपनी'} के रिकॉर्ड के अनुसार यह उत्पाद हमारी उपलब्ध सेवाओं में शामिल नहीं है।"
+                elif conversation_language == "kn":
+                    msg = f"ಕ್ಷಮಿಸಿ, {org_name or 'ನಮ್ಮ ಸಂಸ್ಥೆಯ'} ದಾಖಲೆಗಳ ಪ್ರಕಾರ ಆ ಉತ್ಪನ್ನ ಲಭ್ಯವಿಲ್ಲ."
+                elif conversation_language == "te":
+                    msg = f"క్షమించండి, {org_name or 'మా సంస్థ'} రికార్డుల ప్రకారం ఆ ఉత్పత్తి అందుబాటులో లేదు."
+                else:
+                    msg = f"I apologize, but that product is not available in our current offerings based on our active records for {org_name or 'our company'}."
+                return guardrail_service.validate_and_sanitize_response(msg)
+
             if any(w in txt_low for w in ["department", "teacher", "doctor", "service", "specialist", "cost", "fee", "program", "about", "tell me"]):
-                return guardrail_service.validate_and_sanitize_response(
-                    f"I apologize, but that specific information is not available in our active records for {org_name or 'our organization'}. How else may I assist you?"
-                )
+                if conversation_language == "ta":
+                    msg = f"மன்னிக்கவும், {org_name or 'எங்க'} records-ல அந்த details இல்ல. நான் உங்களுக்கு வேற எப்படி help பண்ணலாம்?"
+                elif conversation_language == "hi":
+                    msg = f"क्षमा करें, {org_name or 'हमारी संस्था'} के सक्रिय रिकॉर्ड में वह जानकारी उपलब्ध नहीं है। मैं आपकी और क्या सहायता कर सकता हूँ?"
+                elif conversation_language == "kn":
+                    msg = f"ಕ್ಷಮಿಸಿ, {org_name or 'ನಮ್ಮ ಸಂಸ್ಥೆಯ'} ದಾಖಲೆಗಳಲ್ಲಿ ಆ ಮಾಹಿತಿ ಲಭ್ಯವಿಲ್ಲ. ನಾನು ನಿಮಗೆ ಹೇಗೆ ಸಹಾಯ ಮಾಡಲಿ?"
+                elif conversation_language == "te":
+                    msg = f"క్షమించండి, {org_name or 'మా సంస్థ'} రికార్డులలో ఆ సమాచారం అందుబాటులో లేదు. నేను మీకు ఎలా సహాయపడగలను?"
+                else:
+                    msg = f"I apologize, but that specific information is not available in our active records for {org_name or 'our organization'}. How else may I assist you?"
+                return guardrail_service.validate_and_sanitize_response(msg)
 
             # General knowledge rule fallback when no LLM key is present
             if "speed of light" in txt_low:
@@ -1006,9 +1213,18 @@ class AIService:
                 "The speed of light in a vacuum is approximately 299,792,458 meters per second or about 300,000 kilometers per second."
             )
 
-        return guardrail_service.validate_and_sanitize_response(
-            "I apologize, but that specific information is not available in our active records. How else may I assist you?"
-        )
+        if conversation_language == "ta":
+            default_apology = f"மன்னிக்கவும், அந்த specific details எங்க records-ல இல்ல. நான் உங்களுக்கு வேற எப்படி help பண்ணலாம்?"
+        elif conversation_language == "hi":
+            default_apology = "क्षमा करें, वह विशिष्ट जानकारी हमारे सक्रिय रिकॉर्ड में उपलब्ध नहीं है। मैं आपकी और क्या सहायता कर सकता हूँ?"
+        elif conversation_language == "kn":
+            default_apology = "ಕ್ಷಮಿಸಿ, ಆ ನಿರ್ದಿಷ್ಟ ಮಾಹಿತಿ ನಮ್ಮ ಸಕ್ರಿಯ ದಾಖಲೆಗಳಲ್ಲಿ ಲಭ್ಯವಿಲ್ಲ. ನಾನು ನಿಮಗೆ ಹೇಗೆ ಸಹಾಯ ಮಾಡಲಿ?"
+        elif conversation_language == "te":
+            default_apology = "క్షమించండి, ఆ సమాచారం మా సక్రియ రికార్డులలో అందుబాటులో లేదు. నేను మీకు ఎలా సహాయపడగలను?"
+        else:
+            default_apology = "I apologize, but that specific information is not available in our active records. How else may I assist you?"
+
+        return guardrail_service.validate_and_sanitize_response(default_apology)
 
     def generate_response_stream(
         self,
@@ -1053,6 +1269,7 @@ class AIService:
             call_direction=call_direction, conversation_language=conversation_language
         )
         if fast_resp:
+            logger.info(f"[DIAG_STAGE_A_RAW_LLM] fast_path=True len={len(fast_resp)} text={fast_resp!r}")
             yield fast_resp
             return
 
@@ -1077,9 +1294,12 @@ class AIService:
             ) + system_prompt
 
         formatted_history = ""
+        prior_history = []
         if session_history and len(session_history) > 0:
+            # Exclude current user query from prior history if it was already appended
+            prior_history = session_history[:-1] if (session_history[-1].get("role") in ("user", "human") and session_history[-1].get("text") == text) else session_history
             history_lines = []
-            for h in session_history[-20:]:
+            for h in prior_history[-20:]:
                 role_label = "Caller" if h.get("role") in ("user", "human") else "Receptionist"
                 history_lines.append(f"{role_label}: {h.get('text', '')}")
             formatted_history = "\n".join(history_lines)
@@ -1113,18 +1333,22 @@ class AIService:
         if conversation_language and conversation_language in ("ta", "hi", "kn", "te"):
             from src.services.language_service import language_service
             lang_name = language_service.get_language_name(conversation_language)
-            user_content += f"\n\n[MANDATORY: Formulate your entire response strictly in {lang_name} ({conversation_language}). Do NOT use English.]"
+            if conversation_language == "ta":
+                user_content += f"\n\n[MANDATORY: Formulate your entire response strictly in natural conversational spoken Tamil (பேச்சுத் தமிழ்). Use common English technical loanwords like service, appointment, booking, date, time, book, help, details naturally. Avoid pure/classical/literary Tamil.]"
+            else:
+                user_content += f"\n\n[MANDATORY: Formulate your entire response strictly in {lang_name} ({conversation_language}). Do NOT use English.]"
 
         provider = self._get_provider()
         gemini_model_name = getattr(settings, "GEMINI_MODEL", "gemini-2.5-flash")
+        yielded_any_tokens = False
 
         try:
             # 1. xAI / Grok Streaming (primary when LLM_PROVIDER=xai)
             if provider == "xai" and getattr(self, "xai_client", None):
                 xai_model = getattr(settings, "XAI_MODEL", "grok-beta") or "grok-beta"
                 messages = [{"role": "system", "content": system_prompt}]
-                if session_history:
-                    for h in session_history[-20:]:
+                if prior_history:
+                    for h in prior_history[-20:]:
                         role = "assistant" if h.get("role") in ("model", "assistant") else "user"
                         messages.append({"role": role, "content": h.get("text", "")})
                 messages.append({"role": "user", "content": user_content})
@@ -1140,25 +1364,30 @@ class AIService:
                     for chunk in response_stream:
                         if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
                             token_count += 1
+                            yielded_any_tokens = True
                             yield chunk.choices[0].delta.content
                     if token_count > 0:
                         return
                 except Exception as e:
+                    if token_count > 0 or yielded_any_tokens:
+                        return
                     logger.warning(f"[XAI STREAM WARNING] xAI stream failed: {e}")
 
             # 2. Gemini Streaming with Multi-Model Failover
-            if self.gemini_client and (provider in ("gemini",) or not self.mistral_client):
+            if not yielded_any_tokens and self.gemini_client and (provider in ("gemini",) or not self.mistral_client):
                 gemini_models = self._get_verified_gemini_models()
 
                 contents = []
-                if session_history and intent not in ("greeting", "general_conversation"):
-                    for h in session_history[-20:]:
+                if prior_history and intent not in ("greeting", "general_conversation"):
+                    for h in prior_history[-20:]:
                         role = "model" if h.get("role") in ("model", "assistant") else "user"
                         contents.append(types.Content(role=role, parts=[types.Part.from_text(text=h.get("text", ""))]))
 
                 contents.append(types.Content(role="user", parts=[types.Part.from_text(text=user_content)]))
 
                 for target_model in gemini_models:
+                    if yielded_any_tokens:
+                        return
                     try:
                         config = self._build_gemini_config(target_model, system_prompt, max_tokens=300)
                         response_stream = self.gemini_client.models.generate_content_stream(
@@ -1170,15 +1399,23 @@ class AIService:
                         for response_chunk in response_stream:
                             if response_chunk.text:
                                 token_count += 1
+                                yielded_any_tokens = True
+                                logger.info(
+                                    f"[DIAG_STAGE_A_RAW_LLM] provider=gemini model={target_model} "
+                                    f"token_idx={token_count} len={len(response_chunk.text)} chunk={response_chunk.text!r}"
+                                )
                                 yield response_chunk.text
                         if token_count > 0:
                             return
                     except Exception as e:
+                        if token_count > 0 or yielded_any_tokens:
+                            logger.info(f"[GEMINI STREAM] Model '{target_model}' stream completed with {token_count} tokens. Returning cleanly without duplicate failover.")
+                            return
                         self._mark_gemini_model_exhausted(target_model, str(e))
                         logger.warning(f"[GEMINI STREAM WARNING] Generation failed with model '{target_model}': {e}")
 
             # 3. Mistral Streaming Fallback
-            if self.mistral_client:
+            if not yielded_any_tokens and self.mistral_client:
                 mistral_model = getattr(settings, "MISTRAL_MODEL", "mistral-tiny")
                 messages = [{"role": "system", "content": system_prompt}]
                 if session_history:
@@ -1187,32 +1424,46 @@ class AIService:
                         messages.append({"role": role, "content": h.get("text", "")})
                 messages.append({"role": "user", "content": user_content})
 
-                response_stream = self.mistral_client.chat.completions.create(
-                    model=mistral_model,
-                    messages=messages,
-                    temperature=0.1,
-                    max_tokens=200,
-                    stream=True
-                )
-                token_count = 0
-                for chunk in response_stream:
-                    if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-                        token_count += 1
-                        yield chunk.choices[0].delta.content
-                if token_count > 0:
-                    return
+                try:
+                    response_stream = self.mistral_client.chat.completions.create(
+                        model=mistral_model,
+                        messages=messages,
+                        temperature=0.1,
+                        max_tokens=200,
+                        stream=True
+                    )
+                    token_count = 0
+                    for chunk in response_stream:
+                        if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                            token_count += 1
+                            yielded_any_tokens = True
+                            tok_txt = chunk.choices[0].delta.content
+                            logger.info(
+                                f"[DIAG_STAGE_A_RAW_LLM] provider=mistral model={mistral_model} "
+                                f"token_idx={token_count} len={len(tok_txt)} chunk={tok_txt!r}"
+                            )
+                            yield tok_txt
+                    if token_count > 0:
+                        return
+                except Exception as e:
+                    if token_count > 0 or yielded_any_tokens:
+                        return
+                    logger.warning(f"[MISTRAL STREAM WARNING] Mistral stream failed: {e}")
 
         except Exception as exc:
+            if yielded_any_tokens:
+                return
             logger.warning(f"[LLM STREAM WARNING] Stream error ({exc}). Falling back to non-stream generation.")
 
-        # Fallback to non-stream generator (handles Ollama + RAG extraction)
-        full_ans = self.generate_response(
-            text, context, session_history, intent, emotion,
-            conversation_language=conversation_language,
-            organization_id=organization_id,
-            conversation_state=conversation_state
-        )
-        yield full_ans
+        # Fallback to non-stream generator only if NO tokens were yielded
+        if not yielded_any_tokens:
+            full_ans = self.generate_response(
+                text, context, session_history, intent, emotion,
+                conversation_language=conversation_language,
+                organization_id=organization_id,
+                conversation_state=conversation_state
+            )
+            yield full_ans
 
     def transcribe_audio(self, audio_bytes: bytes) -> str:
         return stt_service.transcribe_audio_bytes(audio_bytes)

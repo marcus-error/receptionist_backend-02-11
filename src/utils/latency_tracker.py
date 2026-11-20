@@ -40,6 +40,10 @@ class LatencyTracker:
         """Record duration in milliseconds for a specific stage."""
         self.metrics[metric_name] = round(duration_ms, 2)
 
+    def get_metric(self, metric_name: str, default: float = 0.0) -> float:
+        """Get metric value or return default."""
+        return self.metrics.get(metric_name, default)
+
     def to_telemetry(self) -> Dict[str, Any]:
         """Export combined metrics and milestone timings for WebSocket UI updates."""
         total_ms = round((time.perf_counter() - self.t_zero) * 1000.0, 2)

@@ -421,7 +421,7 @@ class LanguageDetectionService:
 
             if pending_field in ("department", "service", "specialty"):
                 prompts = {
-                    LANG_TAMIL: "நிச்சயமாக! இனிமேல் தமிழில் பேசுகிறேன். உங்களுக்கு எந்த மருத்துவத் துறை அல்லது சிகிச்சைக்கான அப்பாயின்ட்மென்ட் வேண்டும்?",
+                    LANG_TAMIL: "கண்டிப்பா! இனிமேல் தமிழ்ல பேசலாம். உங்களுக்கு எந்த service அல்லது department-ல appointment வேணும்?",
                     LANG_ENGLISH: "Certainly! Continuing in English. Which department or service would you like to book?",
                     LANG_HINDI: "ज़रूर! अब मैं हिंदी में बात करूँगा। आप किस विभाग या सेवा के लिए अपॉइंटमेंट बुक करना चाहते हैं?",
                     LANG_KANNADA: "ಖಂಡಿತ! ಇನ್ನು ಮುಂದೆ ಕನ್ನಡದಲ್ಲಿ ಮಾತನಾಡುತ್ತೇನೆ. ನಿಮಗೆ ಯಾವ ವಿಭಾಗ ಅಥವಾ ಸೇವೆಗೆ ಅಪಾಯಿಂಟ್‌ಮೆಂಟ್ ಬೇಕು?",
@@ -431,7 +431,7 @@ class LanguageDetectionService:
 
             elif pending_field in ("doctor", "doctor_name"):
                 prompts = {
-                    LANG_TAMIL: "நிச்சயமாக! தமிழில் தொடர்கிறேன். எந்த மருத்துவரை நீங்கள் பார்க்க விரும்புகிறீர்கள்?",
+                    LANG_TAMIL: "கண்டிப்பா! தமிழ்லயே பேசலாம். நீங்க எந்த doctor-ஐ பார்க்கணும்?",
                     LANG_ENGLISH: "Certainly! Continuing in English. Which doctor would you like to consult?",
                     LANG_HINDI: "ज़रूर! हिंदी में जारी रखते हैं। आप किस डॉक्टर से परामर्श करना चाहते हैं?",
                     LANG_KANNADA: "ಖಂಡಿತ! ಕನ್ನಡದಲ್ಲಿ ಮುಂದುವರಿಸುತ್ತೇನೆ. ನೀವು ಯಾವ ವೈದ್ಯರನ್ನು ಭೇಟಿಯಾಗಲು ಬಯಸುತ್ತೀರಿ?",
@@ -441,7 +441,7 @@ class LanguageDetectionService:
 
             elif pending_field in ("date", "time", "appointment_date", "appointment_time"):
                 prompts = {
-                    LANG_TAMIL: "நிச்சயமாக! தமிழில் தொடர்கிறேன். எந்த தேதி மற்றும் நேரத்தில் அப்பாயின்ட்மென்ட் வேண்டும்?",
+                    LANG_TAMIL: "கண்டிப்பா! உங்களுக்கு எந்த date மற்றும் time-ல appointment book பண்ணணும்?",
                     LANG_ENGLISH: "Certainly! Continuing in English. What date and time would you prefer?",
                     LANG_HINDI: "ज़रूर! हिंदी में जारी रखते हैं। आप किस तारीख और समय पर अपॉइंटमेंट चाहते हैं?",
                     LANG_KANNADA: "ಖಂಡಿತ! ಕನ್ನಡದಲ್ಲಿ ಮುಂದುವರಿಸುತ್ತೇನೆ. ನಿಮಗೆ ಯಾವ ದಿನಾಂಕ ಮತ್ತು ಸಮಯ ಸೂಕ್ತ?",
@@ -451,7 +451,7 @@ class LanguageDetectionService:
 
             elif pending_field in ("patient_name", "full_name", "name", "customer_name"):
                 prompts = {
-                    LANG_TAMIL: "நிச்சயமாக! தமிழில் பேசுகிறேன். அப்பாயின்ட்மென்ட் புக் செய்ய உங்கள் முழுப் பெயரை சொல்லுங்கள்.",
+                    LANG_TAMIL: "கண்டிப்பா! Appointment book பண்ண உங்க பெயர் சொல்ல முடியுமா?",
                     LANG_ENGLISH: "Certainly! Continuing in English. Could you please share your full name for the booking?",
                     LANG_HINDI: "ज़रूर! हिंदी में जारी रखते हैं। बुकिंग के लिए कृपया अपना पूरा नाम बताएं।",
                     LANG_KANNADA: "ಖಂಡಿತ! ಕನ್ನಡದಲ್ಲಿ ಮುಂದುವರಿಸುತ್ತೇನೆ. ಬುಕಿಂಗ್‌ಗಾಗಿ ದಯವಿಟ್ಟು ನಿಮ್ಮ ಪೂರ್ಣ ಹೆಸರನ್ನು ತಿಳಿಸಿ.",
@@ -461,7 +461,7 @@ class LanguageDetectionService:
 
             elif pending_field in ("contact_number", "phone", "phone_number"):
                 prompts = {
-                    LANG_TAMIL: "நிச்சயமாக! தமிழில் தொடர்கிறேன். உங்களை தொடர்பு கொள்ள 10 இலக்க தொலைபேசி எண்ணைக் கூறுங்கள்.",
+                    LANG_TAMIL: "கண்டிப்பா! உங்க 10-digit phone number சொல்லுங்க.",
                     LANG_ENGLISH: "Certainly! Continuing in English. Could you please provide your 10-digit phone number?",
                     LANG_HINDI: "ज़रूर! हिंदी में जारी रखते हैं। कृपया अपना 10 अंकों का मोबाइल नंबर बताएं।",
                     LANG_KANNADA: "ಖಂಡಿತ! ಕನ್ನಡದಲ್ಲಿ ಮುಂದುವರಿಸುತ್ತೇನೆ. ದಯವಿಟ್ಟು ನಿಮ್ಮ 10 ಅಂಕಿಯ ಮೊಬೈಲ್ ಸಂಖ್ಯೆಯನ್ನು ತಿಳಿಸಿ.",
@@ -471,7 +471,7 @@ class LanguageDetectionService:
 
             elif pending_field in ("email", "mail"):
                 prompts = {
-                    LANG_TAMIL: "நிச்சயமாக! தமிழில் தொடர்கிறேன். அப்பாயின்ட்மென்ட் உறுதிப்படுத்த உங்கள் மின்னஞ்சல் (email) முகவரியைக் கூறுங்கள்.",
+                    LANG_TAMIL: "கண்டிப்பா! Confirmation-க்காக உங்க email id சொல்லுங்க.",
                     LANG_ENGLISH: "Certainly! Continuing in English. Could you please provide your email address for the appointment confirmation?",
                     LANG_HINDI: "ज़रूर! हिंदी में जारी रखते हैं। अपॉइंटमेंट पुष्टि के लिए कृपया अपना ईमेल पता बताएं।",
                     LANG_KANNADA: "ಖಂಡಿತ! ಕನ್ನಡದಲ್ಲಿ ಮುಂದುವರಿಸುತ್ತೇನೆ. ಅಪಾಯಿಂಟ್‌ಮೆಂಟ್ ದೃಢೀಕರಣಕ್ಕಾಗಿ ದಯವಿಟ್ಟು ನಿಮ್ಮ ಇಮೇಲ್ ವಿಳಾಸವನ್ನು ತಿಳಿಸಿ.",
@@ -481,7 +481,7 @@ class LanguageDetectionService:
 
         # General acknowledgment (outside of active booking)
         general_prompts = {
-            LANG_TAMIL: "நிச்சயமாக! இனிமேல் தமிழில் பேசுகிறேன். உங்களுக்கு எப்படி உதவலாம்?",
+            LANG_TAMIL: "கண்டிப்பா! இனிமேல் தமிழ்ல பேசலாம். நான் உங்களுக்கு எப்படி help பண்ணலாம்?",
             LANG_ENGLISH: "Certainly! I will continue in English. How may I assist you today?",
             LANG_HINDI: "ज़रूर! अब मैं हिंदी में बात करूँगा। बताइए, मैं आपकी क्या सहायता कर सकता हूँ?",
             LANG_KANNADA: "ಖಂಡಿತ! ಇನ್ನು ಮುಂದೆ ಕನ್ನಡದಲ್ಲಿ ಮಾತನಾಡುತ್ತೇನೆ. ನಿಮಗೆ ಹೇಗೆ ಸಹಾಯ ಮಾಡಬಹುದು?",
@@ -509,7 +509,7 @@ class LanguageDetectionService:
         target = lang if lang in SUPPORTED_LANGUAGES else LANG_ENGLISH
         name = org_name or "our office"
         fallbacks = {
-            LANG_TAMIL: f"நான் {name} நிறுவனத்திற்கான AI வரவேற்பாளர். உங்களுக்கு இன்று எவ்வாறு உதவலாம்?",
+            LANG_TAMIL: f"நான் {name}-ஓட AI receptionist. நான் உங்களுக்கு எப்படி help பண்ணலாம்?",
             LANG_ENGLISH: f"I am here to assist you with inquiries and appointments for {name}. How can I help you today?",
             LANG_HINDI: f"मैं {name} का AI स्वागतकर्ता हूँ। आज मैं आपकी क्या सहायता कर सकता हूँ?",
             LANG_KANNADA: f"ನಾನು {name} ಸಂಸ್ಥೆಯ AI ಸ್ವಾಗತಕಾರ. ಇಂದು ನಾನು ನಿಮಗೆ ಹೇಗೆ ಸಹಾಯ ಮಾಡಲಿ?",
@@ -519,3 +519,5 @@ class LanguageDetectionService:
 
 
 language_service = LanguageDetectionService()
+ENGLISH_ONLY_REDIRECT_MESSAGE = "I am an AI receptionist. How may I assist you today?"
+

@@ -897,6 +897,8 @@ class SipCallSession:
             except Exception as exc:
                 logger.warning(f"[DEEPGRAM STOP ERROR] {exc}")
 
+        logger.info(f"[SIP_TASK_CLEANUP] call_id={self.call_sid}")
+
         # Drain queued audio & stt items so pending frames are discarded immediately
         while not self._audio_queue.empty():
             try:
@@ -1638,7 +1640,8 @@ class SipCallSession:
             wav_bytes = res[0] if isinstance(res, tuple) else res
             if not wav_bytes:
                 return
-            partial_text = await asyncio.to_thread(stt_service.transcribe_audio_bytes, wav_bytes)
+            call_lang = getattr(self.booking_session, "conversation_language", "en") if self.booking_session else "en"
+            partial_text = await asyncio.to_thread(stt_service.transcribe_audio_bytes, wav_bytes, "audio.wav", call_lang)
             partial_text = partial_text.strip()
             from src.utils.text_sanitizer import is_whisper_hallucination
             if partial_text and not is_whisper_hallucination(partial_text):
@@ -1710,7 +1713,8 @@ class SipCallSession:
                 f"\n  audio_source=CUSTOMER_RTP"
             )
 
-            transcription = await asyncio.to_thread(stt_service.transcribe_audio_bytes, wav_bytes)
+            call_lang = getattr(self.booking_session, "conversation_language", "en") if self.booking_session else "en"
+            transcription = await asyncio.to_thread(stt_service.transcribe_audio_bytes, wav_bytes, "audio.wav", call_lang)
             t_stt_end     = time.monotonic()
             stt_elapsed   = t_stt_end - t0
             metrics.update(
@@ -1790,7 +1794,23 @@ class SipCallSession:
         async with self._pipeline_lock:
             if self.ended:
                 return
-            await self._run_ai_pipeline_locked(transcription, metrics)
+            t_ai_start = time.monotonic()
+            if metrics is None:
+                metrics = {}
+            utt_id = metrics.get("utt_id", getattr(self, "_last_utt_id", "utt_?"))
+            resp_id = metrics.get("response_id") or f"resp_{uuid.uuid4().hex[:8]}"
+            metrics["response_id"] = resp_id
+            logger.info(
+                f"[AI_RESPONSE_PIPELINE_STARTED] call_id={self.call_sid} utterance_id={utt_id} "
+                f"response_id={resp_id} text='{transcription}'"
+            )
+            try:
+                await self._run_ai_pipeline_locked(transcription, metrics)
+            finally:
+                logger.info(
+                    f"[AI_RESPONSE_PIPELINE_COMPLETED] call_id={self.call_sid} utterance_id={utt_id} "
+                    f"response_id={metrics.get('response_id', resp_id)} duration_ms={round((time.monotonic() - t_ai_start) * 1000)}"
+                )
 
     async def _run_ai_pipeline_locked(self, transcription: str, metrics: Dict[str, Any] = None):
         self._barge_in_event.clear()
@@ -1995,17 +2015,20 @@ class SipCallSession:
                     f"\n  latency_ms={state_ms}"
                 )
 
+                is_lead_mode = getattr(self.booking_session, "workflow_mode", None) == "LEAD_COLLECTION"
+                detected_intent_logged = "callback" if is_lead_mode else "appointment_booking"
+                selected_wf_logged = "LEAD_COLLECTION_PRIORITY" if is_lead_mode else "APPOINTMENT_BOOKING_PRIORITY"
                 logger.info(
                     f"\n[INTENT_ROUTING]"
                     f"\n  caller_utterance='{transcription}'"
-                    f"\n  detected_intent='appointment_booking'"
-                    f"\n  selected_workflow='APPOINTMENT_BOOKING_PRIORITY'"
+                    f"\n  detected_intent='{detected_intent_logged}'"
+                    f"\n  selected_workflow='{selected_wf_logged}'"
                     f"\n  active_business_type='{getattr(self, 'business_type', 'GENERAL')}'"
-                    f"\n  routing_reason='booking_session_active'"
+                    f"\n  routing_reason='{'lead_collection_active' if is_lead_mode else 'booking_session_active'}'"
                 )
 
                 if response_text:
-                    intent_name = "appointment_booking"
+                    intent_name = detected_intent_logged
                     self._messages.append({"role": "user", "text": transcription, "intent": intent_name})
                     self.session_history.append({"role": "user", "text": transcription})
                     self.session_history.append({"role": "model", "text": response_text})
@@ -2017,7 +2040,8 @@ class SipCallSession:
                     metrics["state_ms"]   = state_ms
 
                     await self._speak(response_text, intent_name, metrics)
-                    await self._handle_booking_confirmed_termination()
+                    if not is_lead_mode:
+                        await self._handle_booking_confirmed_termination()
                     return
         is_informational_query = (
             any(q in txt_lower for q in ["can you list", "what are", "who are", "which are", "tell me about", "where is", "where are", "how much", "what is", "who is", "list the", "list all", "list departments", "list teachers", "list doctors", "list services", "may i know", "can i know", "do you have", "what about"])
@@ -2027,18 +2051,30 @@ class SipCallSession:
             "demo", "schedule demo", "book demo", "want demo", "need demo", "schedule a demo", "book a demo",
             "want a demo", "need a demo", "have a demo", "see a demo", "take a demo"
         ])
-        is_consult_keyword = any(k in txt_lower for k in [
-            "schedule a call", "book a call", "consultation", "schedule consultation"
+        is_callback_keyword = any(k in txt_lower for k in [
+            "arrange a call", "arrange call", "make an arrangement", "make arrangement",
+            "speak with your team", "speak with the team", "speak to your team", "speak to the team",
+            "talk to your team", "talk to the team", "talk with your team", "talk with the team",
+            "connect with your team", "connect with the team", "i want to speak with your team",
+            "i want to talk to your team", "contact me", "yes contact me", "yes, contact me",
+            "call me back", "request a callback", "callback", "arrange a callback",
+            "give me a call back", "schedule a callback", "schedule a call", "call back",
+            "have someone call me", "can someone call me", "get someone to call me"
         ])
-        is_booking_keyword = (
+        is_explicit_appointment = (
             any(k in txt_lower for k in [
                 "book an appointment", "book appointment", "schedule an appointment", "make an appointment",
-                "book a slot", "book my", "reserve", "want to book", "need to book", "i want an appointment",
-                "i need an appointment"
+                "book a slot", "book my", "reserve", "want to book an appointment", "need an appointment",
+                "i want an appointment", "i need an appointment"
             ])
-            or is_demo_keyword
-            or is_consult_keyword
-        ) and not is_informational_query
+            or (is_demo_keyword and any(w in txt_lower for w in ["at", "on", "tomorrow", "today", "pm", "am", "clock", "date", "time"]))
+        ) and not is_informational_query and not is_callback_keyword
+        is_booking_keyword = is_explicit_appointment
+
+        if is_callback_keyword:
+            self.booking_session.workflow_mode = "LEAD_COLLECTION"
+        elif is_explicit_appointment:
+            self.booking_session.workflow_mode = "APPOINTMENT_BOOKING"
 
         # 1. Immediate Intent & Emotion Detection
         intent_name = "general_question"
@@ -2118,9 +2154,11 @@ class SipCallSession:
                     await self._speak(ack_msg, "appointment_already_confirmed", metrics)
                     return
         else:
-            should_route_booking = not is_intent_switch and (self.booking_session.is_active() or is_booking_keyword)
+            is_active_or_triggered = (self.booking_session.is_active() or is_booking_keyword or is_callback_keyword or intent_name == "callback")
+            should_route_booking = not is_intent_switch and is_active_or_triggered
 
-        selected_wf = "APPOINTMENT_BOOKING" if should_route_booking else ("STAFF_DIRECTORY" if intent_name in ("staff_lookup", "staff_availability", "doctor_information") else "RAG_KNOWLEDGE_BASE")
+        is_lead_wf = getattr(self.booking_session, "workflow_mode", None) == "LEAD_COLLECTION" or intent_name == "callback"
+        selected_wf = ("LEAD_COLLECTION" if is_lead_wf else "APPOINTMENT_BOOKING") if should_route_booking else ("STAFF_DIRECTORY" if intent_name in ("staff_lookup", "staff_availability", "doctor_information") else "RAG_KNOWLEDGE_BASE")
         logger.info(
             f"\n[INTENT_ROUTING]"
             f"\n  caller_utterance='{transcription}'"
@@ -2185,7 +2223,7 @@ class SipCallSession:
                 f"\n  text='{response_text}'"
             )
 
-            intent_name = "appointment_booking"
+            intent_name = "callback" if is_lead_wf else "appointment_booking"
             self._messages.append({"role": "user", "text": transcription, "intent": intent_name})
             self.session_history.append({"role": "user", "text": transcription})
             self.session_history.append({"role": "model", "text": response_text})
@@ -2197,7 +2235,8 @@ class SipCallSession:
             metrics["state_ms"]   = state_ms
 
             await self._speak(response_text, intent_name, metrics)
-            await self._handle_booking_confirmed_termination()
+            if not is_lead_wf:
+                await self._handle_booking_confirmed_termination()
             return
 
         # ── Staff Directory Routing (Staff Lookup & Availability Only) ───
@@ -2789,7 +2828,10 @@ class SipCallSession:
 
         # 1. Reset Deepgram STT turn buffer so previous acoustic frames never convert to customer final
         if hasattr(self, "deepgram_session") and self.deepgram_session:
-            self.deepgram_session.reset_turn()
+            try:
+                self.deepgram_session.reset_turn()
+            except Exception as _reset_err:
+                logger.warning(f"[DEEPGRAM_RESET_WARN] call_id={self.call_sid}: {_reset_err}")
 
         # 2. Register AI text in recent speech history ring
         self._recent_ai_texts.append(text)
@@ -2800,6 +2842,11 @@ class SipCallSession:
             self._barge_in_event.clear()
             if metrics and "tts_start" not in metrics:
                 metrics["tts_start"] = time.monotonic()
+
+            logger.info(
+                f"[TTS_STARTED] call_id={self.call_sid} text='{text[:60]}' "
+                f"language={self.current_lang} voice_id={getattr(self, 'selected_tts_voice', None)}"
+            )
 
             t0          = time.monotonic()
             audio_bytes = await tts_service.synthesize_speech_async(text, language=self.current_lang, voice_id=getattr(self, 'selected_tts_voice', None))
@@ -2818,6 +2865,10 @@ class SipCallSession:
             if not audio_bytes:
                 logger.warning(f"[TTS] No audio for: '{text[:50]}'")
                 logger.warning(f"[TTS_GENERATION_STATUS] call_id={self.call_sid} utterance_id={utt_id} status=FAILED error='empty_audio'")
+                logger.warning(
+                    f"[TTS_COMPLETED] call_id={self.call_sid} utterance_id={utt_id} "
+                    f"bytes=0 duration_ms={round(elapsed * 1000)} status=FAILED error='empty_audio'"
+                )
                 logger.info(
                     f"\n[TTS_LANGUAGE]"
                     f"\n  call_id={self.call_sid}"
@@ -2832,6 +2883,10 @@ class SipCallSession:
                 return
             logger.info(f"[TTS] source=AI {len(audio_bytes)} bytes in {elapsed:.2f}s: '{text[:60]}'")
             logger.info(f"[TTS_GENERATION_STATUS] call_id={self.call_sid} utterance_id={utt_id} bytes={len(audio_bytes)} duration_ms={round(elapsed * 1000)} status=SUCCESS")
+            logger.info(
+                f"[TTS_COMPLETED] call_id={self.call_sid} utterance_id={utt_id} "
+                f"bytes={len(audio_bytes)} duration_ms={round(elapsed * 1000)} status=SUCCESS"
+            )
             logger.info(
                 f"\n[TTS_LANGUAGE]"
                 f"\n  call_id={self.call_sid}"

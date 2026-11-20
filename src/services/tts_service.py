@@ -24,6 +24,7 @@ _tts_engine = None
 
 class TTSService:
     _murf_disabled_until = 0.0
+    _murf_consecutive_failures = 0
 
     def __init__(self):
         self.provider = "local"
@@ -56,18 +57,16 @@ class TTSService:
         if self.provider == "murf":
             try:
                 from src.services.murf_tts import murf_tts
-                # Probe Murf once during startup so if quota is exhausted (402), circuit breaker trips BEFORE first call
                 logger.info("[TTS] Verifying Murf TTS provider status at startup...")
                 test_audio = murf_tts.synthesize("Hello", format="MP3")
-                if not test_audio or len(test_audio) < 50:
-                    TTSService._murf_disabled_until = time.monotonic() + 3600.0
-                    logger.warning("[TTS] Murf provider unavailable at startup (402 Quota / Error). Circuit breaker active -> using fast fallback.")
-                else:
+                if test_audio and len(test_audio) > 50:
                     TTSService._murf_disabled_until = 0.0
+                    TTSService._murf_consecutive_failures = 0
                     logger.info("[TTS] Murf provider verified active.")
+                else:
+                    logger.warning("[TTS] Murf startup probe returned empty. Will attempt live calls during conversation.")
             except Exception as exc:
-                TTSService._murf_disabled_until = time.monotonic() + 3600.0
-                logger.warning(f"[TTS] Murf check failed at startup ({exc}). Circuit breaker active -> using fast fallback.")
+                logger.warning(f"[TTS] Murf check encountered error at startup ({exc}).")
 
     @staticmethod
     def pcm_to_ulaw(pcm_bytes: bytes) -> bytes:
@@ -157,7 +156,22 @@ class TTSService:
         if "PYTEST_CURRENT_TEST" in os.environ or os.getenv("APP_ENV") == "test":
             return b"RIFFd\x06\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x40\x1f\x00\x00\x80\x3e\x00\x00\x02\x00\x10\x00data\x40\x06\x00\x00" + (b"\x00\x10" * 800)
 
-        target_gtts_lang = self.detect_language(clean_text, fallback=language)
+        # Determine target language: prioritize explicitly supplied language parameter
+        norm_lang = (language or "").lower().strip()
+        if norm_lang in ("ta", "tanglish", "ta_mix"):
+            target_gtts_lang = "ta"
+        elif norm_lang in ("hi", "hinglish"):
+            target_gtts_lang = "hi"
+        elif norm_lang in ("te", "telugu"):
+            target_gtts_lang = "te"
+        elif norm_lang in ("kn", "kannada"):
+            target_gtts_lang = "kn"
+        elif norm_lang in ("ml", "malayalam"):
+            target_gtts_lang = "ml"
+        elif norm_lang in ("en", "english"):
+            target_gtts_lang = "en"
+        else:
+            target_gtts_lang = self.detect_language(clean_text, fallback=language)
 
         from src.services.cache_service import cache_service
 
@@ -206,13 +220,24 @@ class TTSService:
                 murf_audio = murf_tts.synthesize(clean_text, voice_id=murf_voice, model=murf_model, language=target_gtts_lang, format="MP3")
                 if murf_audio and len(murf_audio) > 50:
                     TTSService._murf_disabled_until = 0.0
+                    TTSService._murf_consecutive_failures = 0
                     cache_service.set(cache_key, murf_audio, ttl=3600)
                     return murf_audio
                 # Empty audio indicates failure
-                logger.warning(f"[TTS Provider: Murf] Murf synthesis returned empty audio. Using fallback gTTS.")
+                TTSService._murf_consecutive_failures += 1
+                if TTSService._murf_consecutive_failures >= 3:
+                    TTSService._murf_disabled_until = time.monotonic() + 60.0
+                    logger.warning(f"[TTS_VOICE_FALLBACK] Murf synthesis failed {TTSService._murf_consecutive_failures} times consecutively. Tripping circuit breaker for 60s. Using fallback gTTS.")
+                else:
+                    logger.warning(f"[TTS_VOICE_FALLBACK] Murf synthesis returned empty audio (failure {TTSService._murf_consecutive_failures}/3). Using fallback gTTS for this turn.")
                 return self._synthesize_gtts(clean_text, target_gtts_lang, cache_key)
             except Exception as exc:
-                logger.warning(f"[TTS Provider: Murf] Murf synthesis failed ({exc}). Using fallback gTTS.")
+                TTSService._murf_consecutive_failures += 1
+                if TTSService._murf_consecutive_failures >= 3:
+                    TTSService._murf_disabled_until = time.monotonic() + 60.0
+                    logger.warning(f"[TTS_VOICE_FALLBACK] Murf exception {exc} ({TTSService._murf_consecutive_failures}/3). Tripping circuit breaker for 60s. Using fallback gTTS.")
+                else:
+                    logger.warning(f"[TTS_VOICE_FALLBACK] Murf exception {exc} ({TTSService._murf_consecutive_failures}/3). Using fallback gTTS for this turn.")
                 return self._synthesize_gtts(clean_text, target_gtts_lang, cache_key)
 
         # ------------------------------------------------------------------
@@ -336,24 +361,28 @@ class TTSService:
             return self.pcm_to_ulaw(audio_bytes[:16000])
 
     async def synthesize_speech_async(self, text: str, language: str = "en", voice_id: Optional[str] = None) -> bytes:
-        """Asynchronously synthesize speech without blocking the event loop, with hard 3.0s timeout and immediate fallback."""
+        """Asynchronously synthesize speech without blocking the event loop, with 7.0s timeout and immediate fallback."""
         t_start = time.perf_counter()
         try:
             audio = await asyncio.wait_for(
                 asyncio.to_thread(self.synthesize_speech, text, language, voice_id),
-                timeout=3.0
+                timeout=7.0
             )
             murf_ms = (time.perf_counter() - t_start) * 1000.0
             logger.info(f"[TTS_DIAGNOSTICS] provider=murf status=success latency_ms={murf_ms:.1f} audio_size={len(audio) if audio else 0}")
             return audio
         except asyncio.TimeoutError:
             murf_ms = (time.perf_counter() - t_start) * 1000.0
-            TTSService._murf_disabled_until = time.monotonic() + 60.0
-            logger.warning(f"[TTS_DIAGNOSTICS] provider=murf status=timeout latency_ms={murf_ms:.1f} (exceeded 3.0s threshold). Tripping circuit breaker (60s) -> invoking immediate gTTS fallback.")
+            TTSService._murf_consecutive_failures += 1
+            if TTSService._murf_consecutive_failures >= 3:
+                TTSService._murf_disabled_until = time.monotonic() + 60.0
+                logger.warning(f"[TTS_VOICE_FALLBACK] provider=murf status=timeout latency_ms={murf_ms:.1f} (failure {TTSService._murf_consecutive_failures}/3). Tripping circuit breaker (60s) -> invoking immediate gTTS fallback.")
+            else:
+                logger.warning(f"[TTS_VOICE_FALLBACK] provider=murf status=timeout latency_ms={murf_ms:.1f} (failure {TTSService._murf_consecutive_failures}/3) -> invoking immediate gTTS fallback for this turn.")
             t_fb = time.perf_counter()
             fb_audio = await asyncio.to_thread(self._synthesize_gtts, text, language or "en")
             fb_ms = (time.perf_counter() - t_fb) * 1000.0
-            logger.info(f"[TTS_DIAGNOSTICS] provider=gtts_fallback status=success latency_ms={fb_ms:.1f} audio_size={len(fb_audio) if fb_audio else 0}")
+            logger.info(f"[TTS_VOICE_FALLBACK] provider=gtts_fallback status=success latency_ms={fb_ms:.1f} audio_size={len(fb_audio) if fb_audio else 0}")
             return fb_audio
 
     async def synthesize_ulaw_async(self, text: str, language: str = "en") -> bytes:

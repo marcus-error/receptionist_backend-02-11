@@ -233,6 +233,23 @@ class NLPService:
         ]):
             return NLPResult(intent=INTENT_APPOINTMENT_AVAILABILITY, confidence=0.96)
 
+        # 9b. Callback / Team Contact / Arrangement Request (Lead Collection)
+        # Evaluated BEFORE appointment booking to ensure "arrange a call", "schedule a call", "speak with team"
+        # are NEVER misrouted to calendar appointment booking!
+        callback_phrases = [
+            "arrange a call", "arrange call", "make an arrangement", "make arrangement", "arrange an arrangement",
+            "speak with your team", "speak with the team", "speak to your team", "speak to the team",
+            "talk to your team", "talk to the team", "talk with your team", "talk with the team",
+            "connect with your team", "connect with the team", "i want to speak with your team",
+            "i want to talk to your team", "contact me", "yes contact me", "yes, contact me",
+            "call me back", "request a callback", "callback", "arrange a callback",
+            "give me a call back", "schedule a callback", "schedule a call", "call back",
+            "have someone call me", "can someone call me", "ask someone to call me",
+            "get someone to call me", "have your team call me", "can your team call me"
+        ]
+        if any(p in txt for p in callback_phrases):
+            return NLPResult(intent=INTENT_CALLBACK, confidence=0.98)
+
         # 10. Appointment Booking Request
         if any(w in txt for w in ["book", "booking", "appointment", "schedule", "reserve", "slot", "slots", "want an appointment", "need an appointment", "make an appointment", "get an appointment", "take an appointment", "fix an appointment", "book doctor", "pannanum", "venum"]):
             customer = None
@@ -310,7 +327,7 @@ class NLPService:
         # 15. Spoken Phone Number / Contact Info
         raw_digits = re.sub(r'[^\d]', '', txt)
         if len(raw_digits) >= 5 and (len(txt.split()) <= 7 or any(w in txt for w in ["it's", "its", "number", "phone", "mobile", "contact"])):
-            return NLPResult(intent=INTENT_APPOINTMENT_BOOKING, confidence=0.95)
+            return NLPResult(intent=INTENT_GENERAL_CONVERSATION, confidence=0.95, appointment_details={"contact_number": raw_digits})
 
         # 16. Standalone Name / Entity statement (filter out common conversational adjectives & state words)
         NON_NAME_WORDS = {"home", "here", "there", "back", "ready", "fine", "good", "ok", "okay", "alright", "listening", "calling", "busy", "free", "available", "sorry", "done", "well", "happy", "sad", "sick", "speaking", "talking"}

@@ -5,7 +5,8 @@ import asyncio
 import time
 import hashlib
 import re
-from typing import List, Optional
+import uuid
+from typing import List, Optional, Dict, Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
@@ -23,7 +24,7 @@ from src.services.call_service import CallService
 from src.services.language_service import language_service
 from src.services.agent_engine import agent_engine
 from src.utils.latency_tracker import LatencyTracker
-from src.utils.text_sanitizer import clean_markdown_for_voice
+from src.utils.text_sanitizer import clean_markdown_for_voice, deduplicate_repeated_sentences
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -153,6 +154,50 @@ def _get_loading_message(lang: str = "en", booking_session=None) -> str:
 def _normalize_speech(text: str) -> str:
     """Strips punctuation and extra spaces for acoustic echo comparison."""
     return re.sub(r'[^a-zA-Z0-9\s]', '', (text or "").lower()).strip()
+
+
+class TurnIdempotencyTracker:
+    """
+    Prevents duplicate conversational response generation from repeated API requests,
+    duplicate WebSocket events, rapid speech recognition triggers, retries, or fallback execution.
+    """
+    def __init__(self, ttl_seconds: float = 15.0):
+        self._processed_turns: Dict[str, Dict[str, Any]] = {}
+        self._last_transcript: Optional[str] = None
+        self._last_transcript_time: float = 0.0
+        self._ttl = ttl_seconds
+
+    def check_duplicate(self, text: str, turn_id: Optional[str] = None) -> tuple[bool, Optional[Dict[str, Any]]]:
+        now = time.time()
+        cutoff = now - self._ttl
+        self._processed_turns = {k: v for k, v in self._processed_turns.items() if v.get("timestamp", 0) > cutoff}
+
+        norm_text = re.sub(r'[^a-zA-Z0-9\s]', '', (text or "").lower()).strip()
+
+        # 1. Check explicit turn_id / utterance_id
+        if turn_id and turn_id in self._processed_turns:
+            return True, self._processed_turns[turn_id]
+
+        # 2. Check identical normalized text arriving within 1.5s
+        if self._last_transcript and norm_text and norm_text == self._last_transcript and (now - self._last_transcript_time) < 1.5:
+            cached = next((v for v in self._processed_turns.values() if v.get("norm_text") == norm_text), None)
+            return True, cached
+
+        return False, None
+
+    def record_turn(self, turn_id: str, message_id: str, text: str, response_text: str):
+        now = time.time()
+        norm_text = re.sub(r'[^a-zA-Z0-9\s]', '', (text or "").lower()).strip()
+        self._last_transcript = norm_text
+        self._last_transcript_time = now
+        self._processed_turns[turn_id] = {
+            "turn_id": turn_id,
+            "message_id": message_id,
+            "text": text,
+            "norm_text": norm_text,
+            "response_text": response_text,
+            "timestamp": now
+        }
 
 
 def _authenticate_ws_token(token: Optional[str], query_org_id: Optional[str] = None) -> Optional[int]:
@@ -510,6 +555,7 @@ async def voice_endpoint(websocket: WebSocket):
     last_processed_utterance_id = None
     last_processed_hash = None
     last_processed_time = 0.0
+    turn_tracker = TurnIdempotencyTracker()
 
     try:
         while True:
@@ -530,7 +576,8 @@ async def voice_endpoint(websocket: WebSocket):
                         continue
 
                     audio_bytes = data['bytes']
-                    logger.info(f"[STT] session_id={session_id} received audio packet of size {len(audio_bytes)}")
+                    current_lang = getattr(booking_session, "conversation_language", "en") or "en"
+                    logger.info(f"[STT] session_id={session_id} received audio packet of size {len(audio_bytes)} language={current_lang}")
 
                     audio_hash = hashlib.md5(audio_bytes).hexdigest()
                     now = time.time()
@@ -540,11 +587,11 @@ async def voice_endpoint(websocket: WebSocket):
                     last_processed_hash = audio_hash
                     last_processed_time = now
 
-                    # 1. Speech-to-Text
+                    # 1. Speech-to-Text with active conversation language
                     t0 = time.perf_counter()
                     tracker.mark("stt_started_at")
                     try:
-                        transcription = await stt_service.transcribe_async(audio_bytes)
+                        transcription = await stt_service.transcribe_async(audio_bytes, language=current_lang)
                     except Exception as e:
                         logger.error(f"[STT] session_id={session_id} transcription failed: {e}")
                         await websocket.send_json({"type": "error", "message": "Failed to transcribe audio"})
@@ -552,6 +599,13 @@ async def voice_endpoint(websocket: WebSocket):
                     t_stt_dur = (time.perf_counter() - t0) * 1000.0
                     tracker.record("stt", t_stt_dur)
                     tracker.mark("stt_completed_at")
+                    logger.info(
+                        f"\n[VOICE_WS_AUDIO_TRANSCRIPTION_RESULT]"
+                        f"\n  session_id={session_id}"
+                        f"\n  language={current_lang}"
+                        f"\n  duration_ms={t_stt_dur:.1f}"
+                        f"\n  transcript='{transcription}'"
+                    )
 
                     if not transcription or transcription.strip() in {"Demo transcription", ""}:
                         continue
@@ -562,6 +616,43 @@ async def voice_endpoint(websocket: WebSocket):
                     try:
                         text_data = json.loads(data['text'])
                         msg_type = text_data.get('type')
+
+                        if msg_type == 'set_language':
+                            req_lang = text_data.get('language') or 'en'
+                            norm_lang = str(req_lang).lower().strip()
+                            if norm_lang.startswith('ta'):
+                                target_lang = 'ta'
+                                stt_code = 'ta-IN'
+                            elif norm_lang.startswith('hi'):
+                                target_lang = 'hi'
+                                stt_code = 'hi-IN'
+                            elif norm_lang.startswith('te'):
+                                target_lang = 'te'
+                                stt_code = 'te-IN'
+                            elif norm_lang.startswith('kn'):
+                                target_lang = 'kn'
+                                stt_code = 'kn-IN'
+                            elif norm_lang.startswith('en'):
+                                target_lang = 'en'
+                                stt_code = 'en-IN'
+                            else:
+                                target_lang = 'en'
+                                stt_code = 'en-IN'
+
+                            booking_session.conversation_language = target_lang
+                            logger.info(
+                                f"\n[VOICE_WS_SET_LANGUAGE]"
+                                f"\n  session_id={session_id}"
+                                f"\n  requested_language='{req_lang}'"
+                                f"\n  target_language='{target_lang}'"
+                                f"\n  stt_code='{stt_code}'"
+                            )
+                            await websocket.send_json({
+                                "type": "language_changed",
+                                "language": target_lang,
+                                "stt_lang": stt_code
+                            })
+                            continue
 
                         if msg_type in ('auth', 'init'):
                             auth_tok = text_data.get('token')
@@ -631,6 +722,22 @@ async def voice_endpoint(websocket: WebSocket):
                                 active_doc_id=active_doc_id,
                                 active_doc_title=active_doc_title
                             )
+                            req_lang = text_data.get('language')
+                            if req_lang:
+                                norm_l = str(req_lang).lower().strip()
+                                if norm_l.startswith('ta'):
+                                    booking_session.conversation_language = 'ta'
+                                elif norm_l.startswith('hi'):
+                                    booking_session.conversation_language = 'hi'
+                                elif norm_l.startswith('te'):
+                                    booking_session.conversation_language = 'te'
+                                elif norm_l.startswith('kn'):
+                                    booking_session.conversation_language = 'kn'
+                                elif norm_l.startswith('en'):
+                                    booking_session.conversation_language = 'en'
+                            else:
+                                booking_session.conversation_language = 'en'
+
                             booking_session.greeting_sent = True
                             booking_session.conversation_started = True
                             booking_session.turn_count = 0
@@ -646,6 +753,7 @@ async def voice_endpoint(websocket: WebSocket):
                                 f"\n  active_doc_title='{active_doc_title}'"
                                 f"\n  business_type={b_type}"
                                 f"\n  booking_type={book_type}"
+                                f"\n  language={booking_session.conversation_language}"
                             )
 
                             await websocket.send_json({
@@ -675,24 +783,34 @@ async def voice_endpoint(websocket: WebSocket):
                                     recent_ai_utterances.append(clean_norm)
                                 last_ai_speech_time = time.time()
 
+                                greeting_turn_id = "turn_greeting"
+                                greeting_msg_id = "msg_greeting"
                                 await websocket.send_json({
                                     "type": "state",
                                     "state": "AI_SPEAKING"
                                 })
                                 await websocket.send_json({
                                     "type": "response",
-                                    "text": opening_greeting
+                                    "text": opening_greeting,
+                                    "turn_id": greeting_turn_id,
+                                    "message_id": greeting_msg_id,
+                                    "conversation_id": session_id,
+                                    "is_final": True
                                 })
-                                audio_response = await tts_service.synthesize_speech_async(clean_markdown_for_voice(opening_greeting), language="en")
+                                audio_response = await tts_service.synthesize_speech_async(clean_markdown_for_voice(opening_greeting), language=booking_session.conversation_language or "en")
                                 if audio_response and len(audio_response) > 100:
                                     audio_base64 = base64.b64encode(audio_response).decode('utf-8')
                                     await websocket.send_json({
                                         "type": "audio",
                                         "audio": audio_base64,
-                                        "text": opening_greeting
+                                        "text": opening_greeting,
+                                        "turn_id": greeting_turn_id,
+                                        "message_id": greeting_msg_id,
+                                        "conversation_id": session_id
                                     })
+                                turn_tracker.record_turn(greeting_turn_id, greeting_msg_id, "[CALL_START]", opening_greeting)
                                 _log_turn(session_id, "[CALL_START]", opening_greeting, "greeting", booking_session)
-                                await _handle_post_response_state(websocket, booking_session, session_id, "en", recent_ai_utterances)
+                                await _handle_post_response_state(websocket, booking_session, session_id, booking_session.conversation_language or "en", recent_ai_utterances)
                             except Exception as exc:
                                 logger.error(f"[VOICE WS] Opening greeting error: {exc}")
                             continue
@@ -791,6 +909,24 @@ async def voice_endpoint(websocket: WebSocket):
                 if not transcription:
                     continue
 
+                # Turn Identification & Turn-Level Idempotency
+                turn_id = utterance_id or f"turn_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}"
+                message_id = f"msg_{turn_id}"
+
+                is_dup_turn, cached_turn = turn_tracker.check_duplicate(transcription, turn_id)
+                if is_dup_turn:
+                    logger.info(f"[TURN IDEMPOTENCY] session_id={session_id} turn_id={turn_id} duplicate turn rejected.")
+                    if cached_turn and cached_turn.get("response_text"):
+                        await websocket.send_json({
+                            "type": "response",
+                            "text": cached_turn["response_text"],
+                            "turn_id": cached_turn.get("turn_id", turn_id),
+                            "message_id": cached_turn.get("message_id", message_id),
+                            "conversation_id": session_id,
+                            "is_final": True
+                        })
+                    continue
+
                 # PRECISE SERVER-SIDE ACOUSTIC ECHO REJECTION
                 time_since_speech = time.time() - last_ai_speech_time
                 if is_ai_playing and time_since_speech < 15.0:
@@ -813,6 +949,8 @@ async def voice_endpoint(websocket: WebSocket):
                     f"\n  session_id={session_id}"
                     f"\n  call_sid={booking_session.call_sid}"
                     f"\n  utterance_id={utterance_id}"
+                    f"\n  turn_id={turn_id}"
+                    f"\n  message_id={message_id}"
                     f"\n  transcript='{transcription}'"
                     f"\n  confidence={confidence}"
                     f"\n  language={booking_session.conversation_language}"
@@ -822,7 +960,10 @@ async def voice_endpoint(websocket: WebSocket):
                 await websocket.send_json({
                     "type": "transcription",
                     "text": transcription,
-                    "utterance_id": utterance_id
+                    "utterance_id": utterance_id,
+                    "turn_id": turn_id,
+                    "message_id": message_id,
+                    "conversation_id": session_id
                 })
 
                 # ============================================================
@@ -836,20 +977,45 @@ async def voice_endpoint(websocket: WebSocket):
                     current_lang = target_lang or booking_session.conversation_language
                     lang_resp = language_service.get_language_switch_confirmation(current_lang, booking_session=booking_session)
 
+                    stt_code_map = {"ta": "ta-IN", "hi": "hi-IN", "te": "te-IN", "kn": "kn-IN", "en": "en-IN"}
+                    stt_code = stt_code_map.get(current_lang, "en-IN")
+                    await websocket.send_json({
+                        "type": "language_changed",
+                        "language": current_lang,
+                        "stt_lang": stt_code,
+                        "turn_id": turn_id,
+                        "conversation_id": session_id
+                    })
+
                     norm_ans = _normalize_speech(lang_resp)
                     if norm_ans:
                         recent_ai_utterances.append(norm_ans)
                     last_ai_speech_time = time.time()
 
                     await websocket.send_json({"type": "analysis", "intent": "LANGUAGE_SWITCH",
-                                               "emotion": "Neutral - 100%", "language": current_lang})
-                    await websocket.send_json({"type": "response", "text": lang_resp})
+                                               "emotion": "Neutral - 100%", "language": current_lang,
+                                               "turn_id": turn_id, "conversation_id": session_id})
+                    await websocket.send_json({
+                        "type": "response",
+                        "text": lang_resp,
+                        "turn_id": turn_id,
+                        "message_id": message_id,
+                        "conversation_id": session_id,
+                        "is_final": True
+                    })
 
                     audio_response = await tts_service.synthesize_stream_chunk_async(lang_resp, language=current_lang)
                     if audio_response and len(audio_response) > 100:
                         audio_base64 = base64.b64encode(audio_response).decode('utf-8')
-                        await websocket.send_json({"type": "audio", "audio": audio_base64})
+                        await websocket.send_json({
+                            "type": "audio",
+                            "audio": audio_base64,
+                            "turn_id": turn_id,
+                            "message_id": message_id,
+                            "conversation_id": session_id
+                        })
 
+                    turn_tracker.record_turn(turn_id, message_id, transcription, lang_resp)
                     _log_turn(session_id, transcription, lang_resp, "LANGUAGE_SWITCH", booking_session)
                     await _handle_post_response_state(websocket, booking_session, session_id, current_lang, recent_ai_utterances)
                     continue
@@ -857,11 +1023,23 @@ async def voice_endpoint(websocket: WebSocket):
 
                 # 2. Language Lock & Single-Pass Intent / Emotion Understanding
                 t_n_start = time.perf_counter()
+                prev_lang = booking_session.conversation_language
                 booking_session.conversation_language = language_service.determine_conversation_language(
                     transcription, current_lang=booking_session.conversation_language
                 )
                 current_lang = booking_session.conversation_language
                 tracker.mark("language_detected_at")
+
+                if current_lang != prev_lang:
+                    stt_code_map = {"ta": "ta-IN", "hi": "hi-IN", "te": "te-IN", "kn": "kn-IN", "en": "en-IN"}
+                    stt_code = stt_code_map.get(current_lang, "en-IN")
+                    await websocket.send_json({
+                        "type": "language_changed",
+                        "language": current_lang,
+                        "stt_lang": stt_code,
+                        "turn_id": turn_id,
+                        "conversation_id": session_id
+                    })
 
                 try:
                     booking_state_service.extract_slots(transcription, booking_session)
@@ -910,10 +1088,25 @@ async def voice_endpoint(websocket: WebSocket):
                         "phone": booking_session.phone_number,
                         "reason": "Caller requested human agent"
                     })
-                    await websocket.send_json({"type": "response", "text": handoff_msg})
+                    await websocket.send_json({
+                        "type": "response",
+                        "text": handoff_msg,
+                        "turn_id": turn_id,
+                        "message_id": message_id,
+                        "conversation_id": session_id,
+                        "is_final": True
+                    })
                     handoff_audio = await tts_service.synthesize_speech_async(clean_markdown_for_voice(handoff_msg), language=current_lang)
                     if handoff_audio and len(handoff_audio) > 100:
-                        await websocket.send_json({"type": "audio", "audio": base64.b64encode(handoff_audio).decode('utf-8')})
+                        await websocket.send_json({
+                            "type": "audio",
+                            "audio": base64.b64encode(handoff_audio).decode('utf-8'),
+                            "text": handoff_msg,
+                            "turn_id": turn_id,
+                            "message_id": message_id,
+                            "conversation_id": session_id
+                        })
+                    turn_tracker.record_turn(turn_id, message_id, transcription, handoff_msg)
                     _log_turn(session_id, transcription, handoff_msg, "transfer request", booking_session)
                     await _handle_post_response_state(websocket, booking_session, session_id, current_lang, recent_ai_utterances)
                     continue
@@ -930,10 +1123,25 @@ async def voice_endpoint(websocket: WebSocket):
                         cb_msg = f"Aapka callback request note kar liya gaya hai. Hamari team aapse jaldi sampark karegi."
 
                     logger.info(f"[WORKFLOW] [CALLBACK] session_id={session_id} registered callback.")
-                    await websocket.send_json({"type": "response", "text": cb_msg})
+                    await websocket.send_json({
+                        "type": "response",
+                        "text": cb_msg,
+                        "turn_id": turn_id,
+                        "message_id": message_id,
+                        "conversation_id": session_id,
+                        "is_final": True
+                    })
                     cb_audio = await tts_service.synthesize_speech_async(clean_markdown_for_voice(cb_msg), language=current_lang)
                     if cb_audio and len(cb_audio) > 100:
-                        await websocket.send_json({"type": "audio", "audio": base64.b64encode(cb_audio).decode('utf-8')})
+                        await websocket.send_json({
+                            "type": "audio",
+                            "audio": base64.b64encode(cb_audio).decode('utf-8'),
+                            "text": cb_msg,
+                            "turn_id": turn_id,
+                            "message_id": message_id,
+                            "conversation_id": session_id
+                        })
+                    turn_tracker.record_turn(turn_id, message_id, transcription, cb_msg)
                     _log_turn(session_id, transcription, cb_msg, "callback", booking_session)
                     await _handle_post_response_state(websocket, booking_session, session_id, current_lang, recent_ai_utterances)
                     continue
@@ -949,13 +1157,31 @@ async def voice_endpoint(websocket: WebSocket):
                         res = cancel_appointment(target_id)
                         cancel_msg = res.get("message", f"Appointment #{target_id} has been cancelled.")
                     else:
-                        cancel_msg = "Please provide your appointment ID or registered phone number so I can cancel your booking."
+                        if current_lang == "ta":
+                            cancel_msg = "உங்கள் பதிவை ரத்து செய்ய, தயவுசெய்து உங்கள் முன்பதிவு எண் அல்லது பதிவு செய்யப்பட்ட தொலைபேசி எண்ணைக் கூறவும்."
+                        else:
+                            cancel_msg = "Please provide your appointment ID or registered phone number so I can cancel your booking."
 
                     logger.info(f"[WORKFLOW] [APPOINTMENT_CANCEL] session_id={session_id} target_id={target_id}")
-                    await websocket.send_json({"type": "response", "text": cancel_msg})
+                    await websocket.send_json({
+                        "type": "response",
+                        "text": cancel_msg,
+                        "turn_id": turn_id,
+                        "message_id": message_id,
+                        "conversation_id": session_id,
+                        "is_final": True
+                    })
                     cancel_audio = await tts_service.synthesize_speech_async(clean_markdown_for_voice(cancel_msg), language=current_lang)
                     if cancel_audio and len(cancel_audio) > 100:
-                        await websocket.send_json({"type": "audio", "audio": base64.b64encode(cancel_audio).decode('utf-8')})
+                        await websocket.send_json({
+                            "type": "audio",
+                            "audio": base64.b64encode(cancel_audio).decode('utf-8'),
+                            "text": cancel_msg,
+                            "turn_id": turn_id,
+                            "message_id": message_id,
+                            "conversation_id": session_id
+                        })
+                    turn_tracker.record_turn(turn_id, message_id, transcription, cancel_msg)
                     _log_turn(session_id, transcription, cancel_msg, "appointment_cancellation", booking_session)
                     await _handle_post_response_state(websocket, booking_session, session_id, current_lang, recent_ai_utterances)
                     continue
@@ -974,13 +1200,31 @@ async def voice_endpoint(websocket: WebSocket):
                         res = reschedule_appointment(target_id, booking_session.date, booking_session.time, org_id)
                         reschedule_msg = res.get("message", f"Appointment #{target_id} rescheduled.")
                     else:
-                        reschedule_msg = "Sure, I can help you reschedule. What new date and time would you prefer?"
+                        if current_lang == "ta":
+                            reschedule_msg = "நிச்சயமாக, உங்கள் முன்பதிவை மாற்றியமைக்க உதவுகிறேன். எந்த புதிய தேதி மற்றும் நேரத்தை விரும்புகிறீர்கள்?"
+                        else:
+                            reschedule_msg = "Sure, I can help you reschedule. What new date and time would you prefer?"
 
                     logger.info(f"[WORKFLOW] [APPOINTMENT_RESCHEDULE] session_id={session_id} target_id={target_id}")
-                    await websocket.send_json({"type": "response", "text": reschedule_msg})
+                    await websocket.send_json({
+                        "type": "response",
+                        "text": reschedule_msg,
+                        "turn_id": turn_id,
+                        "message_id": message_id,
+                        "conversation_id": session_id,
+                        "is_final": True
+                    })
                     resched_audio = await tts_service.synthesize_speech_async(clean_markdown_for_voice(reschedule_msg), language=current_lang)
                     if resched_audio and len(resched_audio) > 100:
-                        await websocket.send_json({"type": "audio", "audio": base64.b64encode(resched_audio).decode('utf-8')})
+                        await websocket.send_json({
+                            "type": "audio",
+                            "audio": base64.b64encode(resched_audio).decode('utf-8'),
+                            "text": reschedule_msg,
+                            "turn_id": turn_id,
+                            "message_id": message_id,
+                            "conversation_id": session_id
+                        })
+                    turn_tracker.record_turn(turn_id, message_id, transcription, reschedule_msg)
                     _log_turn(session_id, transcription, reschedule_msg, "appointment_rescheduling", booking_session)
                     await _handle_post_response_state(websocket, booking_session, session_id, current_lang, recent_ai_utterances)
                     continue
@@ -990,7 +1234,8 @@ async def voice_endpoint(websocket: WebSocket):
                     transcription, intent_name,
                     organization_id=org_id,
                     is_ongoing=is_ongoing_turn,
-                    booking_session=booking_session
+                    booking_session=booking_session,
+                    conversation_language=current_lang
                 )
 
                 if fast_rule_answer:
@@ -1006,7 +1251,11 @@ async def voice_endpoint(websocket: WebSocket):
 
                     await websocket.send_json({
                         "type": "response",
-                        "text": fast_rule_answer
+                        "text": fast_rule_answer,
+                        "turn_id": turn_id,
+                        "message_id": message_id,
+                        "conversation_id": session_id,
+                        "is_final": True
                     })
 
                     audio_response = await tts_service.synthesize_speech_async(clean_markdown_for_voice(fast_rule_answer), language=current_lang)
@@ -1015,11 +1264,16 @@ async def voice_endpoint(websocket: WebSocket):
                         audio_base64 = base64.b64encode(audio_response).decode('utf-8')
                         await websocket.send_json({
                             "type": "audio",
-                            "audio": audio_base64
+                            "audio": audio_base64,
+                            "text": fast_rule_answer,
+                            "turn_id": turn_id,
+                            "message_id": message_id,
+                            "conversation_id": session_id
                         })
                     tracker.record("tts_total", (time.perf_counter() - t_tts_start) * 1000.0)
                     tracker.mark("tts_completed_at")
 
+                    turn_tracker.record_turn(turn_id, message_id, transcription, fast_rule_answer)
                     telemetry = tracker.log_summary()
                     await websocket.send_json({"type": "telemetry", "data": telemetry})
                     _log_turn(session_id, transcription, fast_rule_answer, intent_name, booking_session)
@@ -1029,14 +1283,26 @@ async def voice_endpoint(websocket: WebSocket):
                 # Check if intent switched to informational query
                 is_intent_switched = booking_state_service.check_and_handle_intent_switch(booking_session, intent_name, transcription)
 
-                # 3. BOOKING STATE MACHINE ROUTING
+                # 3. BOOKING / LEAD COLLECTION STATE MACHINE ROUTING
+                is_callback_intent = (
+                    intent_name == "callback"
+                    or any(cb in transcription.lower() for cb in [
+                        "arrange a call", "arrange call", "make an arrangement", "make arrangement",
+                        "speak with your team", "speak with the team", "contact me", "call me back",
+                        "schedule a call", "schedule a callback", "yes, contact me", "yes contact me"
+                    ])
+                )
                 is_booking_intent = (
                     intent_name in ("appointment_booking", "appointment_availability", "sales_demo_booking", "demo_booking", "schedule_demo")
-                    or any(w in transcription.lower() for w in ["book", "appointment", "schedule", "demo", "reserve"])
+                    or any(w in transcription.lower() for w in ["book an appointment", "book appointment", "schedule an appointment", "reserve a slot"])
                 )
-                if not is_intent_switched and (booking_session.is_active() or is_booking_intent):
-                    if intent_name in ("appointment_booking", "sales_demo_booking") and booking_session.is_completed:
-                        booking_session.reset()
+                if not is_intent_switched and (booking_session.is_active() or is_booking_intent or is_callback_intent):
+                    if is_callback_intent:
+                        booking_session.workflow_mode = "LEAD_COLLECTION"
+                    elif is_booking_intent:
+                        booking_session.workflow_mode = "APPOINTMENT_BOOKING"
+                        if booking_session.is_completed:
+                            booking_session.reset()
 
                     response_text = booking_state_service.process_booking_turn(transcription, booking_session)
 
@@ -1047,7 +1313,11 @@ async def voice_endpoint(websocket: WebSocket):
 
                     await websocket.send_json({
                         "type": "response",
-                        "text": response_text
+                        "text": response_text,
+                        "turn_id": turn_id,
+                        "message_id": message_id,
+                        "conversation_id": session_id,
+                        "is_final": True
                     })
 
                     t_tts = time.perf_counter()
@@ -1059,7 +1329,11 @@ async def voice_endpoint(websocket: WebSocket):
                             audio_base64 = base64.b64encode(audio_response).decode('utf-8')
                             await websocket.send_json({
                                 "type": "audio",
-                                "audio": audio_base64
+                                "audio": audio_base64,
+                                "text": response_text,
+                                "turn_id": turn_id,
+                                "message_id": message_id,
+                                "conversation_id": session_id
                             })
                     except Exception as e:
                         logger.error(f"Booking state TTS generation failed: {e}")
@@ -1067,6 +1341,7 @@ async def voice_endpoint(websocket: WebSocket):
                     tts_dur_ms = (time.perf_counter() - t_tts) * 1000.0
                     tracker.record("tts_total", tts_dur_ms)
                     tracker.mark("tts_completed_at")
+                    turn_tracker.record_turn(turn_id, message_id, transcription, response_text)
                     telemetry = tracker.log_summary()
                     logger.info(
                         f"\n[VOICE_TURN_COMPLETE]"
@@ -1199,10 +1474,19 @@ async def voice_endpoint(websocket: WebSocket):
                         full_response_text += token_chunk
                         sentence_buffer += token_chunk
 
+                        logger.info(
+                            f"[DIAG_STAGE_B_ACCUMULATED] turn_id={turn_id} message_id={message_id} "
+                            f"token_chunk_len={len(token_chunk)} accumulated_len={len(full_response_text)} "
+                            f"chunk={token_chunk!r}"
+                        )
+
                         # Stream text chunk to UI so user sees real-time visual transcription/typing
                         await websocket.send_json({
                             "type": "text_chunk",
-                            "text": token_chunk
+                            "text": token_chunk,
+                            "turn_id": turn_id,
+                            "message_id": message_id,
+                            "conversation_id": session_id
                         })
 
                         # Extract completed sentences to synthesize immediate TTS chunk
@@ -1212,9 +1496,17 @@ async def voice_endpoint(websocket: WebSocket):
                             for sentence in sentences:
                                 clean_voice_sent = clean_markdown_for_voice(sentence)
                                 if clean_voice_sent and len(clean_voice_sent) >= 3:
+                                    logger.info(
+                                        f"[DIAG_STAGE_C_FINAL_SERVICE_CHUNK] turn_id={turn_id} chunk_index={chunk_index} "
+                                        f"sentence={clean_voice_sent!r}"
+                                    )
                                     t_tts_c_start = time.perf_counter()
                                     try:
                                         audio_chunk = await tts_service.synthesize_speech_async(clean_voice_sent, language=current_lang)
+                                        if not audio_chunk:
+                                            # Retry once reusing existing sentence text without generating new conversational response
+                                            audio_chunk = await tts_service.synthesize_speech_async(clean_voice_sent, language=current_lang)
+
                                         if audio_chunk and len(audio_chunk) > 100:
                                             chunk_b64 = base64.b64encode(audio_chunk).decode('utf-8')
                                             first_audio_ms = (time.perf_counter() - t_llm_start) * 1000.0
@@ -1235,7 +1527,10 @@ async def voice_endpoint(websocket: WebSocket):
                                                 "audio": chunk_b64,
                                                 "text": sentence,
                                                 "chunk_index": chunk_index,
-                                                "is_first": (chunk_index == 0)
+                                                "is_first": (chunk_index == 0),
+                                                "turn_id": turn_id,
+                                                "message_id": message_id,
+                                                "conversation_id": session_id
                                             })
                                             chunk_index += 1
                                     except Exception as tts_err:
@@ -1244,9 +1539,16 @@ async def voice_endpoint(websocket: WebSocket):
                     # Flush any remaining text in sentence buffer
                     remaining_clean = clean_markdown_for_voice(sentence_buffer.strip())
                     if remaining_clean and len(remaining_clean) >= 3:
+                        logger.info(
+                            f"[DIAG_STAGE_C_FINAL_SERVICE_CHUNK] turn_id={turn_id} chunk_index={chunk_index} (final_buffer) "
+                            f"sentence={remaining_clean!r}"
+                        )
                         t_tts_c_start = time.perf_counter()
                         try:
                             audio_chunk = await tts_service.synthesize_speech_async(remaining_clean, language=current_lang)
+                            if not audio_chunk:
+                                audio_chunk = await tts_service.synthesize_speech_async(remaining_clean, language=current_lang)
+
                             if audio_chunk and len(audio_chunk) > 100:
                                 chunk_b64 = base64.b64encode(audio_chunk).decode('utf-8')
                                 first_audio_ms = (time.perf_counter() - t_llm_start) * 1000.0
@@ -1267,26 +1569,34 @@ async def voice_endpoint(websocket: WebSocket):
                                     "audio": chunk_b64,
                                     "text": sentence_buffer.strip(),
                                     "chunk_index": chunk_index,
-                                    "is_first": (chunk_index == 0)
+                                    "is_first": (chunk_index == 0),
+                                    "turn_id": turn_id,
+                                    "message_id": message_id,
+                                    "conversation_id": session_id
                                 })
                                 chunk_index += 1
                         except Exception as tts_err:
                             logger.warning(f"[VOICE STREAMING TTS] Final chunk synthesis failed: {tts_err}")
 
                     response_text = full_response_text.strip()
+                    response_text = deduplicate_repeated_sentences(clean_markdown_for_voice(response_text))
                     session_history.append({"role": "model", "text": response_text})
 
                 except Exception as e:
                     logger.error(f"[TEST_LLM_RESPONSE] LLM streaming pipeline failed: {e}")
-                    response_text = "Thank you for contacting our reception desk. How may I assist you?"
+                    if current_lang == "ta":
+                        response_text = "எங்கள் வரவேற்பாளர் பிரிவை தொடர்பு கொண்டதற்கு நன்றி. உங்களுக்கு எவ்வாறு உதவலாம்?"
+                    else:
+                        response_text = "Thank you for contacting our reception desk. How may I assist you?"
 
                 total_llm_ms = (time.perf_counter() - t_llm_start) * 1000.0
                 tracker.record("llm_total_ms", total_llm_ms)
                 tracker.mark("llm_completed_at")
 
+                first_tok_val = tracker.get_metric('llm_first_token_ms', 0.0) if hasattr(tracker, 'get_metric') else getattr(tracker, 'metrics', {}).get('llm_first_token_ms', 0.0)
                 logger.info(
                     f"[TEST_LLM_RESPONSE] session_id={session_id} "
-                    f"first_token_ms={tracker.get_metric('llm_first_token_ms') or 0:.1f} "
+                    f"first_token_ms={first_tok_val or 0:.1f} "
                     f"total_ms={total_llm_ms:.1f} chunks_synthesized={chunk_index} "
                     f"text='{response_text[:80].replace(chr(10), ' ')}...'"
                 )
@@ -1298,10 +1608,18 @@ async def voice_endpoint(websocket: WebSocket):
                         recent_ai_utterances = recent_ai_utterances[-15:]
                 last_ai_speech_time = time.time()
 
+                logger.info(
+                    f"[DIAG_STAGE_D_BACKEND_TO_WS] turn_id={turn_id} message_id={message_id} "
+                    f"event_type=response text_len={len(response_text)} text={response_text!r}"
+                )
                 # Send final complete text to UI
                 await websocket.send_json({
                     "type": "response",
-                    "text": response_text
+                    "text": response_text,
+                    "turn_id": turn_id,
+                    "message_id": message_id,
+                    "conversation_id": session_id,
+                    "is_final": True
                 })
 
                 # If no chunks were successfully synthesized (e.g. streaming fallback), synthesize whole response
@@ -1310,16 +1628,24 @@ async def voice_endpoint(websocket: WebSocket):
                     if clean_voice_text:
                         try:
                             audio_resp = await tts_service.synthesize_speech_async(clean_voice_text, language=current_lang)
+                            if not audio_resp:
+                                audio_resp = await tts_service.synthesize_speech_async(clean_voice_text, language=current_lang)
+
                             if audio_resp and len(audio_resp) > 100:
                                 audio_b64 = base64.b64encode(audio_resp).decode('utf-8')
                                 await websocket.send_json({"type": "state", "state": "AI_SPEAKING"})
                                 await websocket.send_json({
                                     "type": "audio",
                                     "audio": audio_b64,
-                                    "text": response_text
+                                    "text": response_text,
+                                    "turn_id": turn_id,
+                                    "message_id": message_id,
+                                    "conversation_id": session_id
                                 })
                         except Exception as e:
                             logger.error(f"Voice fallback TTS synthesis failed: {e}")
+
+                turn_tracker.record_turn(turn_id, message_id, transcription, response_text)
 
                 telemetry = tracker.log_summary()
                 await websocket.send_json({"type": "telemetry", "data": telemetry})

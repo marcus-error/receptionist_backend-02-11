@@ -114,9 +114,10 @@ class GuardrailService:
         response_text = re.sub(r'ACTIVE\s+ORGANIZATION\s+KNOWLEDGE\s+MEMORY:?', '', response_text, flags=re.IGNORECASE)
         response_text = re.sub(r'DEVELOPMENT\s*/\s*TEST\s+DATA\s+(?:ONLY)?', '', response_text, flags=re.IGNORECASE)
 
-        # Step 4: Clean Markdown formatting, double dashes (--), asterisks, brackets, and extra spaces for voice TTS
-        from src.utils.text_sanitizer import clean_markdown_for_voice
+        # Step 4: Clean Markdown formatting, double dashes (--), asterisks, brackets, extra spaces and repeated sentences for voice TTS
+        from src.utils.text_sanitizer import clean_markdown_for_voice, deduplicate_repeated_sentences
         response_text = clean_markdown_for_voice(response_text)
+        response_text = deduplicate_repeated_sentences(response_text)
 
         # Step 5: Ensure complete sentences for voice output (trim dangling words like "in", "specializing in")
         dangling_words = {

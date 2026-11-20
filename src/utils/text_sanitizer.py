@@ -45,7 +45,93 @@ def clean_markdown_for_voice(text: str) -> str:
     # 9. Collapse all multiple spaces, tab stops, and newlines into a single clean space for smooth continuous speech
     text = re.sub(r'\s+', ' ', text).strip()
 
+    # 10. Deduplicate repeated sentences or phrases within the same message
+    text = deduplicate_repeated_sentences(text)
+
     return text
+
+def deduplicate_repeated_sentences(text: str) -> str:
+    """
+    Removes duplicated sentences, repeated paragraphs, or multi-word phrases within a single AI response,
+    guaranteeing clean, non-repetitive conversational speech for both TTS and UI display.
+    """
+    if not text or not text.strip():
+        return ""
+
+    clean_text = text.strip()
+
+    # 1. Regex to collapse adjacent identical phrases (>= 12 chars)
+    collapse_pattern = r'(\b[A-Za-z0-9][^\.!\?]{12,300}?[\.!\?]?)(?:\s+\1)+'
+    prev = None
+    while prev != clean_text:
+        prev = clean_text
+        clean_text = re.sub(collapse_pattern, r'\1', clean_text, flags=re.IGNORECASE)
+
+    # 2. Multi-sentence block collapse: look for identical blocks of 20+ chars
+    clean_len = len(clean_text)
+    for length in range(clean_len // 2, 20, -1):
+        for start in range(clean_len - 2 * length + 1):
+            block1 = clean_text[start:start + length].strip()
+            block2 = clean_text[start + length:start + 2 * length].strip()
+            if len(block1) >= 20 and block1.lower() == block2.lower():
+                clean_text = clean_text[:start + length] + clean_text[start + 2 * length:]
+                clean_len = len(clean_text)
+                break
+
+    # 3. Sentence-level deduplication across the whole response with substring containment
+    sentence_matches = list(re.finditer(r'([^\.\?!]+[\.\?!]+(?:\s+|$)|[^\.\?!]+$)', clean_text))
+
+    seen_normalized = []
+    deduped_sentences = []
+
+    for match in sentence_matches:
+        sent_raw = match.group(1).strip()
+        norm = re.sub(r'[^\w\s]', '', sent_raw.lower()).strip()
+        norm = re.sub(r'\s+', ' ', norm)
+
+        if not norm:
+            continue
+
+        # Do not deduplicate tiny words like 'yes.', 'okay.', etc.
+        if len(norm.split()) <= 2 and len(norm) < 10:
+            deduped_sentences.append(sent_raw)
+            continue
+
+        # Check for duplication or substring containment with seen sentences
+        is_dup = False
+        replace_idx = None
+        for idx, seen in enumerate(seen_normalized):
+            if norm == seen:
+                is_dup = True
+                break
+            if len(norm) >= 15 and len(seen) >= 15:
+                if norm in seen:
+                    is_dup = True
+                    break
+                elif seen in norm:
+                    # Check if seen was just a small incomplete fragment (e.g. "I assist you today" vs "How else may I assist you today")
+                    if len(seen.split()) <= 5 and len(norm.split()) > len(seen.split()):
+                        replace_idx = idx
+                        break
+                    else:
+                        is_dup = True
+                        break
+
+        if is_dup:
+            continue
+
+        if replace_idx is not None:
+            seen_normalized[replace_idx] = norm
+            deduped_sentences[replace_idx] = sent_raw
+            continue
+
+        seen_normalized.append(norm)
+        deduped_sentences.append(sent_raw)
+
+    result = " ".join(deduped_sentences).strip()
+    result = re.sub(r'\s+([.!?])', r'\1', result)
+    result = re.sub(r'\s+', ' ', result)
+    return result
 
 def is_whisper_hallucination(text: str) -> bool:
     """

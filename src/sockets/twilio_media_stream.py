@@ -273,8 +273,10 @@ async def _process_utterance(websocket: WebSocket, stream_sid: str, audio_bytes:
 
     # 1. Local STT
     t0 = time.perf_counter()
+    b_sess = session.get("booking_session")
+    call_lang = getattr(b_sess, "conversation_language", "en") if b_sess else "en"
     try:
-        transcription = await stt_service.transcribe_async(wav_bytes)
+        transcription = await stt_service.transcribe_async(wav_bytes, language=call_lang)
     except Exception:
         logger.exception("STT failed")
         return

@@ -141,7 +141,10 @@ class MurfTTSService:
             return b""
 
         api_key, env_voice, env_model = self.get_credentials()
-        raw_target_voice = voice_id or env_voice or "en-IN-isha"
+        if not voice_id and language and language in MURF_LANGUAGE_VOICES:
+            raw_target_voice = MURF_LANGUAGE_VOICES[language]
+        else:
+            raw_target_voice = voice_id or env_voice or "en-IN-isha"
         raw_target_model = model or env_model or "GEN2"
         target_voice, model_version = parse_voice_and_model(raw_target_voice, raw_target_model)
 
@@ -200,12 +203,13 @@ class MurfTTSService:
 
             try:
                 req_stream = urllib.request.Request(stream_url, data=stream_payload, headers=stream_headers, method="POST")
-                with urllib.request.urlopen(req_stream, timeout=1.8) as stream_resp:
+                with urllib.request.urlopen(req_stream, timeout=3.5) as stream_resp:
                     raw_bytes = stream_resp.read()
                     if raw_bytes and len(raw_bytes) > 50:
                         try:
                             from src.services.tts_service import TTSService
                             TTSService._murf_disabled_until = 0.0
+                            TTSService._murf_consecutive_failures = 0
                         except Exception:
                             pass
                         latency_ms = int((time.time() - t0) * 1000)
@@ -261,7 +265,7 @@ class MurfTTSService:
             req_data = json.dumps(payload_dict).encode("utf-8")
             req = urllib.request.Request(url, data=req_data, headers=headers, method="POST")
 
-            with urllib.request.urlopen(req, timeout=2.0) as resp:
+            with urllib.request.urlopen(req, timeout=6.5) as resp:
                 resp_body = resp.read()
                 data = json.loads(resp_body.decode("utf-8"))
 
@@ -273,6 +277,7 @@ class MurfTTSService:
                         try:
                             from src.services.tts_service import TTSService
                             TTSService._murf_disabled_until = 0.0
+                            TTSService._murf_consecutive_failures = 0
                         except Exception:
                             pass
                         latency_ms = int((time.time() - t0) * 1000)
@@ -287,12 +292,13 @@ class MurfTTSService:
                 # Check for downloadable audio file URL
                 audio_url = data.get("audioFile") or data.get("audio_url")
                 if audio_url:
-                    with urllib.request.urlopen(audio_url, timeout=1.5) as audio_resp:
+                    with urllib.request.urlopen(audio_url, timeout=4.0) as audio_resp:
                         audio_bytes = audio_resp.read()
                         if audio_bytes and len(audio_bytes) > 50:
                             try:
                                 from src.services.tts_service import TTSService
                                 TTSService._murf_disabled_until = 0.0
+                                TTSService._murf_consecutive_failures = 0
                             except Exception:
                                 pass
                             latency_ms = int((time.time() - t0) * 1000)
