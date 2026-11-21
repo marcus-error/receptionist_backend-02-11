@@ -62,8 +62,8 @@ class LeadService:
         query = self.db.query(Lead).filter(Lead.organization_id == organization_id)
 
         # Backward compatibility filter for dialer
-        if status and status != "all":
-            query = query.filter(Lead.status == status)
+        if status and status.lower() != "all":
+            query = query.filter(func.lower(Lead.status) == status.strip().lower())
 
         # Lead status filter
         if lead_status and lead_status.lower() != "all":
@@ -146,8 +146,11 @@ class LeadService:
             "total": total,
             "page": page,
             "limit": limit,
+            "pageSize": limit,
             "total_pages": total_pages,
+            "totalPages": total_pages,
             "results": formatted,
+            "data": formatted,
         }
 
     def get_metrics(self, organization_id: int) -> Dict[str, int]:
@@ -1097,10 +1100,13 @@ class LeadService:
             "id": lead.id,
             "lead_number": lead.lead_number or f"LEAD-{lead.id:04d}",
             "customer": display_name,
+            "name": lead.name or (display_name if display_name != "Not provided" else None),
             "phone": lead.phone,
             "email": display_email,
             "call_type": lead.call_type or "Inbound",
             "call_time": lead.call_time.isoformat() if lead.call_time else None,
+            "script": lead.script,
+            "status": lead.status or "pending",
             "product_service": product_display,
             "appointment_date_time": appointment_date_time,
             "lead_status": lead.lead_status or "New",

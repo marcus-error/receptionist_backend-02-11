@@ -10,6 +10,7 @@ from src.models.department import Department, DepartmentStaff
 from src.models.lead import Lead, LeadActivity
 from src.models.webhook import Webhook, WebhookDelivery, WebhookType, WebhookDeliveryStatus
 from src.models.audit_log import PlatformAuditLog
+from src.models.block_time import BlockTime
 
 __all__ = [
     "Organization",
@@ -18,6 +19,7 @@ __all__ = [
     "StaffStatus",
     "Appointment",
     "AppointmentStatus",
+    "BlockTime",
     "CallLog",
     "AppSettings",
     "ConversationMessage",

@@ -1,4 +1,35 @@
+import html
 import re
+
+def clean_transcript_text(text: str) -> str:
+    """
+    Cleans, decodes, and normalizes transcript text for real-time speech, database storage, and frontend UI.
+    - Decodes HTML entities (e.g. &#x20;, &#32;, &nbsp;, &amp;, &lt;, &gt;, &quot;, &#39;)
+    - Eliminates any stray hex/decimal entity references (&#x20;, &#32;, &nbsp;)
+    - Normalizes non-breaking spaces (\\u00a0, \\xa0), tabs, multiple whitespace characters into single space
+    - Cleans whitespace before punctuation (e.g. "No , " -> "No,")
+    - Strips leading and trailing whitespace
+    """
+    if not text:
+        return ""
+
+    # 1. Unescape standard HTML entities
+    cleaned = html.unescape(str(text))
+
+    # 2. In case of double-escaped or literal entity artifacts
+    cleaned = re.sub(r'&#x20;?', ' ', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'&#32;?', ' ', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'&nbsp;?', ' ', cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.replace('\u00a0', ' ').replace('\xa0', ' ')
+
+    # 3. Collapse multiple whitespace chars (spaces, tabs, newlines) into a single space
+    cleaned = re.sub(r'[ \t\r\n]+', ' ', cleaned)
+
+    # 4. Clean spaces before punctuation like "No , " -> "No, "
+    cleaned = re.sub(r'\s+([,.:;?!])', r'\1', cleaned)
+
+    # 5. Strip leading and trailing whitespace
+    return cleaned.strip()
 
 def clean_markdown_for_voice(text: str) -> str:
     """

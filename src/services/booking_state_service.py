@@ -804,6 +804,9 @@ class BookingSession:
             "department": self.department,
             "service": self.service,
             "product": self.product,
+            "current_topic": getattr(self, "current_topic", None) or self.booking_data.get("current_topic"),
+            "last_discussed_product": getattr(self, "current_topic", None) or self.booking_data.get("current_topic"),
+            "_hello_repeat_count": getattr(self, "_hello_repeat_count", 0) or self.booking_data.get("_hello_repeat_count", 0),
             "industry": getattr(self, "industry", None),
             "requirement": getattr(self, "requirement", None),
             "interested_area": getattr(self, "interested_area", None),
@@ -1079,6 +1082,12 @@ def is_valid_location_candidate(
     if tokens[0] in _INVALID_WORDS and len(tokens) == 1:
         return False
     if cand_lower in _INVALID_WORDS:
+        return False
+
+    # Strictly reject time expressions (e.g. "11:20AM", "9:30 AM") or modal phrases ("I would, before, 11:20AM")
+    if re.search(r'\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b', cand_lower):
+        return False
+    if any(w in cand_lower.split() for w in ["would", "could", "should", "prefer", "before", "after", "choose", "like", "january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"]):
         return False
 
     return True
@@ -1603,7 +1612,13 @@ class BookingStateService:
             "starting", "running", "launching", "building", "operating", "business", "company",
             "startup", "firm", "retail", "manufacturing", "solution", "solutions", "application",
             "platform", "continue", "proceed", "conversation", "last", "service", "services",
-            "department", "industry", "model", "assistant", "system", "caller", "speaker", "machine", "robot", "agent"
+            "department", "industry", "model", "assistant", "system", "caller", "speaker", "machine", "robot", "agent",
+            "january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december",
+            "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+            "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+            "today", "tomorrow", "yesterday", "tonight", "morning", "afternoon", "evening", "night",
+            "date", "dated", "month", "year", "time", "timing", "slot", "slots", "clock", "am", "pm",
+            "first", "second", "third", "fourth", "fifth"
         }
         if any(w in _FORBIDDEN_NAME_TOKENS for w in words):
             return False
@@ -3178,29 +3193,36 @@ class BookingStateService:
             "nov": 11, "november": 11, "dec": 12, "december": 12
         }
         
-        # Month DD
-        m = re.search(r'(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\s+(\d{1,2})', t)
+        # Month DD (e.g. "November 21", "January 4", "January 4, 2027")
+        m = re.search(r'(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s*,?\s*(\d{4}))?', t)
         if m:
             month = month_map[m.group(1)]
             day = int(m.group(2))
+            yr = int(m.group(3)) if m.group(3) else None
             try:
-                # If date is in past this year, maybe next year? We'll just use current year.
-                d = now.replace(month=month, day=day)
-                if d < now - timedelta(days=30): 
-                    d = d.replace(year=now.year + 1)
+                if yr:
+                    d = now.replace(year=yr, month=month, day=day)
+                else:
+                    d = now.replace(month=month, day=day)
+                    if d < now - timedelta(days=30): 
+                        d = d.replace(year=now.year + 1)
                 return d.strftime("%Y-%m-%d")
             except:
                 pass
                 
-        # DD Month
-        m = re.search(r'(\d{1,2})\s+(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)', t)
+        # DD Month (e.g. "21 November", "4 January", "4 January 2027")
+        m = re.search(r'(\d{1,2})(?:st|nd|rd|th)?\s+(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)(?:\s*,?\s*(\d{4}))?', t)
         if m:
             day = int(m.group(1))
             month = month_map[m.group(2)]
+            yr = int(m.group(3)) if m.group(3) else None
             try:
-                d = now.replace(month=month, day=day)
-                if d < now - timedelta(days=30): 
-                    d = d.replace(year=now.year + 1)
+                if yr:
+                    d = now.replace(year=yr, month=month, day=day)
+                else:
+                    d = now.replace(month=month, day=day)
+                    if d < now - timedelta(days=30): 
+                        d = d.replace(year=now.year + 1)
                 return d.strftime("%Y-%m-%d")
             except:
                 pass
@@ -3872,14 +3894,21 @@ class BookingStateService:
             text_for_time = txt_lower
             text_for_time = re.sub(r'\b(?:in\s+|after\s+)?(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+days?\b', ' ', text_for_time)
             text_for_time = re.sub(r'\b\d{1,2}[,\s/-]+\d{1,2}[,\s/-]+\d{2,4}\b', ' ', text_for_time)
-            text_for_time = re.sub(r'\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?\b', ' ', text_for_time)
-            text_for_time = re.sub(r'\b\d{1,2}(?:st|nd|rd|th)?\s+(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b', ' ', text_for_time)
-            text_for_time = re.sub(r'\b(?:not\s+on|not|on|date|dated)\s+\d{1,2}(?:st|nd|rd|th)?\b', ' ', text_for_time)
+            text_for_time = re.sub(r'\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s*,?\s*\d{1,2}(?:st|nd|rd|th)?(?:\s*,?\s*\d{4})?\b', ' ', text_for_time)
+            text_for_time = re.sub(r'\b\d{1,2}(?:st|nd|rd|th)?\s*,?\s*(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:\s*,?\s*\d{4})?\b', ' ', text_for_time)
+            text_for_time = re.sub(r'\b(?:not\s+on|not|on|date|dated|number|no\.?|day)\s+\d{1,2}(?:st|nd|rd|th)?\b', ' ', text_for_time)
             text_for_time = re.sub(r'\b\d{1,2}(?:st|nd|rd|th)\b', ' ', text_for_time)
             text_for_time = re.sub(r'\b\d{4}-\d{2}-\d{2}\b', ' ', text_for_time)
             text_for_time = re.sub(r'\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b', ' ', text_for_time)
+            # If an explicit date has been determined, strip its day number if it appears isolated before time
+            known_date_val = str(extracted_date or session.date or "")
+            if known_date_val:
+                d_match = re.search(r'\b(\d{1,2})\b', known_date_val)
+                if d_match and int(d_match.group(1)) > 0:
+                    text_for_time = re.sub(r'\b' + d_match.group(1) + r'(?:st|nd|rd|th)?\b', ' ', text_for_time)
 
-            time_match = re.search(r'\b((?:1[0-2]|0?[1-9])(?:[:\-\s][0-5][0-9])?\s*(?:a\.?m\.?|p\.?m\.?))\b', text_for_time)
+            # Priority 1: Unambiguous Colon Time (e.g. "9:30 AM", "09:30", "11:20 AM", "12:30 PM", "9:30 PM")
+            colon_match = re.search(r'\b([0-2]?[0-9]):([0-5][0-9])\s*(am|pm|a\.m\.|p\.m\.)?\b', text_for_time)
             _SPOKEN_HOURS_MAP = {
                 'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5,
                 'six': 6, 'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10,
@@ -3893,10 +3922,42 @@ class BookingStateService:
             spoken_hm_match = re.search(r'\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|\d{1,2})\s+(fifteen|thirty|forty[\s\-]five|twenty|forty|fifty)\s*(am|pm|a\.m\.|p\.m\.)?\b', text_for_time)
             # Spoken hour only with AM/PM: e.g. "nine AM", "ten PM"
             spoken_h_match = re.search(r'\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s*(?:o\'clock)?\s*(am|pm|a\.m\.|p\.m\.)\b', text_for_time)
+            # Explicit hour with AM/PM (e.g. "9 AM", "11 PM", "9:00 AM", "9-30 AM")
+            time_match = re.search(r'\b((?:1[0-2]|0?[1-9])(?:[:\-][0-5][0-9])?\s*(?:a\.?m\.?|p\.?m\.?))\b', text_for_time)
 
-            if time_match:
+            if colon_match:
+                h, m = int(colon_match.group(1)), int(colon_match.group(2))
+                mer = colon_match.group(3)
+                if mer:
+                    mer_clean = "AM" if "a" in mer.lower() else "PM"
+                    if h == 12:
+                        extracted_time = f"12:{m:02d} {mer_clean}"
+                    elif h > 12:
+                        extracted_time = f"{h-12}:{m:02d} {mer_clean}"
+                    else:
+                        extracted_time = f"{h}:{m:02d} {mer_clean}"
+                else:
+                    if any(w in text_for_time for w in ["pm", "p.m", "evening", "afternoon", "night", "மாலை", "மதியம்"]):
+                        h_adj = (h - 12) if 13 <= h <= 23 else (12 if h == 12 else h)
+                        extracted_time = f"{h_adj}:{m:02d} PM"
+                    elif any(w in text_for_time for w in ["am", "a.m", "morning", "காலை"]):
+                        h_adj = 12 if h == 0 else (h if h <= 12 else h - 12)
+                        extracted_time = f"{h_adj}:{m:02d} AM"
+                    elif 13 <= h <= 23:
+                        extracted_time = f"{h-12}:{m:02d} PM"
+                    elif h == 12:
+                        extracted_time = f"12:{m:02d} PM"
+                    elif h == 0 or h == 24:
+                        extracted_time = f"12:{m:02d} AM"
+                    elif 1 <= h <= 7:
+                        extracted_time = f"{h}:{m:02d} PM"
+                    elif 8 <= h <= 11:
+                        extracted_time = f"{h}:{m:02d} AM"
+                    else:
+                        extracted_time = f"{h}:{m:02d} AM"
+            elif time_match:
                 raw_tm = time_match.group(1).replace('.', '').upper()
-                raw_tm = re.sub(r'[\-\s]([0-5][0-9])', r':\1', raw_tm) # fix dashes and spaces
+                raw_tm = re.sub(r'[\-]([0-5][0-9])', r':\1', raw_tm) # fix dashes
                 raw_tm = re.sub(r'(\d)(AM|PM)', r'\1 \2', raw_tm) # ensure space before AM/PM
                 if ':' not in raw_tm:
                     raw_tm = re.sub(r'(\d+)\s*(AM|PM)', r'\1:00 \2', raw_tm)
@@ -3932,10 +3993,10 @@ class BookingStateService:
                 mer_clean = 'AM' if 'a' in mer.lower() else 'PM'
                 extracted_time = f"{h}:00 {mer_clean}"
             else:
-                time_colon_match = re.search(r'\b(\d{1,2}[:\-\s][0-5][0-9])\s*(?:o\'clock|p\.?m\.?|a\.?m\.?)?\b', text_for_time)
-                if time_colon_match:
-                    raw_t = time_colon_match.group(1)
-                    parts = re.split(r'[:\-\s]', raw_t)
+                dash_time_match = re.search(r'\b(\d{1,2}-[0-5][0-9])\s*(?:o\'clock|p\.?m\.?|a\.?m\.?)?\b', text_for_time)
+                if dash_time_match:
+                    raw_t = dash_time_match.group(1)
+                    parts = raw_t.split('-')
                     h, m = int(parts[0]), int(parts[1])
                     if any(w in text_for_time for w in ["pm", "p.m", "evening", "afternoon", "night", "மாலை", "மதியம்"]):
                         if 1 <= h <= 12:
@@ -4030,7 +4091,12 @@ class BookingStateService:
             "looking", "wanting", "interested", "trying", "wondering", "asking",
             "starting", "launching", "building", "running", "operating", "business", "company",
             "startup", "firm", "retail", "manufacturing", "continue", "proceed", "conversation",
-            "working", "planning"
+            "working", "planning",
+            "january", "february", "march", "april", "may", "june", "july",
+            "august", "september", "october", "november", "december",
+            "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+            "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+            "today", "tomorrow", "yesterday", "morning", "afternoon", "evening", "night", "noon", "clock"
         }
 
         # 4-pre. Business Description Extraction (Must never overwrite caller name)
@@ -4042,7 +4108,7 @@ class BookingStateService:
 
         # 4a. Universal Explicit Name Statement & Correction (Evaluated unconditionally across all turns)
         explicit_name_handled = False
-        _conv_prefix = r"(?:(?:no|nope|not|wrong|actually|hey|hi|hello|well|sure|yes|yeah|ok|okay),?\s*)*"
+        _conv_prefix = r"(?:(?:no|nope|not|wrong|actually|hey|hi|hello|well|sure|yes|yeah|ok|okay|wait)[\.,!\?]?\s*)*"
         _explicit_name_patterns = [
             rf"{_conv_prefix}(?:i\s+said,?\s+)?(?:(?:my|the)\s+)?(?:full\s+|first\s+|last\s+)?name\s+(?:is|was)\s+([a-zA-Z\u0900-\u097F\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\s]+)",
             rf"{_conv_prefix}(?:how\s+much\s+)?name\s+(?:is|was)\s+([a-zA-Z\u0900-\u097F\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\s]+)",
@@ -4810,42 +4876,7 @@ class BookingStateService:
 
         # 6. Negation / Correction Handling
         if is_negation or any(w in txt_lower for w in ["change", "wrong", "mistake", "correct"]):
-            # Check if multiple fields requested to change (e.g. "change my email and appointment time")
-            req_fields = []
-            if "email" in txt_lower or "mail" in txt_lower:
-                req_fields.append("email")
-            if "time" in txt_lower or "timing" in txt_lower or "slot" in txt_lower:
-                req_fields.append("time")
-            if "date" in txt_lower or "day" in txt_lower:
-                req_fields.append("date")
-            if "phone" in txt_lower or "number" in txt_lower or "mobile" in txt_lower:
-                req_fields.append("phone")
-            if "name" in txt_lower:
-                req_fields.append("name")
-            if "location" in txt_lower or "city" in txt_lower:
-                req_fields.append("location")
-
-            if len(req_fields) > 1:
-                first_target = req_fields[0]
-                session.booking_data["pending_correction_fields"] = req_fields[1:]
-                session.booking_data["correction_field"] = first_target
-                session.state = BookingState.WAITING_FOR_CORRECTION_VALUE
-                session.last_asked_field = f"correction_{first_target}"
-                logger.info(f"[BOOKING_CORRECTION] Multiple corrections requested: {req_fields}. Prompting for {first_target}.")
-                if first_target == "email":
-                    resp = "Sure! What is your updated email address?"
-                elif first_target == "phone":
-                    resp = "Sure! What is your updated contact phone number?"
-                elif first_target == "name":
-                    resp = "Sure! What is your updated full name?"
-                elif first_target == "date":
-                    resp = "Sure! Which date would you prefer?"
-                else:
-                    resp = "Sure! What time would you prefer?"
-                self._log_conversation_turn(session, text, resp, "ask_first_of_multiple_corrections", state_before=state_before)
-                return _ret(resp)
-
-            # Check if inline value provided for a single field
+            # Priority 6a: Check if inline value was provided directly in this turn (e.g. "No, my name is Udaya")
             new_email = self.parse_spoken_email(text)
             new_phone = self.parse_spoken_phone_number(text)
             new_loc = self.parse_spoken_location(text, session=session)
@@ -4871,11 +4902,11 @@ class BookingStateService:
                 self._log_conversation_turn(session, text, resp, "phone_corrected_inline", state_before=state_before)
                 return _ret(resp)
 
-            if any(w in txt_lower for w in ["my name is", "name is", "call me", "myself", "i said"]):
+            if any(w in txt_lower for w in ["my name is", "name is", "call me", "myself", "i said"]) or getattr(session, "patient_name", None):
                 _conf_name_patterns = [
-                    r'(?:(?:no|nope|not|wrong|actually|hey|hi|hello|well|sure|yes|yeah|ok|okay),?\s*)*(?:i\s+said,?\s+)?(?:(?:my|the)\s+)?(?:full\s+|first\s+|last\s+)?name\s+(?:is|was)\s+([a-zA-Z\u0900-\u097F\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\s]+)',
-                    r'(?:(?:no|nope|not|wrong|actually|hey|hi|hello|well|sure|yes|yeah|ok|okay),?\s*)*(?:you\s+can\s+call\s+me|call\s+me)\s+([a-zA-Z\u0900-\u097F\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\s]+)',
-                    r'(?:(?:no|nope|not|wrong|actually|hey|hi|hello|well|sure|yes|yeah|ok|okay),?\s*)*(?:i\s+said)\s+([a-zA-Z\u0900-\u097F\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\s]+)',
+                    r'(?:(?:no|nope|not|wrong|actually|hey|hi|hello|well|sure|yes|yeah|ok|okay|wait)[\.,!\?]?\s*)*(?:i\s+said,?\s+)?(?:(?:my|the)\s+)?(?:full\s+|first\s+|last\s+)?name\s+(?:is|was)\s+([a-zA-Z\u0900-\u097F\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\s]+)',
+                    r'(?:(?:no|nope|not|wrong|actually|hey|hi|hello|well|sure|yes|yeah|ok|okay|wait)[\.,!\?]?\s*)*(?:you\s+can\s+call\s+me|call\s+me)\s+([a-zA-Z\u0900-\u097F\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\s]+)',
+                    r'(?:(?:no|nope|not|wrong|actually|hey|hi|hello|well|sure|yes|yeah|ok|okay|wait)[\.,!\?]?\s*)*(?:i\s+said)\s+([a-zA-Z\u0900-\u097F\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\s]+)',
                 ]
                 for c_pat in _conf_name_patterns:
                     m_c = re.search(c_pat, text, re.IGNORECASE)
@@ -4893,6 +4924,41 @@ class BookingStateService:
                             resp = _build_summary_prompt()
                             self._log_conversation_turn(session, text, resp, "name_corrected_inline", state_before=state_before)
                             return _ret(resp)
+
+            # Priority 6b: Check if multiple fields were named to change (using strict word boundaries)
+            req_fields = []
+            if re.search(r'\b(?:email|mail|e-mail)\b', txt_lower):
+                req_fields.append("email")
+            if re.search(r'\b(?:time|timing|slot|slots)\b', txt_lower):
+                req_fields.append("time")
+            if re.search(r'\b(?:date|day|days)\b', txt_lower):
+                req_fields.append("date")
+            if re.search(r'\b(?:phone|mobile|number|contact)\b', txt_lower):
+                req_fields.append("phone")
+            if re.search(r'\b(?:name|names|fullname)\b', txt_lower):
+                req_fields.append("name")
+            if re.search(r'\b(?:location|city|address|place)\b', txt_lower):
+                req_fields.append("location")
+
+            if len(req_fields) > 1:
+                first_target = req_fields[0]
+                session.booking_data["pending_correction_fields"] = req_fields[1:]
+                session.booking_data["correction_field"] = first_target
+                session.state = BookingState.WAITING_FOR_CORRECTION_VALUE
+                session.last_asked_field = f"correction_{first_target}"
+                logger.info(f"[BOOKING_CORRECTION] Multiple corrections requested: {req_fields}. Prompting for {first_target}.")
+                if first_target == "email":
+                    resp = "Sure! What is your updated email address?"
+                elif first_target == "phone":
+                    resp = "Sure! What is your updated contact phone number?"
+                elif first_target == "name":
+                    resp = "Sure! What is your updated full name?"
+                elif first_target == "date":
+                    resp = "Sure! Which date would you prefer?"
+                else:
+                    resp = "Sure! What time would you prefer?"
+                self._log_conversation_turn(session, text, resp, "ask_first_of_multiple_corrections", state_before=state_before)
+                return _ret(resp)
 
             # Check if caller named a single field to change (e.g. "Email." or "Change my email" or "My phone number")
             if any(w in norm_words for w in ["email", "mail"]):
@@ -6380,6 +6446,109 @@ class BookingStateService:
             self._log_conversation_turn(session, text, resp, "waiting_for_exact_date_in_month", state_before=state_before)
             return _ret(resp)
 
+        # Immediate Past-Date and Past-Time Validation
+        if session.date and session.date.lower().strip() not in _MONTH_NAMES:
+            try:
+                from src.routes.availability_routes import get_current_business_datetime
+                from src.services.calendar_verification_service import calendar_verification_service
+                now_dt = get_current_business_datetime(org_id=getattr(session, "organization_id", 1), db=None)
+                today_date = now_dt.date()
+                parsed_d = calendar_verification_service.parse_date(session.date)
+                if parsed_d < today_date:
+                    past_d_str = parsed_d.strftime("%d %b %Y")
+                    session.date = None
+                    session.time = None
+                    session.state = BookingState.WAITING_FOR_DATE
+                    session.last_asked_field = "date"
+                    if lang in ("ta", "tanglish", "ta_mix"):
+                        resp = f"மன்னிக்கவும், {past_d_str} தேதி ஏற்கனவே முடிந்துவிட்டது. தயவுசெய்து இன்று அல்லது வரவிருக்கும் தேதியைத் தேர்ந்தெடுக்கவும்."
+                    elif lang == "hi":
+                        resp = f"Kshama kijiye, {past_d_str} tareekh guzar chuki hai. Kripya aaj ya aane wali tareekh chunein."
+                    else:
+                        resp = f"Sorry, {past_d_str} has already passed. Please choose today or an upcoming date for your appointment."
+                    self._log_conversation_turn(session, text, resp, "past_date_rejected", state_before=state_before)
+                    return _ret(resp)
+
+                # Immediate Past-Time Validation on Today's Date
+                if parsed_d == today_date and session.time:
+                    target_time_24h = calendar_verification_service.parse_time_to_24h(session.time)
+                    if target_time_24h:
+                        naive_now = now_dt.replace(tzinfo=None) if now_dt.tzinfo else now_dt
+                        target_t_obj = datetime.strptime(target_time_24h, "%H:%M").time()
+                        target_slot_dt = datetime.combine(today_date, target_t_obj)
+                        if target_slot_dt <= naive_now:
+                            requested_time = session.time
+                            session.time = None
+                            session.availability_verified = False
+                            session.state = BookingState.WAITING_FOR_TIME
+                            session.last_asked_field = "time"
+
+                            from src.config.database import SessionLocal
+                            from src.models.staff import Staff, StaffStatus
+                            from src.routes.availability_routes import get_available_slots, find_next_available_slots
+
+                            db_slots = SessionLocal()
+                            try:
+                                staff_id_val = session.doctor_id
+                                if not staff_id_val:
+                                    st_rec = db_slots.query(Staff).filter(
+                                        Staff.organization_id == getattr(session, "organization_id", 1),
+                                        Staff.status != StaffStatus.OFFLINE,
+                                        Staff.online_booking_enabled == True
+                                    ).first()
+                                    if not st_rec:
+                                        st_rec = db_slots.query(Staff).filter(Staff.organization_id == getattr(session, "organization_id", 1)).first()
+                                    staff_id_val = st_rec.id if st_rec else 1
+
+                                rem_res = get_available_slots(staff_id=staff_id_val, selected_date=today_date, db=db_slots)
+                                rem_slots = [calendar_verification_service.format_time_12h(s["start"]) for s in rem_res.get("available_slots", [])[:4]]
+                            except Exception as slot_err:
+                                logger.warning(f"Error fetching remaining slots for past time: {slot_err}")
+                                rem_slots = []
+                            finally:
+                                db_slots.close()
+
+                            if rem_slots:
+                                session.offered_slots = rem_slots
+                                alt_text = ", ".join(rem_slots)
+                                resp = f"Sorry, {requested_time} is no longer available because that time has passed. Today's available slots are {alt_text}. Which time would you prefer?"
+                                if lang in ("ta", "tanglish", "ta_mix"):
+                                    resp = f"மன்னிக்கவும், {requested_time} நேரம் முடிந்துவிட்டது. இன்றைக்கு available slots: {alt_text}. இதில எந்த நேரம் வசதியாக இருக்கும்?"
+                                elif lang == "hi":
+                                    resp = f"Kshama kijiye, {requested_time} ka samay nikal chuka hai. Aaj ke available slots hain: {alt_text}. Aap konsa samay pasand karenge?"
+                            else:
+                                db_next = SessionLocal()
+                                try:
+                                    next_date_obj, next_slots_list = find_next_available_slots(staff_id=staff_id_val, from_date=today_date, db=db_next)
+                                    next_date_str = next_date_obj.strftime("%A, %b %d") if next_date_obj else None
+                                    next_slots_12h = [calendar_verification_service.format_time_12h(s["start"]) for s in next_slots_list[:4]] if next_slots_list else []
+                                    next_slots_str = ", ".join(next_slots_12h) if next_slots_12h else ""
+                                except Exception:
+                                    next_date_str = None
+                                    next_slots_str = ""
+                                finally:
+                                    db_next.close()
+
+                                if next_date_str and next_slots_str:
+                                    session.offered_slots = next_slots_12h
+                                    resp = f"Sorry, {requested_time} is no longer available because that time has passed, and there are no remaining slots available today. The next available date is {next_date_str} with slots at {next_slots_str}. Which time would you prefer?"
+                                    if lang in ("ta", "tanglish", "ta_mix"):
+                                        resp = f"மன்னிக்கவும், {requested_time} நேரம் முடிந்துவிட்டது, இன்றைக்கு வேறு slots இல்லை. அடுத்த available date {next_date_str}, available slots: {next_slots_str}. இதில எந்த நேரம் வசதியாக இருக்கும்?"
+                                    elif lang == "hi":
+                                        resp = f"Kshama kijiye, {requested_time} ka samay nikal chuka hai aur aaj koi slots available nahi hain. Agli available date {next_date_str} hai jisme slots hain: {next_slots_str}. Aap konsa samay pasand karenge?"
+                                else:
+                                    session.offered_slots = []
+                                    resp = f"Sorry, {requested_time} is no longer available because that time has passed, and there are no remaining slots available today. Would you like to check tomorrow or another date?"
+                                    if lang in ("ta", "tanglish", "ta_mix"):
+                                        resp = f"மன்னிக்கவும், {requested_time} நேரம் முடிந்துவிட்டது, இன்றைக்கு வேறு slots இல்லை. நாளை அல்லது வேறு date check பண்ணலாமா?"
+                                    elif lang == "hi":
+                                        resp = f"Kshama kijiye, {requested_time} ka samay nikal chuka hai aur aaj koi slots available nahi hain. Kya aap kal ya koi aur date check karna chahenge?"
+
+                            self._log_conversation_turn(session, text, resp, "past_time_rejected", state_before=state_before)
+                            return _ret(resp)
+            except Exception as d_err:
+                logger.warning(f"Error checking past date/time: {d_err}")
+
         # STEP 3: Time Check (Proactively query & present live Calendar slots)
         if not session.time:
             session.state = BookingState.WAITING_FOR_TIME
@@ -6448,8 +6617,8 @@ class BookingStateService:
                 return _ret(resp)
 
         # STEP 4: Live Exact Slot Availability Check (Stage 1 Verification)
-        target_entity_name = session.doctor or session.service
-        if target_entity_name and session.date and session.time and not session.availability_verified:
+        target_entity_name = session.doctor or session.service or "Representative"
+        if session.date and session.time and not session.availability_verified:
             try:
                 from src.services.calendar_verification_service import calendar_verification_service
                 query_str = f"Appointment with {target_entity_name} on {session.date} at {session.time}"
@@ -6564,21 +6733,34 @@ class BookingStateService:
                 else:
                     resp = "Could you please tell me your full name for the booking?"
             else:
-                if for_other:
-                    resp = f"{session.time} is available {target_str} on {session.date}. May I please have your {rel}'s full name for the booking?"
+                if session.availability_verified:
+                    if for_other:
+                        resp = f"{session.time} is available {target_str} on {session.date}. May I please have your {rel}'s full name for the booking?"
+                    else:
+                        resp = f"{session.time} is available {target_str} on {session.date}. May I please have your full name for the booking?"
                 else:
-                    resp = f"{session.time} is available {target_str} on {session.date}. May I please have your full name for the booking?"
+                    if for_other:
+                        resp = f"May I please have your {rel}'s full name for the booking?"
+                    else:
+                        resp = "Could you please tell me your full name for the booking?"
             if lang in ("ta", "tanglish", "ta_mix"):
                 target_ta = session.doctor or session.service or "appointment"
-                if for_other:
-                    resp = f"{session.time} slot available-ஆ இருக்கு {target_ta}-கூட {session.date}-ல. Booking-க்கு உங்க {rel} full name சொல்லுங்க."
+                if session.availability_verified:
+                    if for_other:
+                        resp = f"{session.time} slot available-ஆ இருக்கு {target_ta}-கூட {session.date}-ல. Booking-க்கு உங்க {rel} full name சொல்லுங்க."
+                    else:
+                        resp = f"{session.time} slot available-ஆ இருக்கு {target_ta}-கூட {session.date}-ல. Booking-க்கு உங்க full name சொல்லுங்க."
                 else:
-                    resp = f"{session.time} slot available-ஆ இருக்கு {target_ta}-கூட {session.date}-ல. Booking-க்கு உங்க full name சொல்லுங்க."
+                    resp = f"Booking-க்கு உங்க full name சொல்லுங்க."
             elif lang == "hi":
                 target_hi = session.doctor or session.service or "appointment"
-                if for_other:
-                    resp = f"{session.time} slot {session.date} ko {target_hi} ke liye available hai. Kripya apne {rel} ka poora naam batayein?"
+                if session.availability_verified:
+                    if for_other:
+                        resp = f"{session.time} slot {session.date} ko {target_hi} ke liye available hai. Kripya apne {rel} ka poora naam batayein?"
+                    else:
+                        resp = f"{session.time} slot {session.date} ko {target_hi} ke liye available hai. Kripya apna poora naam batayein?"
                 else:
+                    resp = "Kripya apna poora naam batayein?"
                     resp = f"{session.time} slot {session.date} ko {target_hi} ke liye available hai. Kripya apna poora naam batayein?"
             self._log_conversation_turn(session, text, resp, "waiting_for_patient_name", state_before=state_before)
             return _ret(resp)
@@ -6654,6 +6836,9 @@ class BookingStateService:
 
             # Check if customer declines email or says they do not have one
             decline_phrases = [
+                "skip and continue without invite", "continue without invite", "without invite",
+                "no invite", "without calendar invite", "no calendar invite", "dont send invite",
+                "don't send invite", "skip invite", "proceed without invite", "skip and continue",
                 "no email", "don't have an email", "don't have email", "no mail", 
                 "i don't have an email", "i don't have one", "skip", "decline", 
                 "not now", "later", "none", "don't want to", "no thanks",
@@ -6665,6 +6850,9 @@ class BookingStateService:
             if is_explicit_decline:
                 session.booking_data["email_declined"] = True
                 session.booking_data["email_confirmed"] = False
+                session.booking_data["send_calendar_invite"] = False
+                session.booking_data["calendar_invite_skipped"] = True
+                session.booking_data["email_skipped"] = True
                 session.email = None
                 # Continue directly to confirmation (Step 8) without email
             else:
@@ -6959,6 +7147,46 @@ class BookingStateService:
 
             db = SessionLocal()
             try:
+                # Authoritative Pre-Commit Past-Date & Past-Time Check
+                from datetime import timedelta
+                from src.routes.availability_routes import get_current_business_datetime, get_available_slots
+                now_dt = get_current_business_datetime(org_id=org_id, db=db)
+                current_date = now_dt.date()
+                naive_now = now_dt.replace(tzinfo=None) if now_dt.tzinfo else now_dt
+
+                if target_date_obj < current_date:
+                    logger.warning(f"[PAST_DATE_PREVENTION] Pre-commit rejected past date: {target_date_obj} < {current_date}")
+                    session.date = None
+                    session.time = None
+                    session.state = BookingState.WAITING_FOR_DATE
+                    session.last_asked_field = "date"
+                    return f"Sorry, {normalized_date_str} has already passed. Please choose today or an upcoming date for your appointment."
+
+                try:
+                    slot_t_obj = datetime.strptime(time_24h, "%H:%M").time()
+                    slot_datetime_obj = datetime.combine(target_date_obj, slot_t_obj)
+                    is_past_time_today = (target_date_obj == current_date and slot_datetime_obj <= naive_now)
+                except Exception:
+                    is_past_time_today = False
+
+                staff_rec = db.query(Staff).filter(Staff.name.ilike(f"%{doctor_name}%")).first() if doctor_name else None
+                staff_id_val = staff_rec.id if staff_rec else (session.doctor_id or 1)
+
+                if is_past_time_today:
+                    logger.warning(f"[PAST_TIME_PREVENTION] Pre-commit rejected past slot: {target_date_obj} {normalized_time_str} <= {naive_now}")
+                    session.time = None
+                    session.availability_verified = False
+                    session.state = BookingState.WAITING_FOR_TIME
+                    session.last_asked_field = "time"
+                    rem_slots_res = get_available_slots(staff_id=staff_id_val, selected_date=target_date_obj, db=db)
+                    rem_slots = [calendar_verification_service.format_time_12h(s["start"]) for s in rem_slots_res.get("available_slots", [])[:4]]
+                    if rem_slots:
+                        session.offered_slots = rem_slots
+                        alt_text = ", ".join(rem_slots)
+                        return f"Sorry, {normalized_time_str} is no longer available because that time has passed. Today's available slots are {alt_text}. Which time would you prefer?"
+                    else:
+                        return f"Sorry, {normalized_time_str} is no longer available because that time has passed, and there are no remaining slots available today. Would you like to check tomorrow or another date?"
+
                 # 1. Recheck selected slot availability and existing duplicates
                 t_avail0 = time.time()
                 existing_for_customer = db.query(Appointment).filter(
@@ -6987,49 +7215,41 @@ class BookingStateService:
                         )
                     session.confirmation_message = resp_text
                     session.confirmed_appointment_id = existing_for_customer.id
-                    logger.info(
-                        f"\n[BOOKING_CONFIRMATION]"
-                        f"\n  confirmation_count={session.confirmation_count}"
-                        f"\n  playback_status=QUEUED"
-                        f"\n  appointment_id={existing_for_customer.id}"
-                        f"\n  booking_status=CONFIRMED"
-                        f"\n  calendar_sync_status={getattr(existing_for_customer, 'calendar_sync_status', 'PENDING')}"
-                        f"\n  email_notification_status={getattr(existing_for_customer, 'email_status', 'PENDING')}"
-                        f"\n  whatsapp_notification_status={getattr(existing_for_customer, 'whatsapp_status', 'PENDING')}"
-                        f"\n  customer={self._mask_pii(session.patient_name)}"
-                        f"\n  phone={self._mask_pii(session.contact_number)}"
-                    )
                     return resp_text
 
-                # Authoritative Pre-Commit Past-Time Check
-                from src.routes.availability_routes import get_current_business_datetime, get_available_slots
-                now_dt = get_current_business_datetime(org_id=org_id, db=db)
-                current_date = now_dt.date()
-                naive_now = now_dt.replace(tzinfo=None) if now_dt.tzinfo else now_dt
+                # Authoritative Pre-Commit Block-Time Check
+                from src.models.block_time import BlockTime
+                from src.routes.availability_routes import _normalize_name
+                slot_start_dt = datetime.combine(target_date_obj, slot_t_obj)
+                slot_end_dt = slot_start_dt + timedelta(minutes=30)
+                block_conflicts = db.query(BlockTime).filter(
+                    BlockTime.start_datetime < slot_end_dt,
+                    BlockTime.end_datetime > slot_start_dt,
+                    (BlockTime.organization_id == org_id) | (BlockTime.organization_id.is_(None))
+                ).all()
+                is_slot_blocked = False
+                for bt in block_conflicts:
+                    if bt.staff_id and staff_rec and bt.staff_id != staff_rec.id:
+                        continue
+                    if bt.staff_name and doctor_name and _normalize_name(bt.staff_name) != _normalize_name(doctor_name):
+                        continue
+                    is_slot_blocked = True
+                    break
 
-                try:
-                    slot_t_obj = datetime.strptime(time_24h, "%H:%M").time()
-                    slot_datetime_obj = datetime.combine(target_date_obj, slot_t_obj)
-                    is_past_commit = (target_date_obj < current_date) or (target_date_obj == current_date and slot_datetime_obj <= naive_now)
-                except Exception:
-                    is_past_commit = False
-
-                if is_past_commit:
-                    logger.warning(f"[PAST_TIME_PREVENTION] Pre-commit rejected past slot: {target_date_obj} {normalized_time_str} <= {naive_now}")
+                if is_slot_blocked:
+                    logger.warning(f"[BLOCK_TIME_PREVENTION] Pre-commit rejected blocked slot: {target_date_obj} {normalized_time_str}")
                     session.time = None
                     session.availability_verified = False
                     session.state = BookingState.WAITING_FOR_TIME
                     session.last_asked_field = "time"
-                    staff_rec = db.query(Staff).filter(Staff.name.ilike(f"%{doctor_name}%")).first() if doctor_name else None
-                    staff_id_val = staff_rec.id if staff_rec else (session.doctor_id or 1)
                     rem_slots_res = get_available_slots(staff_id=staff_id_val, selected_date=target_date_obj, db=db)
                     rem_slots = [calendar_verification_service.format_time_12h(s["start"]) for s in rem_slots_res.get("available_slots", [])[:4]]
                     if rem_slots:
                         session.offered_slots = rem_slots
                         alt_text = ", ".join(rem_slots)
-                        return f"Sorry, {normalized_time_str} is no longer available because that time has passed. Today's available slots are {alt_text}. Which time would you prefer?"
+                        return f"Sorry, {normalized_time_str} is blocked and unavailable for booking. Other available slots on {normalized_date_str} are {alt_text}. Which time would you prefer?"
                     else:
-                        return f"Sorry, {normalized_time_str} is no longer available because that time has passed, and there are no remaining slots available today. Would you like to check tomorrow or another date?"
+                        return f"Sorry, {normalized_time_str} is blocked and unavailable for booking, and there are no other slots open on {normalized_date_str}. Would you like to check tomorrow or another date?"
 
                 # Race condition check: slot taken by another customer right before commit
                 conflict = db.query(Appointment).filter(

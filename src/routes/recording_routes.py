@@ -26,19 +26,27 @@ def list_call_recordings(
     end_date: Optional[str] = None,
     search: Optional[str] = None,
     call_type: Optional[str] = Query(None, description="Filter by call direction: 'all', 'inbound', 'outbound'"),
+    page: Optional[int] = Query(None, ge=1, description="Page number (starts at 1)"),
+    limit: Optional[int] = Query(None, ge=1, le=500, description="Items per page"),
+    pageSize: Optional[int] = Query(None, ge=1, le=500, description="Alias for limit"),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_permission("recordings"))
 ):
     """List real call recordings with period and call direction filtering and multi-tenant organization boundaries."""
     svc = RecordingService(db)
     org_id = None if current_user.role == "super_admin" else current_user.organization_id
+    eff_limit = limit or pageSize
+    if page is not None and eff_limit is None:
+        eff_limit = 10
     return svc.list_recordings(
         organization_id=org_id,
         period=period,
         start_date=start_date,
         end_date=end_date,
         search=search,
-        call_type=call_type
+        call_type=call_type,
+        page=page,
+        limit=eff_limit,
     )
 
 

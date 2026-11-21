@@ -333,13 +333,16 @@ class AgentEngine:
 
         # Appointment Cancellation
         if intent_name == "appointment_cancellation":
-            appt_id_match = re.search(r'\b(?:id|appointment\s+id|appointment\s*#|#)\s*(\d+)\b', user_text, re.IGNORECASE)
-            target_id = int(appt_id_match.group(1)) if appt_id_match else booking_session.appointment_id
-            if target_id:
-                res = cancel_appointment(target_id)
-                cancel_msg = res.get("message", f"Appointment #{target_id} has been cancelled.")
-            else:
-                cancel_msg = "Please provide your appointment ID so I can cancel your booking."
+            from src.services.cancellation_service import cancellation_service
+            cancel_res = cancellation_service.handle_cancellation(
+                utterance=user_text,
+                caller_phone=booking_session.contact_number if booking_session else None,
+                caller_name=booking_session.patient_name if booking_session else None,
+                session=booking_session,
+                organization_id=organization_id,
+                language=current_lang
+            )
+            cancel_msg = cancel_res.get("response", "Your cancellation request has been processed.")
 
             self._log_turn(session_id, user_text, cancel_msg, "appointment_cancellation", booking_session, channel=channel, emotion=emotion)
             post_eval = booking_state_service.evaluate_post_response(booking_session)

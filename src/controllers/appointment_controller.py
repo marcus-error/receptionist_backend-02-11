@@ -1,6 +1,6 @@
-from typing import List, Optional
+from typing import List, Optional, Union
 
-from fastapi import Depends
+from fastapi import Depends, Query
 from sqlalchemy.orm import Session
 
 from src.config.database import get_db
@@ -19,11 +19,27 @@ def _get_org_id(user: Optional[User]) -> Optional[int]:
 
 
 def list_appointments(
+    page: Optional[int] = Query(None, ge=1, description="Page number (starts at 1)"),
+    limit: Optional[int] = Query(None, ge=1, le=500, description="Items per page"),
+    pageSize: Optional[int] = Query(None, ge=1, le=500, description="Alias for limit"),
+    search: Optional[str] = Query(None, description="Search query"),
+    status: Optional[str] = Query(None, description="Status filter"),
+    time_filter: Optional[str] = Query(None, description="Time filter: all, today, weekly, monthly"),
     current_user: Optional[User] = Depends(get_current_user),
     db: Session = Depends(get_db)
-) -> List[AppointmentOut]:
+):
     org_id = _get_org_id(current_user)
-    return AppointmentService(db).list_appointments(organization_id=org_id)
+    effective_limit = limit or pageSize
+    if page is not None and effective_limit is None:
+        effective_limit = 10
+    return AppointmentService(db).list_appointments(
+        organization_id=org_id,
+        page=page,
+        limit=effective_limit,
+        search=search,
+        status=status,
+        time_filter=time_filter,
+    )
 
 
 def get_appointment(

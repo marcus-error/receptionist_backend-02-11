@@ -102,3 +102,15 @@ class AppointmentOut(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
+
+class PaginatedAppointmentsOut(BaseModel):
+    data: list[AppointmentOut]
+    total: int
+    page: int
+    pageSize: int
+    limit: int
+    totalPages: int
+    total_pages: int
+
+    model_config = ConfigDict(from_attributes=True)
+

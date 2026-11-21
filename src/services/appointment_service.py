@@ -1,6 +1,7 @@
 import logging
+import math
 from datetime import date, datetime
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
@@ -24,8 +25,38 @@ class AppointmentService:
         self.db = db
         self.repo = AppointmentRepository(db)
 
-    def list_appointments(self, organization_id: Optional[int] = None) -> List[Appointment]:
-        return self.repo.get_all(organization_id=organization_id)
+    def list_appointments(
+        self,
+        organization_id: Optional[int] = None,
+        page: Optional[int] = None,
+        limit: Optional[int] = None,
+        search: Optional[str] = None,
+        status: Optional[str] = None,
+        time_filter: Optional[str] = None,
+    ) -> Union[List[Appointment], dict]:
+        res = self.repo.get_all(
+            organization_id=organization_id,
+            page=page,
+            limit=limit,
+            search=search,
+            status=status,
+            time_filter=time_filter,
+        )
+        if page is not None or limit is not None:
+            records, total = res
+            page_val = page or 1
+            limit_val = limit or 10
+            total_pages = max(1, math.ceil(total / limit_val)) if total > 0 else 1
+            return {
+                "data": records,
+                "total": total,
+                "page": page_val,
+                "pageSize": limit_val,
+                "limit": limit_val,
+                "totalPages": total_pages,
+                "total_pages": total_pages,
+            }
+        return res
 
     def get_appointment(self, appointment_id: int, organization_id: Optional[int] = None) -> Appointment:
         appointment = self.repo.get_by_id(appointment_id, organization_id=organization_id)
@@ -311,6 +342,68 @@ class AppointmentService:
 
         if organization_id is not None:
             data["organization_id"] = organization_id
+
+        # Centralized Authoritative Pre-Commit Validation:
+        # 1. Past Date & Past Time Check
+        from datetime import timedelta
+        from src.routes.availability_routes import get_current_business_datetime, _normalize_name
+        now_dt = get_current_business_datetime(org_id=data.get("organization_id", 1), db=self.db)
+        today_date = now_dt.date()
+        naive_now = now_dt.replace(tzinfo=None) if now_dt.tzinfo else now_dt
+
+        # Parse appointment start and end datetimes
+        from src.services.calendar_verification_service import calendar_verification_service
+        appt_date_obj = calendar_verification_service.parse_date(data.get("appointment_date"))
+        t24 = calendar_verification_service.parse_time_to_24h(data.get("appointment_time")) or "10:00"
+        appt_time_obj = datetime.strptime(t24, "%H:%M").time()
+        start_dt = datetime.combine(appt_date_obj, appt_time_obj)
+
+        minutes = 30
+        import re
+        match = re.search(r"\d+", data.get("duration") or "")
+        if match:
+            minutes = int(match.group())
+        end_dt = start_dt + timedelta(minutes=minutes)
+
+        if appt_date_obj < today_date:
+            raise HTTPException(status_code=400, detail="Cannot book appointments on past dates.")
+
+        if appt_date_obj == today_date and start_dt <= naive_now:
+            formatted_t = calendar_verification_service.format_time_12h(t24)
+            raise HTTPException(status_code=400, detail=f"Cannot book appointments for past times. Slot {formatted_t} has already passed today.")
+
+        # 2. Block Time Check
+        from src.models.block_time import BlockTime
+        block_query = self.db.query(BlockTime).filter(
+            BlockTime.start_datetime < end_dt,
+            BlockTime.end_datetime > start_dt,
+        )
+        if data.get("organization_id"):
+            block_query = block_query.filter(
+                (BlockTime.organization_id == data["organization_id"]) | (BlockTime.organization_id.is_(None))
+            )
+        staff_str = data.get("staff", "")
+        for bt in block_query.all():
+            if bt.staff_id:
+                staff_rec = self._find_staff(staff_str)
+                if staff_rec and bt.staff_id != staff_rec.id:
+                    continue
+            if bt.staff_name and staff_str:
+                if _normalize_name(bt.staff_name) != _normalize_name(staff_str):
+                    continue
+            raise HTTPException(status_code=409, detail="Selected appointment time is blocked and unavailable for booking.")
+
+        # 3. Existing Appointment Collision Check
+        existing_conflict = self.db.query(Appointment).filter(
+            Appointment.staff == staff_str,
+            Appointment.appointment_date == data.get("appointment_date"),
+            Appointment.appointment_time == data.get("appointment_time"),
+            Appointment.status != AppointmentStatus.CANCELLED
+        )
+        if data.get("organization_id"):
+            existing_conflict = existing_conflict.filter(Appointment.organization_id == data["organization_id"])
+        if existing_conflict.first():
+            raise HTTPException(status_code=409, detail="Selected appointment time is already booked.")
 
         # Ensure customer_id is assigned
         if not data.get("customer_id"):

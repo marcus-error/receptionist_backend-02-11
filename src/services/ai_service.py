@@ -311,6 +311,31 @@ class AIService:
                 "   - Do not invent services or assume any specific business domain outside what is described in the active records.\n\n"
             )
 
+        # Dynamic server date, time, and timezone
+        try:
+            from src.routes.availability_routes import get_current_business_datetime
+            from src.config.env import settings
+            now_dt = get_current_business_datetime(org_id=None, db=None)
+            curr_date_str = now_dt.strftime("%A, %d %B %Y")
+            curr_time_str = now_dt.strftime("%I:%M %p")
+            tz_name = getattr(settings, "BUSINESS_TIMEZONE", "Asia/Kolkata")
+        except Exception:
+            curr_date_str = "Current Date"
+            curr_time_str = "Current Time"
+            tz_name = "Business Timezone"
+
+        time_and_booking_rule = (
+            f"\n13. DYNAMIC REAL-TIME SERVER CLOCK & STRICT PAST-TIME VALIDATION:\n"
+            f"   - Current real-time server date: {curr_date_str}\n"
+            f"   - Current real-time server time: {curr_time_str} ({tz_name})\n"
+            f"   - Today is strictly {curr_date_str}. Any date before today is in the PAST and CANNOT be booked.\n"
+            f"   - If the caller requests a time on today's date that is before or equal to {curr_time_str}, that time has ALREADY PASSED.\n"
+            f"   - ABSOLUTE APPOINTMENT CONFIRMATION BAN:\n"
+            f"     * NEVER say 'Your appointment is confirmed', 'I\\'ve noted your appointment for today at [time]', 'I have booked your appointment', or pretend a slot is booked.\n"
+            f"     * You have NO direct authority to confirm appointments or declare slots available without backend calendar engine validation.\n"
+            f"     * If the caller requests an appointment, invite them to confirm their requested date and time or provide details, but NEVER pretend the appointment is already booked or confirmed.\n"
+        )
+
         return (
             f"{lang_directive}You are an AI Receptionist for {org_title}. Your primary responsibility is to maintain complete conversation continuity throughout the entire call, understand caller speech accurately, retrieve correct RAG information, and prompt ONLY for remaining missing details.\n\n"
             f"{rag_mode_directive}"
@@ -364,7 +389,17 @@ class AIService:
             "     * Ask ONLY for fields that are missing. NEVER ask for details already provided or validated.\n"
             "     * Final response format after collecting details: 'Thank you, [Customer Name]. I\'ve noted your contact details and requirements. Our team will contact you to discuss your [Requirement]. Is there anything else I can help you with?'\n"
             "     * NEVER mention a calendar invite or schedule an appointment for callback/contact requests.\n"
-            "   - SEPARATE APPOINTMENT BOOKING: Only activate appointment booking when the customer explicitly says they want to book/schedule an appointment, meeting, or demo with a date and time (e.g., 'Book a meeting tomorrow', 'Schedule a demo at 3 PM', 'I want to schedule an appointment')."
+            "   - SEPARATE APPOINTMENT BOOKING: Only activate appointment booking when the customer explicitly says they want to book/schedule an appointment, meeting, or demo with a date and time (e.g., 'Book a meeting tomorrow', 'Schedule a demo at 3 PM', 'I want to schedule an appointment').\n\n"
+            "14. PRODUCT ENQUIRIES & ELLIPTICAL QUESTIONS CONTEXT RESOLUTION:\n"
+            "   - When the caller asks follow-up or elliptical questions (e.g. 'What are the advantages?', 'How much does it cost?', 'Can you explain more?', 'What are the features?', 'How does it work?'):\n"
+            "     * You MUST ALWAYS resolve these questions to the specific product or service previously discussed in the conversation (such as Galaxy Chat, AI Voice Agent, CRM, ERP, Custom Software).\n"
+            "     * NEVER ask 'Advantages of what?' or act unaware of the product under discussion.\n"
+            "     * Provide a clear, natural explanation of the features and benefits from the active knowledge base.\n"
+            "   - Do NOT immediately force the caller into an appointment booking while they are exploring product information.\n\n"
+            "15. CONNECTION CHECKS & CORRECTION HANDLING:\n"
+            "   - If the caller says 'Hello?', 'Are you there?', or pauses, smoothly reassure them and continue the topic without restarting.\n"
+            "   - If the caller corrects their name (e.g. 'No, my name is Udaya'), acknowledge and adopt the corrected name immediately. NEVER address the customer by a date or month name (such as 'January').\n"
+            + time_and_booking_rule
             + continuity_rule
         )
 
@@ -377,7 +412,8 @@ class AIService:
         booking_session=None,
         has_context: bool = False,
         call_direction: str = "INBOUND",
-        conversation_language: str = "en"
+        conversation_language: str = "en",
+        session_history: Optional[list] = None
     ) -> str | None:
         """
         Sub-50ms rule-based responses for common conversational pleasantries and basic identity questions.
@@ -636,36 +672,104 @@ class AIService:
             "doctor", "doctors", "department", "hospital", "clinic", "timing", "hours"
         }
         is_pure_greeting = (txt_clean in greetings or intent == "greeting") and not any(w in txt_clean.split() for w in question_or_entity_words)
+        is_connection_check = audio_check_match or (is_pure_greeting and already_greeted)
 
-        if is_pure_greeting:
-            if already_greeted:
-                logger.info(f"[FAST_PATH_CONTEXT] intent={intent or 'greeting'} bypassed=true reason=greeting_acknowledgement")
-                return "Yes, how may I assist you?"
-            else:
-                logger.info(f"[FAST_PATH_CONTEXT] intent={intent or 'greeting'} bypassed=true reason=welcome_greeting")
-                return welcome_greeting
+        if is_pure_greeting and not already_greeted:
+            logger.info(f"[FAST_PATH_CONTEXT] intent={intent or 'greeting'} bypassed=true reason=welcome_greeting")
+            return welcome_greeting
 
-        # Identity and call origin questions
-        if origin_match:
-            target_org = org_name or rag_service.get_organization_name(organization_id)
-            if not target_org or target_org.strip().lower() in ("default organization", "unknown", "none"):
-                target_org = "our office"
+        if is_connection_check and already_greeted:
+            logger.info(f"[FAST_PATH_CONTEXT] intent={intent or 'connection_check'} bypassed=true reason=connection_reassurance")
+            
+            # Determine repeat count to vary responses naturally and prevent loops
+            repeat_count = 1
+            if isinstance(booking_session, dict):
+                repeat_count = booking_session.get("_hello_repeat_count", 0) + 1
+                booking_session["_hello_repeat_count"] = repeat_count
+            elif booking_session is not None and hasattr(booking_session, "_hello_repeat_count"):
+                repeat_count = getattr(booking_session, "_hello_repeat_count", 0) + 1
+                booking_session._hello_repeat_count = repeat_count
+            elif booking_session is not None and hasattr(booking_session, "booking_data"):
+                repeat_count = booking_session.booking_data.get("_hello_repeat_count", 0) + 1
+                booking_session.booking_data["_hello_repeat_count"] = repeat_count
 
-            logger.info(f"[FAST_PATH_CONTEXT] intent={intent or 'identity_check'} bypassed=true reason=origin_identity")
-            if effective_direction == "INBOUND":
-                return f"You've reached {target_org}. How may I help you?"
-            else:
-                return f"I'm calling from {target_org}. How may I assist you?"
-
-        if audio_check_match:
-            logger.info(f"[FAST_PATH_CONTEXT] intent={intent or 'audio_check'} bypassed=true reason=audio_test")
+            # 1. Active Booking Session - prompt for current missing field smoothly
             if booking_session and hasattr(booking_session, "is_active") and booking_session.is_active():
                 from src.services.booking_state_service import booking_state_service
                 resume_prompt = booking_state_service.get_silence_prompt(booking_session)
-                return f"Yes, I can hear you clearly! {resume_prompt}"
+                if repeat_count == 1:
+                    return f"Yes, I'm right here! {resume_prompt}"
+                elif repeat_count == 2:
+                    return f"I'm still here with you. {resume_prompt}"
+                else:
+                    return f"Yes, I can hear you clearly. {resume_prompt}"
             elif isinstance(booking_session, dict) and booking_session.get("state") not in (None, "IDLE", "COMPLETED"):
-                return "Yes, I can hear you clearly! We were discussing your appointment. How would you like to proceed?"
-            return "Yes, I can hear you clearly! How may I assist you today?"
+                if repeat_count == 1:
+                    return "Yes, I'm right here! We were discussing your appointment. How would you like to proceed?"
+                else:
+                    return "I'm still here with you. Would you like to proceed with your booking details?"
+
+            # 2. Product Enquiry / Topic Context
+            curr_topic = None
+            if isinstance(booking_session, dict):
+                curr_topic = booking_session.get("current_topic") or booking_session.get("last_discussed_product")
+            elif booking_session is not None and hasattr(booking_session, "current_topic"):
+                curr_topic = getattr(booking_session, "current_topic", None) or getattr(booking_session, "booking_data", {}).get("current_topic")
+
+            if not curr_topic and session_history:
+                for h in reversed(session_history):
+                    t_msg = h.get("text", "").lower()
+                    if any(w in t_msg for w in ["ai voice agent", "voice agent", "call center"]):
+                        curr_topic = "AI Voice Agent"
+                        break
+                    elif any(w in t_msg for w in ["galaxy chat", "galaxy"]):
+                        curr_topic = "Galaxy Chat"
+                        break
+                    elif any(w in t_msg for w in ["erp", "hrms", "crm", "software"]):
+                        curr_topic = "business software"
+                        break
+                    elif any(w in t_msg for w in ["demo", "schedule demo"]):
+                        curr_topic = "demo"
+                        break
+
+            if curr_topic:
+                top_lower = str(curr_topic).lower()
+                if "voice" in top_lower or "call center" in top_lower:
+                    if repeat_count == 1:
+                        return "Yes, I'm right here! We were discussing the AI voice agent. Would you like to know about features or pricing?"
+                    else:
+                        return "I'm still here with you. Would you like me to share more details about the AI voice agent, or arrange a demo?"
+                elif "galaxy" in top_lower or "chat" in top_lower:
+                    if repeat_count == 1:
+                        return "Yes, I can hear you clearly! We were talking about Galaxy Chat. What would you like to know?"
+                    else:
+                        return "I'm still right here with you. Would you like to explore Galaxy Chat features or pricing?"
+                elif "demo" in top_lower:
+                    return "I'm still here with you. Would you like to proceed with booking your demo?"
+                else:
+                    if repeat_count == 1:
+                        return f"Yes, I'm right here! We were discussing {curr_topic}. What would you like to know?"
+                    else:
+                        return f"I'm still here with you. Would you like to continue discussing {curr_topic}?"
+
+            # 3. Check Last Assistant Question in Session History
+            last_ai_text = ""
+            if session_history:
+                for h in reversed(session_history):
+                    if h.get("role") in ("model", "assistant"):
+                        last_ai_text = h.get("text", "").strip()
+                        break
+
+            if last_ai_text and last_ai_text.endswith("?"):
+                if repeat_count == 1:
+                    return f"Yes, I'm right here! {last_ai_text}"
+                else:
+                    return f"I'm still here with you. {last_ai_text}"
+
+            if repeat_count == 1:
+                return "Yes, I'm right here! How may I assist you with our services today?"
+            else:
+                return "I'm still here with you. Please let me know how I can help whenever you're ready."
 
         if help_inquiry_match:
             target_org = org_name or rag_service.get_organization_name(organization_id)
@@ -757,7 +861,8 @@ class AIService:
         fast_resp = self._fast_rule_response(
             text, intent, organization_id=organization_id, is_ongoing=is_ongoing,
             booking_session=conversation_state, has_context=bool(clean_context),
-            call_direction=call_direction, conversation_language=conversation_language
+            call_direction=call_direction, conversation_language=conversation_language,
+            session_history=session_history
         )
         if fast_resp:
             return guardrail_service.validate_and_sanitize_response(fast_resp, call_direction=call_direction, org_name=org_name if 'org_name' in locals() else "")
@@ -1266,7 +1371,8 @@ class AIService:
         fast_resp = self._fast_rule_response(
             text, intent, organization_id=organization_id, is_ongoing=is_ongoing,
             booking_session=conversation_state, has_context=bool(clean_context),
-            call_direction=call_direction, conversation_language=conversation_language
+            call_direction=call_direction, conversation_language=conversation_language,
+            session_history=session_history
         )
         if fast_resp:
             logger.info(f"[DIAG_STAGE_A_RAW_LLM] fast_path=True len={len(fast_resp)} text={fast_resp!r}")

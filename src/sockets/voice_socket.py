@@ -1150,19 +1150,18 @@ async def voice_endpoint(websocket: WebSocket):
                 # APPOINTMENT CANCELLATION HANDLING
                 # -------------------------------------------------------------
                 if intent_name == "appointment_cancellation":
-                    from src.services.receptionist_tools import cancel_appointment
-                    appt_id_match = re.search(r'\b(?:id|appointment\s+id|appointment\s*#|#)\s*(\d+)\b', transcription, re.IGNORECASE)
-                    target_id = int(appt_id_match.group(1)) if appt_id_match else booking_session.appointment_id
-                    if target_id:
-                        res = cancel_appointment(target_id)
-                        cancel_msg = res.get("message", f"Appointment #{target_id} has been cancelled.")
-                    else:
-                        if current_lang == "ta":
-                            cancel_msg = "உங்கள் பதிவை ரத்து செய்ய, தயவுசெய்து உங்கள் முன்பதிவு எண் அல்லது பதிவு செய்யப்பட்ட தொலைபேசி எண்ணைக் கூறவும்."
-                        else:
-                            cancel_msg = "Please provide your appointment ID or registered phone number so I can cancel your booking."
+                    from src.services.cancellation_service import cancellation_service
+                    cancel_res = cancellation_service.handle_cancellation(
+                        utterance=transcription,
+                        caller_phone=booking_session.contact_number if booking_session else None,
+                        caller_name=booking_session.patient_name if booking_session else None,
+                        session=booking_session,
+                        organization_id=getattr(booking_session, "organization_id", 1) or 1,
+                        language=current_lang
+                    )
+                    cancel_msg = cancel_res.get("response", "Your cancellation request has been processed.")
 
-                    logger.info(f"[WORKFLOW] [APPOINTMENT_CANCEL] session_id={session_id} target_id={target_id}")
+                    logger.info(f"[WORKFLOW] [APPOINTMENT_CANCEL] session_id={session_id} result={cancel_res}")
                     await websocket.send_json({
                         "type": "response",
                         "text": cancel_msg,

@@ -219,8 +219,23 @@ class NLPService:
             return NLPResult(intent=INTENT_DOCTOR_INFORMATION, confidence=0.96)
 
         # 7. Cancellation Request
-        if any(w in txt for w in ["cancel", "cancellation", "drop appointment", "dont want appointment"]):
-            return NLPResult(intent=INTENT_APPOINTMENT_CANCELLATION, confidence=0.95)
+        cancellation_keywords = [
+            "cancel", "cancelling", "cancellation", "cancel my appointment", "cancel my booking",
+            "cancel the appointment", "cancel the booking", "cancel appointment", "cancel booking",
+            "drop appointment", "drop booking", "drop my appointment", "drop the appointment",
+            "dont want appointment", "don't want appointment", "dont want booking", "don't want booking",
+            "want to cancel", "need to cancel", "like to cancel", "wish to cancel",
+            "cancel tomorrow", "cancel today", "remove my appointment", "remove my booking",
+            "delete appointment", "delete my appointment", "won't be able to make it",
+            "cannot make it", "can't make it to my appointment", "can't make it",
+            "appointment cancel", "booking cancel"
+        ]
+        is_cancellation = (
+            any(w in txt for w in cancellation_keywords)
+            or bool(re.search(r'\b(?:drop|cancel|delete|remove)\s+(?:the\s+|my\s+|our\s+)?(?:appointment|booking|visit|slot)\b', txt))
+        )
+        if is_cancellation:
+            return NLPResult(intent=INTENT_APPOINTMENT_CANCELLATION, confidence=0.98)
 
         # 8. Rescheduling Request
         if any(w in txt for w in ["reschedule", "change time", "move appointment", "postpone", "change date"]):

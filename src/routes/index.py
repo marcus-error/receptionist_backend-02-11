@@ -72,8 +72,10 @@ from src.routes.webhook_routes import router as webhook_router
 api_router.include_router(webhook_router)
 
 # Calendar integrations
+from src.routes.block_time_routes import router as block_time_router
 api_router.include_router(calendar_router)             # /calendar/*
 api_router.include_router(calendar_events_router)      # /calendar/events/*
+api_router.include_router(block_time_router)           # /calendar/blocked-time/*
 api_router.include_router(microsoft_calendar_router)   # /microsoft-calendar/*
 api_router.include_router(availability_router)         # /availability/*
 

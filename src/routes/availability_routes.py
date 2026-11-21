@@ -320,6 +320,28 @@ def get_available_slots(
         if pair:
             blocked.append(pair)
 
+    # Persisted Blocked Times (Manual calendar block time slots)
+    try:
+        from src.models.block_time import BlockTime
+        bt_query = db.query(BlockTime).filter(
+            BlockTime.start_datetime < day_end,
+            BlockTime.end_datetime > day_start,
+        )
+        if staff.organization_id:
+            bt_query = bt_query.filter(
+                (BlockTime.organization_id == staff.organization_id) | (BlockTime.organization_id.is_(None))
+            )
+        for bt in bt_query.all():
+            if bt.staff_id and bt.staff_id != staff.id:
+                continue
+            if bt.staff_name and staff.name and _normalize_name(bt.staff_name) != _normalize_name(staff.name):
+                continue
+            bt_start = bt.start_datetime.replace(tzinfo=None) if hasattr(bt.start_datetime, 'tzinfo') and bt.start_datetime.tzinfo else bt.start_datetime
+            bt_end = bt.end_datetime.replace(tzinfo=None) if hasattr(bt.end_datetime, 'tzinfo') and bt.end_datetime.tzinfo else bt.end_datetime
+            blocked.append((bt_start, bt_end))
+    except Exception as bt_err:
+        logger.warning(f"Error checking BlockTime in get_available_slots: {bt_err}")
+
     slots = []
     cursor = day_start
     naive_now = now_dt.replace(tzinfo=None) if now_dt.tzinfo else now_dt

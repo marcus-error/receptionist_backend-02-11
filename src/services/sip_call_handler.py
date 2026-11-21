@@ -47,7 +47,7 @@ from src.services.booking_state_service import booking_state_service, BookingSta
 from src.services.call_service import CallService
 from src.services.language_service import language_service
 from src.models.call_log import CallType
-from src.utils.text_sanitizer import clean_markdown_for_voice
+from src.utils.text_sanitizer import clean_markdown_for_voice, clean_transcript_text
 
 logger = logging.getLogger(__name__)
 
@@ -378,7 +378,7 @@ pcm8_to_wav16 = pcm8u_to_wav16
 _active_sip_calls: Dict[str, "SipCallSession"] = {}
 
 
-_call_termination_lock = asyncio.Lock()
+_call_termination_lock = threading.RLock()
 
 
 def get_active_call(call_sid: str) -> Optional["SipCallSession"]:
@@ -403,6 +403,7 @@ async def terminate_call(call_id: Optional[str] = None, reason: str = "LOCAL_HAN
     """
     Authoritative, idempotent call termination function.
     Handles both REMOTE_HANGUP (customer phone) and LOCAL_HANGUP (laptop UI).
+    Thread-safe across multiple background asyncio event loops and the main FastAPI/Socket.IO loop.
     """
     session = None
     if call_id and str(call_id).strip() and str(call_id).strip() != "undefined":
@@ -426,7 +427,7 @@ async def terminate_call(call_id: Optional[str] = None, reason: str = "LOCAL_HAN
         logger.info(f"[CALL_ENDED_SKIPPED] call_id={session.call_sid} already terminated")
         return {"status": "already_ended", "call_id": session.call_sid}
 
-    async with _call_termination_lock:
+    with _call_termination_lock:
         if getattr(session, "_terminated", False):
             return {"status": "already_ended", "call_id": session.call_sid}
         session._terminated = True
@@ -437,7 +438,10 @@ async def terminate_call(call_id: Optional[str] = None, reason: str = "LOCAL_HAN
 
         session.ended = True
         session._ai_speaking = False
-        session._barge_in_event.set()
+        try:
+            session._barge_in_event.set()
+        except Exception:
+            pass
 
         # 1. IMMEDIATELY & SYNCHRONOUSLY finalize recording to WAV and persist DB record
         try:
@@ -460,43 +464,46 @@ async def terminate_call(call_id: Optional[str] = None, reason: str = "LOCAL_HAN
             except Exception as exc:
                 logger.warning(f"[SIP_BYE_ERROR] call_id={session.call_sid}: {exc}")
 
-        # 3. Teardown session resources
+    # 3. Teardown session resources
+    try:
         await session.stop()
+    except Exception as _se:
+        logger.warning(f"[SESSION_STOP_ERROR] call_id={session.call_sid}: {_se}")
 
-        # 3. Broadcast CALL_ENDED event
-        ts = datetime.now(timezone.utc).isoformat()
-        payload = {
-            "type": "CALL_ENDED",
-            "event": "call_ended",
-            "call_id": session.call_sid,
-            "call_sid": session.call_sid,
-            "reason": reason,
-            "timestamp": ts,
-        }
-        status_payload = {
-            "call_sid": session.call_sid,
-            "call_id": session.call_sid,
-            "id": session.call_sid,
-            "status": "completed",
-            "customer_number": session.caller_phone,
-            "caller_number": session.caller_phone,
-            "customer_name": session.caller_name,
-            "caller_name": session.caller_name,
-        }
-        try:
-            from src.sockets.socket_manager import sio
-            await sio.emit("call_status_update", status_payload)
-            await sio.emit("CALL_ENDED", payload)
-            await sio.emit("call_ended", payload)
-            await sio.emit("call_status_event", {"call_sid": session.call_sid, "phase": "idle", "timestamp": ts})
-        except Exception as exc:
-            logger.warning(f"[SOCKET EMIT ERROR] {exc}")
+    # 4. Broadcast CALL_ENDED event
+    ts = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "type": "CALL_ENDED",
+        "event": "call_ended",
+        "call_id": session.call_sid,
+        "call_sid": session.call_sid,
+        "reason": reason,
+        "timestamp": ts,
+    }
+    status_payload = {
+        "call_sid": session.call_sid,
+        "call_id": session.call_sid,
+        "id": session.call_sid,
+        "status": "completed",
+        "customer_number": session.caller_phone,
+        "caller_number": session.caller_phone,
+        "customer_name": session.caller_name,
+        "caller_name": session.caller_name,
+    }
+    try:
+        from src.sockets.socket_manager import sio
+        await sio.emit("call_status_update", status_payload)
+        await sio.emit("CALL_ENDED", payload)
+        await sio.emit("call_ended", payload)
+        await sio.emit("call_status_event", {"call_sid": session.call_sid, "phase": "idle", "timestamp": ts})
+    except Exception as exc:
+        logger.warning(f"[SOCKET EMIT ERROR] {exc}")
 
-        logger.info(f"[CALL_ENDED] call_id={session.call_sid} reason={reason}")
-        logger.info(f"[MONITOR_STOPPED] call_id={session.call_sid}")
-        logger.info(f"[AI_SESSION_STOPPED] call_id={session.call_sid}")
+    logger.info(f"[CALL_ENDED] call_id={session.call_sid} reason={reason}")
+    logger.info(f"[MONITOR_STOPPED] call_id={session.call_sid}")
+    logger.info(f"[AI_SESSION_STOPPED] call_id={session.call_sid}")
 
-        return {"status": "success", "call_id": session.call_sid, "reason": reason}
+    return {"status": "success", "call_id": session.call_sid, "reason": reason}
 
 
 class TwoWayCallRecorder:
@@ -1069,7 +1076,7 @@ class SipCallSession:
         """Handle real-time interim results from Deepgram."""
         if self.ended or getattr(self, "human_attended", False):
             return
-        text = (transcript or "").strip()
+        text = clean_transcript_text(transcript)
         if not text:
             return
 
@@ -1129,7 +1136,7 @@ class SipCallSession:
         """Handle speech_final / endpointed results from Deepgram."""
         if self.ended or getattr(self, "human_attended", False):
             return
-        text = (transcript or "").strip()
+        text = clean_transcript_text(transcript)
         if not text or text.lower() in ("", " ", "[silence]", "[noise]", "<silence>", "<noise>", "...", ".", "-"):
             logger.info(f"[DEEPGRAM_STT_EMPTY] utt_id={utt_id} (buffer cleared, no AI response generated)")
             return
@@ -2043,14 +2050,39 @@ class SipCallSession:
                     if not is_lead_mode:
                         await self._handle_booking_confirmed_termination()
                     return
+        # Extract and persist active discussion topic across turns
+        _TOPIC_CANDIDATES = [
+            ("galaxy chat", "Galaxy Chat"),
+            ("galaxy", "Galaxy Chat"),
+            ("ai voice agent", "AI Voice Agent"),
+            ("voice agent", "AI Voice Agent"),
+            ("call center", "Call Center Automation"),
+            ("receptionist", "AI Receptionist"),
+            ("ai receptionist", "AI Receptionist"),
+            ("crm", "CRM Platform"),
+            ("erp", "ERP Software"),
+            ("hrms", "HRMS Platform"),
+            ("survey", "Survey Platform"),
+            ("website", "Website Development"),
+            ("custom software", "Custom Software"),
+            ("business software", "Business Software"),
+        ]
+        for kw, canonical in _TOPIC_CANDIDATES:
+            if kw in txt_lower:
+                self.booking_session.current_topic = canonical
+                self.booking_session.booking_data["current_topic"] = canonical
+                self.booking_session.booking_data["last_discussed_product"] = canonical
+                break
+
         is_informational_query = (
             any(q in txt_lower for q in ["can you list", "what are", "who are", "which are", "tell me about", "where is", "where are", "how much", "what is", "who is", "list the", "list all", "list departments", "list teachers", "list doctors", "list services", "may i know", "can i know", "do you have", "what about"])
             or bool(re.search(r'^(?:what|who|which|how|where|when|can\s+you|could\s+you|tell\s+me|show|list)\b', txt_lower))
         )
-        is_demo_keyword = any(k in txt_lower for k in [
-            "demo", "schedule demo", "book demo", "want demo", "need demo", "schedule a demo", "book a demo",
-            "want a demo", "need a demo", "have a demo", "see a demo", "take a demo"
+        is_demo_intent = any(k in txt_lower for k in [
+            "want a demo", "want demo", "need a demo", "need demo", "schedule a demo", "schedule demo",
+            "book a demo", "book demo", "get a demo", "take a demo", "arrange a demo", "see a demo", "have a demo"
         ])
+        is_demo_keyword = is_demo_intent or any(k in txt_lower for k in ["demo", "demos"])
         is_callback_keyword = any(k in txt_lower for k in [
             "arrange a call", "arrange call", "make an arrangement", "make arrangement",
             "speak with your team", "speak with the team", "speak to your team", "speak to the team",
@@ -2061,13 +2093,20 @@ class SipCallSession:
             "give me a call back", "schedule a callback", "schedule a call", "call back",
             "have someone call me", "can someone call me", "get someone to call me"
         ])
+        has_date_time_booking_intent = (
+            any(w in txt_lower for w in ["today", "tomorrow", "appointment", "booking", "slot", "schedule", "demo", "meeting", "consultation"])
+            and bool(re.search(r'\b\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b', txt_lower))
+            and any(w in txt_lower for w in ["am", "pm", "clock", "morning", "afternoon", "evening", ":", "at", "for"])
+        )
         is_explicit_appointment = (
             any(k in txt_lower for k in [
                 "book an appointment", "book appointment", "schedule an appointment", "make an appointment",
                 "book a slot", "book my", "reserve", "want to book an appointment", "need an appointment",
                 "i want an appointment", "i need an appointment"
             ])
+            or is_demo_intent
             or (is_demo_keyword and any(w in txt_lower for w in ["at", "on", "tomorrow", "today", "pm", "am", "clock", "date", "time"]))
+            or has_date_time_booking_intent
         ) and not is_informational_query and not is_callback_keyword
         is_booking_keyword = is_explicit_appointment
 
@@ -2075,6 +2114,13 @@ class SipCallSession:
             self.booking_session.workflow_mode = "LEAD_COLLECTION"
         elif is_explicit_appointment:
             self.booking_session.workflow_mode = "APPOINTMENT_BOOKING"
+            if is_demo_keyword:
+                self.booking_session.booking_type = "SALES_DEMO"
+                target_service = getattr(self.booking_session, "current_topic", None) or "Product Demo"
+                self.booking_session.service = target_service
+                self.booking_session.booking_data["service"] = target_service
+                self.booking_session.booking_data["interested_service"] = target_service
+                self.booking_session.booking_data["requirement"] = target_service
 
         # 1. Immediate Intent & Emotion Detection
         intent_name = "general_question"
@@ -2118,6 +2164,54 @@ class SipCallSession:
             })
         except Exception:
             pass
+
+        # 1c. Direct Appointment Cancellation Workflow
+        is_cancel_request = (
+            intent_name == "appointment_cancellation"
+            or any(w in txt_lower for w in [
+                "cancel my appointment", "cancel my booking", "cancel appointment", "cancel booking",
+                "want to cancel", "need to cancel", "cancel tomorrow", "drop appointment",
+                "drop my appointment", "appointment cancel", "booking cancel"
+            ])
+            or (self.booking_session and getattr(self.booking_session, "state", None) == "WAITING_FOR_CANCELLATION_CHOICE")
+        )
+
+        if is_cancel_request:
+            t_cancel_0 = time.monotonic()
+            from src.services.cancellation_service import cancellation_service
+            cancel_result = cancellation_service.handle_cancellation(
+                utterance=transcription,
+                caller_phone=self.caller_number,
+                caller_name=getattr(self.booking_session, "patient_name", None),
+                session=self.booking_session,
+                organization_id=self.organization_id,
+                language=self.preferred_response_language
+            )
+            cancel_msg = cancel_result.get("response", "Your cancellation request has been processed.")
+            t_cancel_1 = time.monotonic()
+            cancel_ms = round((t_cancel_1 - t_cancel_0) * 1000)
+
+            logger.info(
+                f"\n[APPOINTMENT_CANCELLATION_ROUTE]"
+                f"\n  call_id={self.call_sid}"
+                f"\n  transcription='{transcription}'"
+                f"\n  response_text='{cancel_msg}'"
+                f"\n  latency_ms={cancel_ms}"
+            )
+
+            intent_name = "appointment_cancellation"
+            self._messages.append({"role": "user", "text": transcription, "intent": intent_name})
+            self.session_history.append({"role": "user", "text": transcription})
+            self.session_history.append({"role": "model", "text": cancel_msg})
+            asyncio.create_task(asyncio.to_thread(self._log_to_db, "user", transcription, intent_name))
+
+            metrics["response_id"] = response_id
+            metrics["ai_end"]     = t_cancel_1
+            metrics["ai_latency"] = t_cancel_1 - t_ai_start
+            metrics["state_ms"]   = cancel_ms
+
+            await self._speak(cancel_msg, intent_name, metrics)
+            return
 
         # 2. Check for Topic/Intent Switch vs Booking Flow
         # CRITICAL: Never let NLP intent misclassifications ("greeting", "general_question", etc.)
@@ -2406,11 +2500,18 @@ class SipCallSession:
         if is_rag_required:
             t_rag_0 = time.monotonic()
             metrics["rag_start"] = t_rag_0
+            rag_query = transcription
+            cur_topic_val = getattr(self.booking_session, "current_topic", None) or getattr(self.booking_session, "booking_data", {}).get("current_topic")
+            if cur_topic_val:
+                elliptical_indicators = ["advantages", "advantage", "benefit", "benefits", "features", "feature", "cost", "price", "pricing", "how does it work", "how it works", "tell me more", "explain more", "what does it do", "details"]
+                if any(w in txt_lower for w in elliptical_indicators) and cur_topic_val.lower() not in txt_lower:
+                    rag_query = f"{cur_topic_val} {transcription}"
+
             try:
                 context = await asyncio.wait_for(
                     asyncio.to_thread(
                         rag_service.retrieve_context,
-                        query=transcription,
+                        query=rag_query,
                         n_results=3,
                         organization_id=self.organization_id,
                         intent=intent_name,
@@ -3373,6 +3474,7 @@ class SipCallSession:
     async def _emit_transcript(self, speaker: str, text: str):
         try:
             from src.sockets.socket_manager import sio
+            clean_txt = clean_transcript_text(text)
             source = "CUSTOMER" if speaker == "customer" else "AI"
             audio_source = "CUSTOMER_RTP" if source == "CUSTOMER" else "AI_TTS"
             await sio.emit("transcript_event", {
@@ -3382,7 +3484,7 @@ class SipCallSession:
                 "speaker": speaker,
                 "source": source,
                 "audio_source": audio_source,
-                "text": text,
+                "text": clean_txt,
                 "timestamp": datetime.now(timezone.utc).isoformat()
             })
         except Exception as exc:
@@ -3392,13 +3494,14 @@ class SipCallSession:
         """Emit structured transcript event: CUSTOMER_PARTIAL / CUSTOMER_FINAL / AI_RESPONSE / etc."""
         try:
             from src.sockets.socket_manager import sio
+            clean_txt = clean_transcript_text(text)
             speaker = "customer" if event_type.startswith("CUSTOMER") else "ai"
             source = "CUSTOMER" if speaker == "customer" else "AI"
             audio_source = "CUSTOMER_RTP" if source == "CUSTOMER" else "AI_TTS"
             
             # Server-side validation: Reject any customer event that contains AI-generated speech
-            if source == "CUSTOMER" and self._is_ai_echo(text):
-                logger.warning(f"[CRITICAL] AI_AUDIO_OR_EVENT_LEAKED_INTO_CUSTOMER_STT Discarded customer STT matching recent AI speech: '{text}' utt_id={utt_id}")
+            if source == "CUSTOMER" and self._is_ai_echo(clean_txt):
+                logger.warning(f"[CRITICAL] AI_AUDIO_OR_EVENT_LEAKED_INTO_CUSTOMER_STT Discarded customer STT matching recent AI speech: '{clean_txt}' utt_id={utt_id}")
                 return
 
             ts      = datetime.now(timezone.utc).isoformat()
@@ -3411,7 +3514,7 @@ class SipCallSession:
                 "utterance_id": utt_id,
                 "type": event_type,
                 "event_type": event_type,
-                "text": text,
+                "text": clean_txt,
                 "speaker": speaker,
                 "role": role,
                 "source": source,
@@ -3627,30 +3730,31 @@ class SipCallSession:
 
     def _log_to_db(self, role: str, text: str, intent: str = ""):
         try:
+            clean_txt = clean_transcript_text(text)
             db = SessionLocal()
             try:
                 CallService(db).log_conversation_message(
-                    session_id=self.session_id, role=role, message=text, intent=intent)
+                    session_id=self.session_id, role=role, message=clean_txt, intent=intent)
                 if self.db_call_id:
                     from src.models.call_log import CallLog
                     import json
                     call = db.query(CallLog).filter(CallLog.id == self.db_call_id).first()
                     if call:
                         # Ensure message is tracked in session message history
-                        msg_entry = {"role": role, "text": text}
+                        msg_entry = {"role": role, "text": clean_txt}
                         if intent:
                             msg_entry["intent"] = intent
-                        if not any(m.get("role") == role and m.get("text") == text for m in self._messages):
+                        if not any(m.get("role") == role and m.get("text") == clean_txt for m in self._messages):
                             self._messages.append(msg_entry)
                         call.messages = json.dumps(self._messages)
 
                         # Immediately update caller_said and ai_response for real-time live monitoring
                         if role in ("user", "customer"):
-                            call.caller_said = text
+                            call.caller_said = clean_txt
                             if intent:
                                 call.intent = intent
                         elif role in ("assistant", "ai"):
-                            call.ai_response = text
+                            call.ai_response = clean_txt
 
                         if self.active_script_title:
                             call.rag_source = self.active_script_title

@@ -70,13 +70,35 @@ class RecordingService:
         end_date: Optional[str] = None,
         search: Optional[str] = None,
         call_type: Optional[str] = None,
+        page: Optional[int] = None,
+        limit: Optional[int] = None,
     ):
-        query = self.db.query(CallLog)
+        base_query = self.db.query(CallLog)
 
         if organization_id:
-            query = query.filter(CallLog.organization_id == organization_id)
+            base_query = base_query.filter(CallLog.organization_id == organization_id)
+
+        s_dt, e_dt = self.get_date_range(period or "monthly", start_date, end_date)
+        if s_dt and e_dt:
+            base_query = base_query.filter(CallLog.created_at >= s_dt, CallLog.created_at <= e_dt)
+
+        if search and search.strip():
+            s_term = f"%{search.strip()}%"
+            base_query = base_query.filter(
+                or_(
+                    CallLog.caller_name.ilike(s_term),
+                    CallLog.caller_phone.ilike(s_term),
+                    CallLog.intent.ilike(s_term)
+                )
+            )
+
+        # Tab counts for All, Inbound, Outbound based on the same period and search
+        all_count = base_query.count()
+        inbound_count = base_query.filter(CallLog.call_type == CallType.INBOUND).count()
+        outbound_count = base_query.filter(CallLog.call_type == CallType.OUTBOUND).count()
 
         # Call type filtering
+        query = base_query
         if call_type and call_type.lower() != "all":
             ct = call_type.strip().lower()
             if ct in ("inbound", "in"):
@@ -86,21 +108,20 @@ class RecordingService:
             elif ct in ("web_test", "voice_test", "test"):
                 query = query.filter(CallLog.call_type == CallType.VOICE_TEST)
 
-        s_dt, e_dt = self.get_date_range(period or "monthly", start_date, end_date)
-        if s_dt and e_dt:
-            query = query.filter(CallLog.created_at >= s_dt, CallLog.created_at <= e_dt)
+        total = query.count()
 
-        if search:
-            s_term = f"%{search}%"
-            query = query.filter(
-                or_(
-                    CallLog.caller_name.ilike(s_term),
-                    CallLog.caller_phone.ilike(s_term),
-                    CallLog.intent.ilike(s_term)
-                )
-            )
-
-        logs = query.order_by(CallLog.created_at.desc()).all()
+        # If paginated
+        if page is not None or limit is not None:
+            eff_limit = limit or 10
+            eff_page = page or 1
+            offset = max(0, (eff_page - 1) * eff_limit)
+            logs = query.order_by(CallLog.created_at.desc()).offset(offset).limit(eff_limit).all()
+            total_pages = max(1, (total + eff_limit - 1) // eff_limit) if total > 0 else 1
+        else:
+            logs = query.order_by(CallLog.created_at.desc()).all()
+            eff_limit = len(logs)
+            eff_page = 1
+            total_pages = 1
 
         results = []
         for log in logs:
@@ -166,6 +187,23 @@ class RecordingService:
                 "messages": log.messages,
                 "appointment_created": f"{appt.service} ({appt.appointment_date} {appt.appointment_time})" if appt else None
             })
+
+        if page is not None or limit is not None:
+            return {
+                "total": total,
+                "page": eff_page,
+                "limit": eff_limit,
+                "pageSize": eff_limit,
+                "total_pages": total_pages,
+                "totalPages": total_pages,
+                "results": results,
+                "data": results,
+                "counts": {
+                    "all": all_count,
+                    "inbound": inbound_count,
+                    "outbound": outbound_count,
+                }
+            }
         return results
 
     def get_recording_file(self, recording_id: int, organization_id: Optional[int] = None) -> Tuple[CallLog, str]:

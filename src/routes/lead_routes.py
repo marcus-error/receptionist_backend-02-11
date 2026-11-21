@@ -90,6 +90,7 @@ def list_leads(
     sort_order: str = Query("desc", description="asc or desc"),
     page: int = Query(1, ge=1),
     limit: int = Query(20, le=500),
+    pageSize: Optional[int] = Query(None, le=500, description="Alias for limit"),
     offset: Optional[int] = Query(None),  # Backward compatibility
     status: Optional[str] = Query(None),  # Backward compatibility for dialer
     db: Session = Depends(get_db),
@@ -97,10 +98,11 @@ def list_leads(
 ):
     """List leads with multi-filter, search, sorting and server-side pagination."""
     org_id = current_user.organization_id or 1
+    eff_limit = pageSize or limit
     
     # Handle backward compatibility with dialer page offset parameter
     if offset is not None and offset > 0 and page == 1:
-        page = (offset // limit) + 1
+        page = (offset // eff_limit) + 1
 
     svc = LeadService(db)
     return svc.get_leads(
@@ -116,7 +118,7 @@ def list_leads(
         sort_by=sort_by,
         sort_order=sort_order,
         page=page,
-        limit=limit,
+        limit=eff_limit,
         status=status,
     )
 

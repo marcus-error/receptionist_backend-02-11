@@ -283,8 +283,15 @@ class CalendarVerificationService:
                 raw_time_str = raw_time_str.upper()
             target_time_24h = self.parse_time_to_24h(raw_time_str) if raw_time_str else None
 
+            is_generic_doc = bool(
+                doctor_name and doctor_name.strip().lower() in (
+                    "representative", "rep", "team", "sales team", "sales representative",
+                    "demo", "consultation", "agent", "assistant", "ai agent", "general"
+                )
+            )
+
             staff = None
-            if doctor_name:
+            if doctor_name and not is_generic_doc:
                 clean_doc = re.sub(r'^(dr\.?|doctor)\s*', '', doctor_name, flags=re.IGNORECASE).strip()
                 staff = db.query(Staff).filter(Staff.organization_id == org_id, Staff.name.ilike(f"%{clean_doc or doctor_name}%")).first()
                 if not staff:
@@ -295,18 +302,42 @@ class CalendarVerificationService:
                         reason=f"{doctor_name} is not listed in our active directory.",
                         prompt_summary=f"[LIVE CALENDAR VERIFICATION: '{doctor_name}' is not listed in our active directory.]"
                     )
-            else:
-                staff = None
 
             if not staff:
-                # If booking is for a service/product or general consultation, assign first available staff
+                # If booking is for a service/product, demo, representative, or general consultation, assign first active staff
                 staff = db.query(Staff).filter(
                     Staff.organization_id == org_id,
                     Staff.status != StaffStatus.OFFLINE,
                     Staff.online_booking_enabled == True
                 ).first()
                 if not staff:
-                    # No staff restriction for general service, treat slot as available
+                    staff = db.query(Staff).filter(Staff.organization_id == org_id).first()
+                if not staff:
+                    # Defensive fallback: If no staff in DB, STILL enforce past-time validation
+                    now_dt = get_current_business_datetime(org_id=org_id, db=db, reference_now=reference_now)
+                    current_date = now_dt.date()
+                    naive_now = now_dt.replace(tzinfo=None) if now_dt.tzinfo else now_dt
+                    is_past = False
+                    if target_time_24h:
+                        try:
+                            target_time_obj = datetime.strptime(target_time_24h, "%H:%M").time()
+                            target_slot_dt = datetime.combine(target_date, target_time_obj)
+                            if target_date < current_date or (target_date == current_date and target_slot_dt <= naive_now):
+                                is_past = True
+                        except Exception:
+                            pass
+                    if is_past:
+                        freq_12h = self.format_time_12h(target_time_24h) if target_time_24h else (raw_time_str or "that time")
+                        return CalendarVerificationResult(
+                            is_checked=True,
+                            is_available=False,
+                            is_past_time=True,
+                            doctor_name=doctor_name or "Representative",
+                            requested_date=target_date.strftime("%A, %b %d, %Y"),
+                            requested_time=freq_12h,
+                            reason=f"Slot {freq_12h} is no longer available because that time has passed.",
+                            prompt_summary=f"[LIVE CALENDAR VERIFICATION: Slot {freq_12h} on {target_date} has ALREADY PASSED.]"
+                        )
                     return CalendarVerificationResult(
                         is_checked=True,
                         is_available=True,

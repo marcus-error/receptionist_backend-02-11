@@ -20,6 +20,7 @@ from typing import Any, Callable, Dict, Optional
 import websockets
 
 from src.config.env import settings
+from src.utils.text_sanitizer import clean_transcript_text
 
 logger = logging.getLogger(__name__)
 
@@ -552,7 +553,7 @@ class DeepgramStreamingSession:
             return
 
         alt = alternatives[0]
-        transcript = (alt.get("transcript") or "").strip()
+        transcript = clean_transcript_text(alt.get("transcript") or "")
         confidence = alt.get("confidence", 0.0)
         self._last_detected_language = getattr(self, "language", "en") or "en"
         is_final = data.get("is_final", False)
@@ -739,7 +740,7 @@ class DeepgramStreamingSession:
             self._debounce_task = None
 
         now = time.monotonic()
-        text = transcript.strip()
+        text = clean_transcript_text(transcript)
         if not text or self._turn_finalized:
             return
 
