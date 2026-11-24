@@ -210,6 +210,12 @@ class Settings(BaseSettings):
     NLP_MODEL: str = "local"
 
     # ------------------------------------------------------------------
+    # Sarvam AI (Indian Multilingual Speech / Translation / LLM)
+    # ------------------------------------------------------------------
+    SARVAM_API_KEY: Optional[str] = None
+    SARVAM_BASE_URL: str = "https://api.sarvam.ai"
+
+    # ------------------------------------------------------------------
     # Emotion Detection (External API only)
     # ------------------------------------------------------------------
     EMOTION_API_KEY: Optional[str] = None
@@ -276,7 +282,7 @@ class Settings(BaseSettings):
     BUSINESS_TIMEZONE: str = Field(default="Asia/Kolkata")
 
     model_config = SettingsConfigDict(
-        env_file=("backend/.env", ".env"),
+        env_file=("receptionist_backend-02-11/.env", "backend/.env", ".env"),
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",

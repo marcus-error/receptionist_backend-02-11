@@ -975,7 +975,10 @@ class SipCallSession:
             "thanks", "thank", "today", "tomorrow", "morning", "afternoon", "evening",
             "am", "pm", "correct", "right", "fine", "appointment", "doctor", "service",
             "services", "hospital", "clinic", "treatment", "book", "booking", "schedule",
-            "help", "need", "want", "information", "timing", "hours", "available"
+            "help", "need", "want", "information", "timing", "hours", "available",
+            # Protected Tamil short customer answers
+            "சரி", "ஆமாம்", "ஆமா", "வேண்டாம்", "வேண்டாங்க", "இல்லை", "நன்றி", "வணக்கம்",
+            "போதும்", "sari", "aamaam", "venam", "vendaam", "illa", "nanri"
         }
         if len(words_t) <= 3 and (
             any(w in protected_customer_words for w in words_t)
@@ -985,6 +988,7 @@ class SipCallSession:
             return False
 
         # Check against recent AI utterances
+        now = time.monotonic()
         for ai_t in self._recent_ai_texts:
             clean_ai = "".join(c.lower() for c in ai_t if c.isalnum() or c.isspace()).strip()
             if not clean_ai:
@@ -993,6 +997,12 @@ class SipCallSession:
             # Verbatim exact match
             if clean_t == clean_ai:
                 return True
+
+            # If AI is currently transmitting: suppress acoustic feedback of AI's opening word
+            if (self._ai_speaking or now < getattr(self, "_ai_speaking_until", 0.0)):
+                if clean_ai.startswith(clean_t) and len(clean_t) >= 4 and clean_t not in {"yes", "yeah", "no", "சரி", "ஆமாம்", "வேண்டாம்"}:
+                    logger.warning(f"[AI_ECHO_FILTER] Detected acoustic leakage of AI opening word: '{clean_t}' during playback")
+                    return True
 
             # If AI is currently transmitting or in immediate echo window:
             # Any phrase of 2+ words that is a verbatim substring of what AI is saying is acoustic echo
@@ -1355,18 +1365,21 @@ class SipCallSession:
                     booking_session=getattr(self, "booking_session", None),
                     org_name=rag_service.get_organization_name(self.organization_id)
                 )
+                if not switch_msg or not switch_msg.strip():
+                    switch_msg = "கண்டிப்பா, தமிழ்ல பேசுறேன். சொல்லுங்க, உங்களுக்கு என்ன உதவி வேணும்?" if target_lang == "ta" else "Certainly! I will continue in English. How may I assist you today?"
 
                 self.session_history.append({"role": "user", "text": text})
                 self.session_history.append({"role": "model", "text": switch_msg})
-                self._messages.append({"role": "user", "text": text, "intent": "language_switch"})
-                self._messages.append({"role": "assistant", "text": switch_msg, "intent": "language_switch"})
-                asyncio.create_task(asyncio.to_thread(self._log_to_db, "user", text, "language_switch"))
-                asyncio.create_task(asyncio.to_thread(self._log_to_db, "assistant", switch_msg, "language_switch"))
+                self._messages.append({"role": "user", "text": text, "intent": "CHANGE_LANGUAGE"})
+                self._messages.append({"role": "assistant", "text": switch_msg, "intent": "CHANGE_LANGUAGE"})
+                asyncio.create_task(asyncio.to_thread(self._log_to_db, "user", text, "CHANGE_LANGUAGE"))
+                asyncio.create_task(asyncio.to_thread(self._log_to_db, "assistant", switch_msg, "CHANGE_LANGUAGE"))
 
                 metrics["response_id"] = f"ai_lang_switch_{int(time.time()*1000)}"
                 metrics["source"] = "LANGUAGE_SWITCH"
                 metrics["language"] = self.current_lang
                 logger.info(f"[LANG_SWITCH_EXECUTED] call_id={self.call_sid} new_lang={target_lang} response='{switch_msg}'")
+                self._barge_in_event.clear()
                 await self._speak(switch_msg, "language_switch", metrics)
                 return
             else:
@@ -1883,9 +1896,41 @@ class SipCallSession:
 
         txt_lower = transcription.lower().strip()
 
+        stt_conf = float(metrics.get("confidence", 1.0)) if metrics else 1.0
+        script_or_transliteration = "tamil_native_script" if any('\u0B80' <= c <= '\u0BFF' for c in transcription) else ("tamil_transliterated_tanglish" if self.preferred_response_language == "ta" else "latin_english")
+        logger.info(
+            f"\n[LANGUAGE_UNDERSTANDING]"
+            f"\n  call_id={self.call_sid}"
+            f"\n  utterance='{transcription}'"
+            f"\n  detected_language={self.preferred_response_language}"
+            f"\n  confidence={stt_conf:.2f}"
+            f"\n  script_or_transliteration={script_or_transliteration}"
+            f"\n  action=PROCESS_TURN"
+        )
+
+        # Low confidence STT check (< 0.25)
+        _valid_short_tokens = {"yes", "yeah", "yep", "ok", "okay", "sure", "no", "nope", "சரி", "ஆமாம்", "ஆமா", "வேண்டாம்", "இல்லை", "sari", "aamaam", "venam", "vendaam", "illa"}
+        if metrics and metrics.get("confidence") is not None and stt_conf < 0.25 and txt_lower not in _valid_short_tokens and len(transcription.strip()) > 1:
+            clarify_text = "சார், கொஞ்சம் தெளிவாக சொல்ல முடியுமா?" if self.preferred_response_language == "ta" else "I'm sorry, I couldn't hear that clearly. Could you please repeat that?"
+            logger.info(f"[STT_LOW_CONFIDENCE] call_id={self.call_sid} conf={stt_conf:.2f} text='{transcription}' -> asking clarification")
+            self.session_history.append({"role": "user", "text": transcription})
+            self.session_history.append({"role": "model", "text": clarify_text})
+            metrics["response_id"] = f"ai_stt_clarify_{int(time.time()*1000)}"
+            metrics["source"] = "LOW_CONFIDENCE_STT"
+            await self._speak(clarify_text, "clarification", metrics)
+            return
+
         # ── PRIORITY 0: Explicit Language Switch ──────────────────────────────
         # Language switch takes highest precedence before any booking or question processing.
         target_lang, is_switch, switch_reason = language_service.check_language_switch_detailed(transcription)
+        if not is_switch:
+            from src.services.nlp_service import INTENT_CHANGE_LANGUAGE
+            nlp_pre = nlp_service.detect_intent(transcription)
+            if nlp_pre.intent == INTENT_CHANGE_LANGUAGE and nlp_pre.requested_language_code:
+                target_lang = nlp_pre.requested_language_code
+                is_switch = True
+                switch_reason = "explicit"
+
         if is_switch:
             if target_lang in ("ta", "en", "hi", "kn", "te"):
                 prev_lang = getattr(self, "preferred_response_language", "en")
@@ -1933,17 +1978,20 @@ class SipCallSession:
                     booking_session=getattr(self, "booking_session", None),
                     org_name=rag_service.get_organization_name(self.organization_id)
                 )
+                if not switch_msg or not switch_msg.strip():
+                    switch_msg = "கண்டிப்பா, தமிழ்ல பேசுறேன். சொல்லுங்க, உங்களுக்கு என்ன உதவி வேணும்?" if target_lang == "ta" else "Certainly! I will continue in English. How may I assist you today?"
 
                 self.session_history.append({"role": "user", "text": transcription})
                 self.session_history.append({"role": "model", "text": switch_msg})
-                self._messages.append({"role": "user", "text": transcription, "intent": "language_switch"})
-                self._messages.append({"role": "assistant", "text": switch_msg, "intent": "language_switch"})
-                asyncio.create_task(asyncio.to_thread(self._log_to_db, "user", transcription, "language_switch"))
-                asyncio.create_task(asyncio.to_thread(self._log_to_db, "assistant", switch_msg, "language_switch"))
+                self._messages.append({"role": "user", "text": transcription, "intent": "CHANGE_LANGUAGE"})
+                self._messages.append({"role": "assistant", "text": switch_msg, "intent": "CHANGE_LANGUAGE"})
+                asyncio.create_task(asyncio.to_thread(self._log_to_db, "user", transcription, "CHANGE_LANGUAGE"))
+                asyncio.create_task(asyncio.to_thread(self._log_to_db, "assistant", switch_msg, "CHANGE_LANGUAGE"))
 
                 metrics["response_id"] = f"ai_lang_switch_{int(time.time()*1000)}"
                 metrics["source"] = "LANGUAGE_SWITCH"
                 metrics["language"] = target_lang
+                self._barge_in_event.clear()
                 await self._speak(switch_msg, "language_switch", metrics)
                 return
 
@@ -2075,8 +2123,13 @@ class SipCallSession:
                 break
 
         is_informational_query = (
-            any(q in txt_lower for q in ["can you list", "what are", "who are", "which are", "tell me about", "where is", "where are", "how much", "what is", "who is", "list the", "list all", "list departments", "list teachers", "list doctors", "list services", "may i know", "can i know", "do you have", "what about"])
-            or bool(re.search(r'^(?:what|who|which|how|where|when|can\s+you|could\s+you|tell\s+me|show|list)\b', txt_lower))
+            any(q in txt_lower for q in [
+                "can you list", "what are", "who are", "which are", "tell me about", "where is", "where are",
+                "how much", "what is", "who is", "list the", "list all", "list departments", "list teachers",
+                "list doctors", "list services", "may i know", "can i know", "do you have", "what about",
+                "explain your services", "explain services", "can you explain", "what products", "what services"
+            ])
+            or bool(re.search(r'^(?:what|who|which|how|where|when|can\s+you|could\s+you|tell\s+me|show|list|explain)\b', txt_lower))
         )
         is_demo_intent = any(k in txt_lower for k in [
             "want a demo", "want demo", "need a demo", "need demo", "schedule a demo", "schedule demo",
@@ -2084,6 +2137,8 @@ class SipCallSession:
         ])
         is_demo_keyword = is_demo_intent or any(k in txt_lower for k in ["demo", "demos"])
         is_callback_keyword = any(k in txt_lower for k in [
+            "arrange a team call", "arrange team call", "team call", "call with your team", "call with the team",
+            "arrange a call with your team", "arrange a call with the team", "can i arrange a team call",
             "arrange a call", "arrange call", "make an arrangement", "make arrangement",
             "speak with your team", "speak with the team", "speak to your team", "speak to the team",
             "talk to your team", "talk to the team", "talk with your team", "talk with the team",
@@ -2091,7 +2146,17 @@ class SipCallSession:
             "i want to talk to your team", "contact me", "yes contact me", "yes, contact me",
             "call me back", "request a callback", "callback", "arrange a callback",
             "give me a call back", "schedule a callback", "schedule a call", "call back",
-            "have someone call me", "can someone call me", "get someone to call me"
+            "have someone call me", "can someone call me", "get someone to call me",
+            # Tamil native script
+            "உங்க team callback பண்ண சொல்லுங்க", "எனக்கு call பண்ண சொல்லுங்க",
+            "ஒருத்தர் எனக்கு contact பண்ணட்டும்", "நான் பேசணும் உங்கள் team கூட",
+            "team contact பண்ண சொல்லுங்க", "callback பண்ணுங்க", "call பண்ணுங்க",
+            "contact பண்ணுங்க", "team callback", "எனக்கு வேற எதுவும் தெரிஞ்சிக்க வேணாம்",
+            "callback பண்ண சொல்லுங்க", "call பண்ண சொல்லு",
+            # Tanglish
+            "callback panna sollunga", "call panna sollunga", "contact panna sollunga",
+            "callback pannunga", "call pannunga", "team callback pannunga",
+            "pesanum ungal team kooda", "pesanum unga team", "team contact pannattum"
         ])
         has_date_time_booking_intent = (
             any(w in txt_lower for w in ["today", "tomorrow", "appointment", "booking", "slot", "schedule", "demo", "meeting", "consultation"])
@@ -2112,6 +2177,13 @@ class SipCallSession:
 
         if is_callback_keyword:
             self.booking_session.workflow_mode = "LEAD_COLLECTION"
+            logger.info(
+                f"\n[CALLBACK_INTENT]"
+                f"\n  call_id={self.call_sid}"
+                f"\n  trigger_phrase='{transcription}'"
+                f"\n  lead_created_or_updated=INITIALIZING"
+                f"\n  workflow_mode=LEAD_COLLECTION"
+            )
         elif is_explicit_appointment:
             self.booking_session.workflow_mode = "APPOINTMENT_BOOKING"
             if is_demo_keyword:
@@ -2217,8 +2289,8 @@ class SipCallSession:
         # CRITICAL: Never let NLP intent misclassifications ("greeting", "general_question", etc.)
         # override an active booking state when the customer is answering a booking prompt (e.g. name, phone, email, date, time).
         is_intent_switch = (
-            intent_name in ("emergency/urgent request", "transfer request", "product_information", "service_information", "company_information", "staff_lookup", "staff_availability", "doctor_information")
-            or (not self.booking_session.is_active() and (is_informational_query or intent_name in ("department_list", "doctor_list", "service_information", "product_information", "company_information", "staff_lookup", "staff_availability", "doctor_information", "general_question", "faq")))
+            intent_name in ("emergency/urgent request", "transfer request", "product_information", "service_information", "product_service_query", "company_information", "organization_information", "staff_lookup", "staff_availability", "doctor_information")
+            or (not self.booking_session.is_active() and (is_informational_query or intent_name in ("department_list", "doctor_list", "service_information", "product_information", "product_service_query", "company_information", "organization_information", "staff_lookup", "staff_availability", "doctor_information", "general_question", "faq")))
             or booking_state_service.check_and_handle_intent_switch(self.booking_session, intent_name, transcription)
         )
 
@@ -2228,6 +2300,21 @@ class SipCallSession:
         except Exception as e:
             logger.warning(f"[SIP] Slot extraction error: {e}")
 
+        # Check for appointment details inquiry
+        is_appt_details_q = (
+            intent_name == "appointment_details_inquiry"
+            or any(p in txt_lower for p in ["share the appointment details", "share my appointment details", "share appointment details", "share the date and time", "share date and time", "appointment details", "what are my appointment details", "my appointment details"])
+        )
+        if is_appt_details_q:
+            ack_msg = booking_state_service.get_appointment_or_demo_details(self.booking_session)
+            self.session_history.append({"role": "user", "text": transcription})
+            self.session_history.append({"role": "model", "text": ack_msg})
+            metrics["response_id"] = response_id
+            metrics["ai_end"] = time.monotonic()
+            metrics["ai_latency"] = metrics["ai_end"] - t_ai_start
+            await self._speak(ack_msg, "appointment_details_inquiry", metrics)
+            return
+
         is_explicit_new_booking = any(w in txt_lower for w in ["new appointment", "another appointment", "book again", "book another", "one more appointment"])
         if self.booking_session.is_completed:
             if is_explicit_new_booking:
@@ -2236,16 +2323,66 @@ class SipCallSession:
             else:
                 should_route_booking = False
                 clean_w = [re.sub(r'[^a-zA-Z0-9]', '', w) for w in txt_lower.split()]
-                if any(w in clean_w for w in ["yes", "yeah", "yep", "okay", "ok", "thanks", "thank", "fine", "alright", "sure", "done"]):
-                    appt_id = getattr(self.booking_session, "appointment_id", "")
-                    id_str = f" under Appointment ID #{appt_id}" if appt_id else ""
-                    ack_msg = f"Your appointment is already confirmed{id_str}! Is there anything else I can help you with today?"
+                if any(w in clean_w for w in ["yes", "yeah", "yep", "okay", "ok", "sure", "done", "fine", "alright"]):
+                    # Look at last AI question in session history
+                    last_ai = ""
+                    for msg in reversed(self.session_history):
+                        if msg.get("role") == "model":
+                            last_ai = msg.get("text", "").lower()
+                            break
+                    has_more_help_q = any(p in last_ai for p in ["anything else", "help you with", "assist you", "வேறு உதவி", "உதவி வேணுமா"])
+
+                    lang = getattr(self.booking_session, "conversation_language", getattr(self, "current_lang", "en"))
+                    if has_more_help_q:
+                        if lang in ("ta", "tanglish", "ta_mix"):
+                            ack_msg = "கண்டிப்பா! சொல்லுங்க, உங்களுக்கு என்ன உதவி வேணும்?"
+                        elif lang == "hi":
+                            ack_msg = "हाँ, बताइए मैं आपकी क्या सहायता कर सकता हूँ?"
+                        else:
+                            ack_msg = "Certainly! How else can I assist you today?"
+                    elif self.booking_session.booking_confirmed and getattr(self.booking_session, "appointment_id", None):
+                        appt_id = self.booking_session.appointment_id
+                        if lang in ("ta", "tanglish", "ta_mix"):
+                            ack_msg = f"உங்க appointment {self.booking_session.date} அன்று {self.booking_session.time}-க்கு Appointment ID #{appt_id}-ல் confirm செய்யப்பட்டுள்ளது. நான் உங்களுக்கு வேற எப்படி உதவலாம்?"
+                        elif lang == "hi":
+                            ack_msg = f"Aapka appointment {self.booking_session.date} ko {self.booking_session.time} par Appointment ID #{appt_id} ke sath confirm hai. Main aapki aur kya madad kar sakta hoon?"
+                        else:
+                            ack_msg = f"Your appointment is confirmed for {self.booking_session.date} at {self.booking_session.time} under Appointment ID #{appt_id}. Is there anything else I can help you with today?"
+                    elif getattr(self.booking_session, "workflow_mode", None) == "LEAD_COLLECTION" or not self.booking_session.booking_confirmed:
+                        avail = self.booking_session.booking_data.get("caller_availability")
+                        avail_str = f", noting that you are available {avail}" if avail else ""
+                        if lang in ("ta", "tanglish", "ta_mix"):
+                            ack_msg = "எங்க team உங்க விவரங்களை குறித்துக்கொண்டது, 24 மணி நேரத்திற்குள் demo-வை schedule பண்ண உங்களை contact பண்ணுவாங்க. உங்களுக்கு வேற என்ன உதவி வேணும்?"
+                        elif lang == "hi":
+                            ack_msg = "Hamari team aapko demo schedule karne ke liye 24 ghante me contact karegi. Kya aapko koi aur sahayata chahiye?"
+                        else:
+                            ack_msg = f"Our team has recorded your details and will contact you within 24 hours to schedule the demo{avail_str}. Is there anything else I can assist you with today?"
+                    else:
+                        ack_msg = "How else may I assist you today?"
+
                     self.session_history.append({"role": "user", "text": transcription})
                     self.session_history.append({"role": "model", "text": ack_msg})
                     metrics["response_id"] = response_id
                     metrics["ai_end"] = time.monotonic()
                     metrics["ai_latency"] = metrics["ai_end"] - t_ai_start
-                    await self._speak(ack_msg, "appointment_already_confirmed", metrics)
+                    await self._speak(ack_msg, "follow_up_ack", metrics)
+                    return
+                elif any(w in clean_w for w in ["no", "nope", "nothing", "bye", "goodbye", "thanks", "thank", "thats all"]):
+                    org_title = rag_service.get_organization_name(self.organization_id) or "CallZenza"
+                    lang = getattr(self.booking_session, "conversation_language", getattr(self, "current_lang", "en"))
+                    if lang in ("ta", "tanglish", "ta_mix"):
+                        ack_msg = f"ரொம்ப நன்றி! {org_title}-ஐ அழைத்தமைக்கு நன்றி. Have a wonderful day, goodbye!"
+                    elif lang == "hi":
+                        ack_msg = f"Bahut dhanyawad! {org_title} me call karne ke liye shukriya. Aapka din shubh ho, namaste!"
+                    else:
+                        ack_msg = f"You're very welcome! Thank you for calling {org_title}. Have a wonderful day, goodbye!"
+                    self._call_ending_scheduled = True
+                    self.session_history.append({"role": "user", "text": transcription})
+                    self.session_history.append({"role": "model", "text": ack_msg})
+                    metrics["response_id"] = response_id
+                    metrics["ai_end"] = time.monotonic()
+                    metrics["ai_latency"] = metrics["ai_end"] - t_ai_start
+                    await self._speak(ack_msg, "closing_ack", metrics)
                     return
         else:
             is_active_or_triggered = (self.booking_session.is_active() or is_booking_keyword or is_callback_keyword or intent_name == "callback")
@@ -2765,6 +2902,8 @@ class SipCallSession:
                 org_name = rag_service.get_organization_name(self.organization_id)
                 if self.current_lang != "en":
                     full_response = language_service.get_language_fallback_prompt(self.current_lang, org_name)
+                elif getattr(self.booking_session, "greeting_sent", False):
+                    full_response = "I'm sorry, I didn't quite catch that. How can I help you today?"
                 elif org_name:
                     full_response = f"Thank you for contacting {org_name}. How may I assist you today?"
                 else:
@@ -2927,6 +3066,15 @@ class SipCallSession:
             f"response_length={len(text or '')} validated={'true' if is_valid_resp else 'false'}"
         )
 
+        is_spoken_ta = "true" if getattr(self, "preferred_response_language", "en") == "ta" else "n/a"
+        logger.info(
+            f"\n[RESPONSE_VALIDATION]"
+            f"\n  call_id={self.call_sid}"
+            f"\n  language={getattr(self, 'preferred_response_language', 'en')}"
+            f"\n  response_text='{text}'"
+            f"\n  is_natural_spoken_tamil={is_spoken_ta}"
+        )
+
         # 1. Reset Deepgram STT turn buffer so previous acoustic frames never convert to customer final
         if hasattr(self, "deepgram_session") and self.deepgram_session:
             try:
@@ -2938,8 +3086,11 @@ class SipCallSession:
         self._recent_ai_texts.append(text)
         try:
             from src.sockets.socket_manager import sio
-            await self._emit_status("speaking")
-            self._ai_speaking = True
+            # During TTS network synthesis, the AI is synthesizing, not actively playing on RTP.
+            # Do NOT set self._ai_speaking = True here, otherwise trailing acoustic frames
+            # from customer's input utterance will be falsely classified as barge-in interruptions
+            # and drop the synthesized response before it even reaches the caller!
+            self._ai_speaking = False
             self._barge_in_event.clear()
             if metrics and "tts_start" not in metrics:
                 metrics["tts_start"] = time.monotonic()
@@ -3092,16 +3243,24 @@ class SipCallSession:
                 logger.warning(f"[SOCKET_EMIT] {_se}")
 
             # Phone - PCMU via RTP TX (paced 20ms frames to prevent VPS jitter/buffer overflow)
-            if self.audio_send_callback and not self._barge_in_event.is_set():
+            is_opening_greeting = bool(metrics and metrics.get("is_greeting"))
+            is_switch_or_greeting = bool(intent in ("language_switch", "CHANGE_LANGUAGE", "ACTIVE_SCRIPT_GREETING") or is_opening_greeting)
+            if is_switch_or_greeting:
+                self._barge_in_event.clear()
+
+            if self.audio_send_callback and (is_switch_or_greeting or not self._barge_in_event.is_set()):
                 try:
                     from src.config.env import settings
                     tts_provider = getattr(settings, "TTS_PROVIDER", "murf").lower().strip()
                     pcmu_bytes, pcm16_audio = await asyncio.to_thread(convert_tts_to_pcmu_and_pcm16, audio_bytes, tts_provider)
-                    if pcmu_bytes and not self._barge_in_event.is_set():
+                    if pcmu_bytes and (is_switch_or_greeting or not self._barge_in_event.is_set()):
                         audio_play_dur = len(pcmu_bytes) / 8000.0
                         now = time.monotonic()
-                        # Playback window
+                        # Playback window: AI is now physically speaking out to the caller
+                        self._ai_speaking = True
                         self._ai_speaking_until = now + audio_play_dur + 0.15
+                        self._barge_in_event.clear()
+                        await self._emit_status("speaking")
 
                         if metrics and "rtp_tx_start" not in metrics:
                             t_rtp_start = now
@@ -3170,6 +3329,31 @@ class SipCallSession:
                                     f"[LATENCY_TARGET_EXCEEDED] Total response latency {cust_to_ai}ms > 2000ms target! "
                                     f"Bottleneck: {slowest_stage} ({slowest_ms}ms). Breakdown: {stage_breakdown}"
                                 )
+
+                            conv_state_str = getattr(self.booking_session, "state", "IDLE") if hasattr(self, "booking_session") else "IDLE"
+                            logger.info(
+                                f"\n[PERFORMANCE_METRICS]"
+                                f"\n  call_id={self.call_sid}"
+                                f"\n  utterance_id={utt_id}"
+                                f"\n  turn_id={getattr(self.booking_session, 'turn_count', 1)}"
+                                f"\n  response_id={metrics.get('response_id') or getattr(self, '_current_response_id', 'none')}"
+                                f"\n  language={getattr(self, 'current_lang', 'en')}"
+                                f"\n  intent={intent}"
+                                f"\n  conversation_state={conv_state_str}"
+                                f"\n  speech_end_ts={metrics.get('speech_end_monotonic', 0):.4f}"
+                                f"\n  final_stt_ts={metrics.get('t_stt_final', 0):.4f}"
+                                f"\n  intent_detection_dur_ms={intent_ms}"
+                                f"\n  context_retrieval_dur_ms={metrics.get('state_ms', 0)}"
+                                f"\n  rag_retrieval_dur_ms={rag_ms}"
+                                f"\n  llm_first_token_ts={metrics.get('llm_first_token', 0):.4f}"
+                                f"\n  response_generation_dur_ms={llm_ms}"
+                                f"\n  tts_generation_dur_ms={tts_ms}"
+                                f"\n  playback_start_ts={t_rtp_start:.4f}"
+                                f"\n  total_response_initiation_latency_ms={cust_to_ai}"
+                                f"\n  target_met={cust_to_ai <= 2000}"
+                                f"\n  duplicate_event_count=0"
+                                f"\n  response_generation_count=1"
+                            )
 
                             logger.info(
                                 f"[TTS_FIRST_AUDIO] call_id={self.call_sid} utterance_id={utt_id} timestamp={time.time():.4f}"
@@ -3281,7 +3465,7 @@ class SipCallSession:
                             self._last_ai_speak_end_time = time.monotonic()
                             self._ai_speaking_until = time.monotonic() + 0.15
 
-                    elif self._barge_in_event.is_set():
+                    elif self._barge_in_event.is_set() and not is_switch_or_greeting:
                         logger.info("[BARGE_IN] Customer spoke - dropping AI audio")
                         self._ai_speaking = False
                         self._last_ai_speak_end_time = time.monotonic()

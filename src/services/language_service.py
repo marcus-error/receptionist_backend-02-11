@@ -121,31 +121,31 @@ _SWITCH_PATTERNS = [
 
     # 2. Canonical language patterns with explicit verbs
     (rf'\b(?:change\s+(?:the\s+)?language\s+(?:back\s+)?to\s+)({_CANONICAL_LANG_OR_REGEX})\b', 1),
-    (rf'\b(?:talk|speak|chat|converse|switch|change|respond)\s+(?:back\s+to\s+|to\s+|in\s+)?(?:the\s+language\s+to\s+)?({_CANONICAL_LANG_OR_REGEX})\b', 1),
-    (rf'\b(?:can|could|will|would)\s+(?:you\s+|we\s+)?(?:please\s+)?(?:talk|speak|chat|converse|respond|switch)\s+(?:back\s+to\s+|to\s+me\s+in\s+|to\s+|in\s+)?({_CANONICAL_LANG_OR_REGEX})\b', 1),
-    (rf'\bplease\s+(?:talk|speak|switch(?:\s+(?:back\s+)?to)?|respond)\s+(?:in\s+)?({_CANONICAL_LANG_OR_REGEX})\b', 1),
-    (rf'\bi\s+(?:want|prefer|need|would\s+like)(?:\s+to\s+(?:talk|speak|hear|switch))?\s+(?:in\s+|to\s+)?({_CANONICAL_LANG_OR_REGEX})[\.\!\?]?\s*$', 1),
+    (rf'\b(?:talk|speak|chat|converse|switch|change|respond|continue)\s+(?:back\s+to\s+|to\s+|in\s+)?(?:the\s+language\s+to\s+)?({_CANONICAL_LANG_OR_REGEX})\b', 1),
+    (rf'\b(?:can|could|will|would)\s+(?:you\s+|we\s+)?(?:please\s+)?(?:talk|speak|chat|converse|respond|switch|continue)\s+(?:back\s+to\s+|to\s+me\s+in\s+|to\s+|in\s+)?({_CANONICAL_LANG_OR_REGEX})\b', 1),
+    (rf'\bplease\s+(?:talk|speak|switch(?:\s+(?:back\s+)?to)?|respond|continue)\s+(?:in\s+)?({_CANONICAL_LANG_OR_REGEX})\b', 1),
+    (rf'\bi\s+(?:want|prefer|need|would\s+like)(?:\s+to\s+(?:talk|speak|hear|switch|continue))?\s+(?:in\s+|to\s+)?({_CANONICAL_LANG_OR_REGEX})[\.\!\?]?\s*$', 1),
     (rf'\b({_CANONICAL_LANG_OR_REGEX})\s+(?:please|language)\b', 1),
     (rf'\b(?:switch|change)\s+(?:back\s+)?to\s+({_CANONICAL_LANG_OR_REGEX})\b', 1),
     (rf'^\s*({_CANONICAL_LANG_OR_REGEX})[\.\!\?]?\s*$', 1),
     (rf'\bin\s+({_CANONICAL_LANG_OR_REGEX})[\.\!\?]?\s*$', 1),
 
     # Transliterated Indic phrases
-    (r'\b(?:tamil|tamizh|thamil)\s*(?:la|il)\s*(?:pesunga|pesalam|pesu|pesa\s*mudiyuma)\b', LANG_TAMIL),
-    (r'\b(?:pesunga|pesalam)\s*(?:tamil|tamizh|thamil)\s*(?:la|il)?\b', LANG_TAMIL),
+    (r'\b(?:tamil|tamizh|thamil)\s*(?:la|il|ku|ukku)?\s*(?:pesunga|pesalam|pesu|pesa\s*mudiyuma|pesanum|pesalaam|pesa\s*vendum|switch\s*pannunga|switch\s*pannu|continue\s*pannunga|continue\s*pannu)\b', LANG_TAMIL),
+    (r'\b(?:pesunga|pesalam|pesanum|pesalaam)\s*(?:tamil|tamizh|thamil)\s*(?:la|il)?\b', LANG_TAMIL),
+    (r'\b(?:switch|continue)\s*(?:pannunga|pannu)?\s*(?:to\s+)?(?:tamil|tamizh|thamil)\b', LANG_TAMIL),
     (r'\b(?:hindi)\s*(?:me|mein)\s*(?:baat\s*karo|baat\s*kijiye|boliye|baat\s*karein)\b', LANG_HINDI),
     (r'\b(?:kannada|kanada)\s*(?:dalli|alli)?\s*(?:matadi|mathadi|matanadi|mathanadi)\b', LANG_KANNADA),
     (r'\b(?:telugu|telgu)\s*(?:lo)?\s*(?:matladandi|matladu|matladavacha)\b', LANG_TELUGU),
 
     # Native script phrases
-    (r'[\u0b80-\u0bff].*(?:பேசு|பேசுங்கள்|பேச|பேசலாம்)', LANG_TAMIL),
-    (r'தமிழில்\s+(?:பேசுங்கள்|பேசு|பேசலாம்|பேச\s*முடியுமா)', LANG_TAMIL),
-    (r'தமிழ்ல\s+(?:பேசுங்க|பேசு)', LANG_TAMIL),
-    (r'[\u0900-\u097f].*(?:बात\s+करो|बोलिए|बात\s+कीजिए|बोलो)', LANG_HINDI),
+    (r'(?:தமிழ்|தமிழ்ல|தமிழில்|மொழியில்|மொழி).*(?:பேசு|பேசுங்கள்|பேச|பேசலாம்|பேசணும்|பேசனும்|பேச\s*வேண்டும்|மாற்று|மாற்றுங்கள்|மாத்து|மாத்துங்க|மாறு|மாறுங்கள்|தொடர்(?!பு)|தொடருங்கள்)', LANG_TAMIL),
+    (r'(?:நாம்|நாங்க|நான்)?\s*(?:தமிழில்|தமிழுக்கு|தமிழ்ல|தமிழ்)\s+(?:பேசுங்கள்|பேசுங்க|பேசு|பேசலாம்|பேச\s*முடியுமா|மாற்றுங்க|மாத்துங்க|மாறுங்க|தொடருங்க|தொடரவும்|பேசணும்|பேசனும்|பேச\s*வேண்டும்)', LANG_TAMIL),
+    (r'[\u0900-\u097f].*(?:बात\s+करो|बोलिए|बात\s+कीजिए|बोलो|बदलिए)', LANG_HINDI),
     (r'हिंदी\s+में\s+(?:बात\s+करो|बोलिए|बात\s+कीजिए)', LANG_HINDI),
-    (r'[\u0c80-\u0cff].*(?:ಮಾತನಾಡಿ|ಮಾತಾಡಿ|ಮಾತನಾಡಬಹುದಾ)', LANG_KANNADA),
+    (r'[\u0c80-\u0cff].*(?:ಮಾತನಾಡಿ|ಮಾತಾಡಿ|ಮಾತನಾಡಬಹುದಾ|ಬದಲಾಯಿಸಿ)', LANG_KANNADA),
     (r'ಕನ್ನಡದಲ್ಲಿ\s+(?:ಮಾತನಾಡಿ|ಮಾತಾಡಿ)', LANG_KANNADA),
-    (r'[\u0c00-\u0c7f].*(?:మాట్లాడండి|మాట్లాడు|మాట్లాడవచ్చా)', LANG_TELUGU),
+    (r'[\u0c00-\u0c7f].*(?:మాట్లాడండి|మాట్లాడు|మాట్లాడవచ్చా|మార్చండి)', LANG_TELUGU),
     (r'తెలుగులో\s+(?:మాట్లాడండి|మాట్లాడు)', LANG_TELUGU),
 ]
 
@@ -481,13 +481,16 @@ class LanguageDetectionService:
 
         # General acknowledgment (outside of active booking)
         general_prompts = {
-            LANG_TAMIL: "கண்டிப்பா! இனிமேல் தமிழ்ல பேசலாம். நான் உங்களுக்கு எப்படி help பண்ணலாம்?",
+            LANG_TAMIL: "கண்டிப்பா, தமிழ்ல பேசுறேன். சொல்லுங்க, உங்களுக்கு என்ன உதவி வேணும்?",
             LANG_ENGLISH: "Certainly! I will continue in English. How may I assist you today?",
             LANG_HINDI: "ज़रूर! अब मैं हिंदी में बात करूँगा। बताइए, मैं आपकी क्या सहायता कर सकता हूँ?",
             LANG_KANNADA: "ಖಂಡಿತ! ಇನ್ನು ಮುಂದೆ ಕನ್ನಡದಲ್ಲಿ ಮಾತನಾಡುತ್ತೇನೆ. ನಿಮಗೆ ಹೇಗೆ ಸಹಾಯ ಮಾಡಬಹುದು?",
             LANG_TELUGU: "తప్పకుండా! ఇకపై తెలుగులో మాట్లాడుతాను. మీకు ఎలా సహాయపడగలను?",
         }
-        return general_prompts.get(target_lang, general_prompts[LANG_ENGLISH])
+        resp = general_prompts.get(target_lang, general_prompts[LANG_ENGLISH])
+        if not resp or not resp.strip():
+            resp = "கண்டிப்பா, தமிழ்ல பேசுறேன். சொல்லுங்க, உங்களுக்கு என்ன உதவி வேணும்?" if target_lang == LANG_TAMIL else "Certainly! I will continue in English. How may I assist you today?"
+        return resp
 
     def get_tts_voice_and_model(self, lang: str) -> Tuple[str, str, str]:
         """

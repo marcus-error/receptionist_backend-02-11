@@ -468,6 +468,53 @@ class AIService:
         curr_lang = effective_lang if effective_lang in ("ta", "hi", "kn", "te") else "en"
 
         if curr_lang != "en":
+            already_greeted = is_ongoing or bool(
+                (booking_session and getattr(booking_session, "greeting_sent", False))
+                or (isinstance(booking_session, dict) and booking_session.get("greeting_sent"))
+            )
+
+            # Affirmations / Short agreement
+            if txt_clean in {"yes", "yeah", "yep", "sure", "சரி", "ஆமாம்", "ஆமா", "sari", "aamaam"}:
+                if curr_lang == "ta":
+                    return "சொல்லுங்க, நான் உங்களுக்கு எப்படி help பண்ணலாம்?"
+                elif curr_lang == "hi":
+                    return "हाँ, बताइए मैं आपकी क्या सहायता कर सकता हूँ?"
+                elif curr_lang == "kn":
+                    return "ಹೌದು, ನಾನು ನಿಮಗೆ ಹೇಗೆ ಸಹಾಯ ಮಾಡಲಿ?"
+                elif curr_lang == "te":
+                    return "అవును, నేను మీకు ఎలా సహాయపడగలను?"
+
+            # Website Inquiry in Tamil
+            if curr_lang == "ta" and (any(p in txt for p in ["website பற்றி சொல்லுங்க", "website பற்றி", "வலைத்தளம்", "website development", "web development"]) or intent == "website_inquiry"):
+                if booking_session:
+                    if isinstance(booking_session, dict):
+                        booking_session["current_topic"] = "Website Development"
+                    else:
+                        setattr(booking_session, "current_topic", "Website Development")
+                return "கண்டிப்பா சார்! நாங்க business websites, e-commerce, மற்றும் custom web development பண்ணி தரோம். உங்களுக்கு எந்த மாதிரி website வேணும்?"
+
+            # ERP focus / narrowing in Tamil
+            if curr_lang == "ta" and any(p in txt for p in ["erp software மட்டும் போதும்", "erp மட்டும் போதும்", "software மட்டும் போதும்"]):
+                if booking_session:
+                    if isinstance(booking_session, dict):
+                        booking_session["current_topic"] = "ERP Software"
+                        booking_session["requirement"] = "ERP Software"
+                    else:
+                        setattr(booking_session, "current_topic", "ERP Software")
+                        setattr(booking_session, "requirement", "ERP Software")
+                return "சரிங்க சார், கண்டிப்பா ERP software-க்கு மட்டும் பாக்கலாம். இதோட details மட்டும் உங்களுக்கு ஏற்பாடு செய்கிறேன்."
+
+            # ERP Software Inquiry in Tamil
+            if curr_lang == "ta" and (any(p in txt for p in ["erp software வேணும்", "erp software பற்றி", "erp software", "erp வேணும்"]) or intent == "erp_inquiry"):
+                if booking_session:
+                    if isinstance(booking_session, dict):
+                        booking_session["current_topic"] = "ERP Software"
+                        booking_session["requirement"] = "ERP Software"
+                    else:
+                        setattr(booking_session, "current_topic", "ERP Software")
+                        setattr(booking_session, "requirement", "ERP Software")
+                return "கண்டிப்பா சார்! நாங்க inventory, billing, accounts, மற்றும் HR manage பண்ணக்கூடிய custom ERP software develop பண்றோம். உங்க business-க்கு தகுந்த மாதிரி customize பண்ணிக்கலாம்."
+
             # 1. Any business / product / doctor / booking inquiry in non-English must go directly to LLM/RAG
             # Exclude common pleasantries ("how are you") and audio checks from being blocked by business terms
             is_common_pleasantry = any(p in txt for p in ["how are you", "how are you doing", "can you hear", "hear me", "are you there", "audible"])
@@ -634,7 +681,7 @@ class AIService:
             p in txt_clean for p in [
                 "what do you do", "what can you do", "tell me about", "about the receptionist",
                 "about receptionist", "how can you help", "tell me about yourself", "what products",
-                "what services", "book a demo", "software demo"
+                "what services", "book a demo", "software demo", "explain your services", "explain services"
             ]
         )
 
@@ -651,7 +698,8 @@ class AIService:
             "can i help you", "can you help me", "can you help", "how can you help", "could you help me", "i need help"
         ])
 
-        if has_business_inquiry and not audio_check_match and not origin_match and not help_inquiry_match:
+        # Genuine business questions ALWAYS bypass fast-path to RAG/LLM, even if audio check words exist!
+        if has_business_inquiry and not origin_match and not help_inquiry_match:
             logger.info(f"[FAST_PATH_CONTEXT] intent={intent or 'business_inquiry'} bypassed=false reason=business_inquiry")
             return None
 
@@ -671,14 +719,60 @@ class AIService:
             "can", "could", "service", "services", "book", "booking", "appointment",
             "doctor", "doctors", "department", "hospital", "clinic", "timing", "hours"
         }
-        is_pure_greeting = (txt_clean in greetings or intent == "greeting") and not any(w in txt_clean.split() for w in question_or_entity_words)
-        is_connection_check = audio_check_match or (is_pure_greeting and already_greeted)
+        is_pure_greeting = (txt_clean in greetings or intent in ("greeting", "GREETING", "initial_greeting", "INITIAL_GREETING")) and not any(w in txt_clean.split() for w in question_or_entity_words)
 
+        curr_topic = None
+        if isinstance(booking_session, dict):
+            curr_topic = booking_session.get("current_topic") or booking_session.get("last_discussed_product")
+        elif booking_session is not None and hasattr(booking_session, "current_topic"):
+            curr_topic = getattr(booking_session, "current_topic", None) or getattr(booking_session, "booking_data", {}).get("current_topic")
+
+        if not curr_topic and session_history:
+            for h in reversed(session_history):
+                t_msg = h.get("text", "").lower()
+                if any(w in t_msg for w in ["ai voice agent", "voice agent", "call center"]):
+                    curr_topic = "AI Voice Agent"
+                    break
+                elif any(w in t_msg for w in ["galaxy chat", "galaxy"]):
+                    curr_topic = "Galaxy Chat"
+                    break
+                elif any(w in t_msg for w in ["erp", "hrms", "crm", "software"]):
+                    curr_topic = "business software"
+                    break
+                elif any(w in t_msg for w in ["demo", "schedule demo"]):
+                    curr_topic = "demo"
+                    break
+
+        has_active_context = bool(curr_topic) or bool(
+            (booking_session and hasattr(booking_session, "is_active") and booking_session.is_active())
+            or (isinstance(booking_session, dict) and booking_session.get("state") not in (None, "IDLE", "COMPLETED"))
+        )
+
+        # ── Case 1: Initial Opening Greeting (call start, not already greeted) ──
         if is_pure_greeting and not already_greeted:
             logger.info(f"[FAST_PATH_CONTEXT] intent={intent or 'greeting'} bypassed=true reason=welcome_greeting")
             return welcome_greeting
 
-        if is_connection_check and already_greeted:
+        # ── Case 2: Greeting return after already greeted (and not in mid-topic) ──
+        # Caller responds to initial greeting with "Good afternoon", "Hello", etc.
+        # Respond naturally with a brief greeting acknowledgement.
+        # NEVER replay opening greeting or append last_ai_text!
+        if is_pure_greeting and already_greeted and not has_active_context:
+            logger.info(f"[FAST_PATH_CONTEXT] intent={intent or 'greeting'} bypassed=true reason=greeting_acknowledgement")
+            if curr_lang == "ta":
+                return "வணக்கம்! சொல்லுங்க, உங்களுக்கு என்ன உதவி வேணும்?"
+            elif "good morning" in txt_clean:
+                return "Good morning! How can I help you today?"
+            elif "good afternoon" in txt_clean:
+                return "Good afternoon! How can I help you today?"
+            elif "good evening" in txt_clean:
+                return "Good evening! How can I help you today?"
+            else:
+                return "Hello! How can I help you today?"
+
+        # ── Case 3: Connection Reassurance / Audio Check / Mid-topic presence check ──
+        is_connection_check = audio_check_match or (is_pure_greeting and has_active_context) or intent in ("connection_reassurance", "CONNECTION_REASSURANCE", "silence_check", "audio_check")
+        if is_connection_check:
             logger.info(f"[FAST_PATH_CONTEXT] intent={intent or 'connection_check'} bypassed=true reason=connection_reassurance")
             
             # Determine repeat count to vary responses naturally and prevent loops
@@ -692,6 +786,22 @@ class AIService:
             elif booking_session is not None and hasattr(booking_session, "booking_data"):
                 repeat_count = booking_session.booking_data.get("_hello_repeat_count", 0) + 1
                 booking_session.booking_data["_hello_repeat_count"] = repeat_count
+
+            # Tamil audio check / connection reassurance
+            if curr_lang == "ta":
+                if any(p in txt_clean for p in ["can you hear me", "hear me", "கேட்கிறதா", "audible"]):
+                    return "ஆமா, உங்க voice தெளிவா கேக்குதுங்க! நான் உங்களுக்கு எப்படி help பண்ணலாம்?"
+                if repeat_count == 1:
+                    return "வணக்கம்! நான் இங்கதான் இருக்கேன். சொல்லுங்க, உங்களுக்கு என்ன உதவி வேணும்?"
+                else:
+                    return "நான் உங்ககூடதான் இருக்கேன். சொல்லுங்க, உங்களுக்கு என்ன உதவி வேணும்?"
+
+            # If asking "can you hear me" in English:
+            if any(p in txt_clean for p in ["can you hear me", "can you hear", "hear me", "am i audible"]):
+                if repeat_count == 1:
+                    return "Yes, I can hear you clearly! How can I help you today?"
+                else:
+                    return "Yes, I can still hear you clearly. How can I assist you?"
 
             # 1. Active Booking Session - prompt for current missing field smoothly
             if booking_session and hasattr(booking_session, "is_active") and booking_session.is_active():
@@ -710,28 +820,6 @@ class AIService:
                     return "I'm still here with you. Would you like to proceed with your booking details?"
 
             # 2. Product Enquiry / Topic Context
-            curr_topic = None
-            if isinstance(booking_session, dict):
-                curr_topic = booking_session.get("current_topic") or booking_session.get("last_discussed_product")
-            elif booking_session is not None and hasattr(booking_session, "current_topic"):
-                curr_topic = getattr(booking_session, "current_topic", None) or getattr(booking_session, "booking_data", {}).get("current_topic")
-
-            if not curr_topic and session_history:
-                for h in reversed(session_history):
-                    t_msg = h.get("text", "").lower()
-                    if any(w in t_msg for w in ["ai voice agent", "voice agent", "call center"]):
-                        curr_topic = "AI Voice Agent"
-                        break
-                    elif any(w in t_msg for w in ["galaxy chat", "galaxy"]):
-                        curr_topic = "Galaxy Chat"
-                        break
-                    elif any(w in t_msg for w in ["erp", "hrms", "crm", "software"]):
-                        curr_topic = "business software"
-                        break
-                    elif any(w in t_msg for w in ["demo", "schedule demo"]):
-                        curr_topic = "demo"
-                        break
-
             if curr_topic:
                 top_lower = str(curr_topic).lower()
                 if "voice" in top_lower or "call center" in top_lower:
@@ -752,24 +840,13 @@ class AIService:
                     else:
                         return f"I'm still here with you. Would you like to continue discussing {curr_topic}?"
 
-            # 3. Check Last Assistant Question in Session History
-            last_ai_text = ""
-            if session_history:
-                for h in reversed(session_history):
-                    if h.get("role") in ("model", "assistant"):
-                        last_ai_text = h.get("text", "").strip()
-                        break
-
-            if last_ai_text and last_ai_text.endswith("?"):
-                if repeat_count == 1:
-                    return f"Yes, I'm right here! {last_ai_text}"
-                else:
-                    return f"I'm still here with you. {last_ai_text}"
-
+            # Clean standalone reassurance without compounding old responses or replaying greetings
             if repeat_count == 1:
                 return "Yes, I'm right here! How may I assist you with our services today?"
+            elif repeat_count == 2:
+                return "I'm still here with you. How can I assist you?"
             else:
-                return "I'm still here with you. Please let me know how I can help whenever you're ready."
+                return "Yes, I can hear you clearly. Please let me know how I can help whenever you're ready."
 
         if help_inquiry_match:
             target_org = org_name or rag_service.get_organization_name(organization_id)
@@ -793,6 +870,14 @@ class AIService:
         if any(p in txt_clean for p in ["thank you", "thanks", "thank u", "appreciated", "that is all", "that's all", "that will be all"]) or intent in ("thanks", "gratitude"):
             logger.info(f"[FAST_PATH_CONTEXT] intent={intent or 'thanks'} bypassed=true reason=polite_closure")
             return "You are very welcome! Please let me know if you need any other assistance."
+
+        if txt_clean in {"yes", "yeah", "yep", "sure", "yes please", "yes please help"}:
+            logger.info(f"[FAST_PATH_CONTEXT] intent={intent or 'affirmation'} bypassed=true reason=greeting_affirmation")
+            if booking_session and hasattr(booking_session, "is_active") and booking_session.is_active():
+                from src.services.booking_state_service import booking_state_service
+                resume_prompt = booking_state_service.get_silence_prompt(booking_session)
+                return f"Yes! {resume_prompt}"
+            return "Yes, how may I assist you today?"
 
         if txt_clean in {"yeah good", "doing good", "good", "great", "im good", "i am good", "fine", "all good"}:
             logger.info(f"[FAST_PATH_CONTEXT] intent={intent or 'acknowledgement'} bypassed=true reason=acknowledgement")
